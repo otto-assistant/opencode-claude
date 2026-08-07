@@ -1,4 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["file:///workspace"]
+  "plugin": [
+    "@otto-assistant/opencode-claude@0.1.0"
+  ]
 }

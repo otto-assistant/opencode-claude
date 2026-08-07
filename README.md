@@ -102,6 +102,27 @@ Optional knobs:
 - `OPENCODE_CLAUDE_CWD` — working directory passed to the Agent SDK
 - `CLAUDE_CODE_OAUTH_TOKEN` — inject a subscription token (CI / headless)
 
+## Release
+
+Publish via GitHub Actions → **Actions → Release → Run workflow**:
+
+| Input | Purpose |
+|---|---|
+| `version` | Explicit semver (`0.2.0`). Empty → use bump |
+| `bump` | `minor` (default) / `patch` / `major` |
+| `dry_run` | Skip npm publish; create a draft GitHub release |
+
+Requires repo secrets: `NPM_TOKEN` (npm publish), optional `DISCORD_WEBHOOK_URL`.
+
+The workflow: bump version → `bun test` → `bun build` → tag `vX.Y.Z` → `npm publish` → GitHub Release.
+
+Local pin refresh after a release:
+
+```bash
+./scripts/update-plugin.sh --dry-run
+./scripts/update-plugin.sh
+```
+
 ## License
 
 [MIT](LICENSE)
