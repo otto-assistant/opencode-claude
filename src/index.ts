@@ -35,9 +35,9 @@ import {
   resolveClaudeModelSelection,
 } from "./model-selection.js";
 import {
+  buildConfigVariants,
   buildEffortVariants,
   getClaudeModels,
-  isLoginPlaceholderModel,
   LOGIN_PLACEHOLDER_MODELS,
   type ClaudeModel,
 } from "./models.js";
@@ -78,6 +78,9 @@ function buildProviderModel(
   baseURL: string,
 ): Record<string, unknown> {
   const variants = buildEffortVariants(model);
+  const hasEffort = Object.values(variants).some(
+    (v) => v && typeof v === "object" && "effort" in v,
+  );
   return {
     id,
     providerID: PROVIDER_ID,
@@ -91,7 +94,8 @@ function buildProviderModel(
       : model.name,
     capabilities: {
       temperature: true,
-      reasoning: model.reasoning && Object.keys(variants).length > 0,
+      // Runtime models expose reasoning so streams can carry thinking deltas.
+      reasoning: hasEffort,
       attachment: true,
       toolcall: true,
       input: {
@@ -119,12 +123,42 @@ function buildProviderModel(
       context: model.contextWindow,
       output: model.maxTokens,
     },
-    status: isLoginPlaceholderModel(id) ? "active" : "active",
+    status: "active",
     options: {
       includeUsage: true,
     },
     headers: {},
     release_date: "",
+    variants,
+  };
+}
+
+function buildConfigModelEntry(model: ClaudeModel): Record<string, unknown> {
+  const variants = buildConfigVariants(model);
+  return {
+    name: model.name,
+    // Keep config non-reasoning so OpenCode does not prepend generic
+    // low/medium/high ahead of our explicit effort map (cursor pattern).
+    reasoning: false,
+    tool_call: true,
+    // Without modalities.input including "image", OpenCode strips attachments
+    // before they reach the proxy.
+    modalities: {
+      input: ["text", "image"],
+      output: ["text"],
+    },
+    capabilities: {
+      tools: true,
+      input: ["text", "image"],
+      output: ["text"],
+    },
+    limit: {
+      context: model.contextWindow,
+      output: model.maxTokens,
+    },
+    options: {
+      includeUsage: true,
+    },
     variants,
   };
 }
@@ -155,33 +189,47 @@ function ensureClaudeProviderConfig(
   if (!config.provider || typeof config.provider !== "object") {
     config.provider = {};
   }
-  const existing = config.provider[PROVIDER_ID];
-  if (existing && typeof existing === "object" && existing.models) {
-    return;
-  }
+  const existing = config.provider[PROVIDER_ID] ?? {};
+  const existingOptions =
+    existing.options && typeof existing.options === "object"
+      ? existing.options
+      : {};
+  const existingModels =
+    existing.models && typeof existing.models === "object"
+      ? existing.models
+      : {};
 
   const baseURL = getClaudeProxyBaseUrl();
+  const seededModels = Object.fromEntries(
+    models.map((model) => [model.id, buildConfigModelEntry(model)]),
+  );
+  const defaultModel =
+    models.find((m) => m.id === DEFAULT_MODEL_ID) || models[0];
+  if (defaultModel && !(DEFAULT_MODEL_ID in seededModels)) {
+    seededModels[DEFAULT_MODEL_ID] = {
+      ...buildConfigModelEntry(defaultModel),
+      name: `Default (${defaultModel.name})`,
+    };
+  }
+
   config.provider[PROVIDER_ID] = {
-    name: "Claude Code",
-    npm: OPENAI_COMPATIBLE_NPM,
+    ...existing,
+    name:
+      typeof existing.name === "string" && existing.name.trim()
+        ? existing.name
+        : "Claude Code",
+    npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
     options: {
       baseURL,
       apiKey: "claude-code-proxy",
+      includeUsage: true,
+      ...existingOptions,
     },
-    models: Object.fromEntries(
-      models.map((model) => [
-        model.id,
-        {
-          name: model.name,
-          limit: {
-            context: model.contextWindow,
-            output: model.maxTokens,
-          },
-          modalities: { input: ["text", "image"], output: ["text"] },
-        },
-      ]),
-    ),
-    ...(existing && typeof existing === "object" ? existing : {}),
+    // Seeded catalog first; user-declared model entries win.
+    models: {
+      ...seededModels,
+      ...existingModels,
+    },
   };
 }
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- README + package description aligned with opencode-cursor style (header, badges, effort docs)
+- Effort variants `low`→`max` exposed as OpenCode model variants (disable generic `none`/`minimal`)
+- Multimodal prompts: OpenAI `image_url` / file parts → Claude image & document blocks
+- Auto-compact enabled; compact boundary events surfaced in the stream
+- Static provider config seeds modalities + variants so attachments and effort survive OpenCode's config path
+
+## 0.5.0
+
+- See GitHub releases
+
 ## 0.1.0
 
 - Initial `@otto-assistant/opencode-claude` plugin

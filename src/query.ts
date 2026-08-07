@@ -157,6 +157,13 @@ export type StartClaudeQueryParams = {
   pathToClaudeCodeExecutable?: string;
   /** Required when permissionMode is bypassPermissions. */
   allowDangerouslySkipPermissions?: boolean;
+  /** Auto-compact long conversations (Claude Code default). */
+  autoCompactEnabled?: boolean;
+  /** Thinking config; defaults to adaptive when effort is set. */
+  thinking?:
+    | { type: "adaptive" }
+    | { type: "enabled"; budgetTokens: number }
+    | { type: "disabled" };
   queryImpl?: (mod: SdkModule) => unknown;
 };
 
@@ -218,6 +225,17 @@ export async function startClaudeQuery(
 
   const effort = trimmedString(params.effort);
   if (isClaudeEffort(effort)) options.effort = effort;
+
+  if (params.thinking) {
+    options.thinking = params.thinking;
+  } else if (isClaudeEffort(effort)) {
+    // Effort guides adaptive thinking depth on models that support it.
+    options.thinking = { type: "adaptive" };
+  }
+
+  if (params.autoCompactEnabled !== false) {
+    options.autoCompactEnabled = true;
+  }
 
   if (typeof params.canUseTool === "function") {
     options.canUseTool = params.canUseTool;

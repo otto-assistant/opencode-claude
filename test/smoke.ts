@@ -127,13 +127,50 @@ async function main() {
   for (const level of EFFORT_LEVELS) {
     assert.ok(variants[level]);
     assert.equal(isClaudeEffort(level), true);
+    assert.ok(
+      variants[level] &&
+        typeof variants[level] === "object" &&
+        "effort" in variants[level],
+    );
   }
+  assert.deepEqual(variants.none, { disabled: true });
+  assert.deepEqual(variants.minimal, { disabled: true });
   assert.equal(isClaudeEffort("nope"), false);
 
   const selection = resolveClaudeModelSelection("sonnet", "high");
   const encoded = encodeClaudeModelSelection(selection);
   const decoded = decodeClaudeModelSelection(encoded);
   assert.deepEqual(decoded, { modelId: "sonnet", effort: "high" });
+
+  // Multimodal prompt conversion
+  const {
+    openaiContentToAnthropicBlocks,
+    latestUserPrompt: buildPrompt,
+    contentHasAttachments,
+  } = await import("../src/prompt.ts");
+  const png =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const blocks = openaiContentToAnthropicBlocks([
+    { type: "text", text: "what color?" },
+    {
+      type: "image_url",
+      image_url: { url: `data:image/png;base64,${png}` },
+    },
+  ]);
+  assert.equal(blocks.length, 2);
+  assert.equal(blocks[0]?.type, "text");
+  assert.equal(blocks[1]?.type, "image");
+  assert.equal(contentHasAttachments([{ type: "image_url", image_url: { url: "x" } }]), true);
+  const multi = buildPrompt([
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "describe" },
+        { type: "image_url", image_url: { url: `data:image/png;base64,${png}` } },
+      ],
+    },
+  ]);
+  assert.equal(typeof multi === "object" && multi !== null && multi.type === "user", true);
 
   // Conversation key stability
   const key = conversationKeyFromMessages([
