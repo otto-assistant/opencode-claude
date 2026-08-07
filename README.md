@@ -6,11 +6,18 @@ Inspired by the [OpenChamber Claude Code harness](https://github.com/makeittech/
 
 ## Install
 
+`claude-code` is **not** a built-in OpenCode provider. Install the plugin first, or
+`opencode auth login --provider claude-code` fails with `Unknown provider "claude-code"`.
+
 ```bash
-npm install -g @otto-assistant/opencode-claude
+# global (recommended)
+opencode plugin @otto-assistant/opencode-claude -g
+
+# or project-local (writes .opencode/opencode.json)
+opencode plugin @otto-assistant/opencode-claude
 ```
 
-Add the plugin to `~/.config/opencode/opencode.json`:
+Optional: name the provider in config (OpenCode also seeds this when the plugin loads):
 
 ```jsonc
 {
@@ -22,16 +29,18 @@ Add the plugin to `~/.config/opencode/opencode.json`:
 }
 ```
 
-Or build from source:
+Or build from source and point OpenCode at the local package:
 
 ```bash
 git clone https://github.com/otto-assistant/opencode-claude.git
 cd opencode-claude
 bun install && bun run build
-npm install -g .
+opencode plugin file://$PWD
 ```
 
 ## Authenticate
+
+Requires the plugin to be installed (see above).
 
 ### Option A — Claude Code CLI (recommended)
 
