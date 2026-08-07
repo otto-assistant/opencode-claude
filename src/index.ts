@@ -43,6 +43,7 @@ import {
 } from "./models.js";
 import {
   getClaudeProxyBaseUrl,
+  getProxyPort,
   startProxy,
 } from "./proxy.js";
 
@@ -52,8 +53,6 @@ type ClaudeOAuthAuth = {
   refresh: string;
   expires: number;
 };
-
-const CLAUDE_BASE_URL = getClaudeProxyBaseUrl();
 
 function isClaudeOAuthAuth(auth: unknown): auth is ClaudeOAuthAuth {
   return (
@@ -76,7 +75,7 @@ function zeroCost() {
 function buildProviderModel(
   model: ClaudeModel,
   id: string,
-  port: number,
+  baseURL: string,
 ): Record<string, unknown> {
   const variants = buildEffortVariants(model);
   return {
@@ -84,7 +83,7 @@ function buildProviderModel(
     providerID: PROVIDER_ID,
     api: {
       id,
-      url: `http://127.0.0.1:${port}/v1`,
+      url: baseURL,
       npm: OPENAI_COMPATIBLE_NPM,
     },
     name: id === DEFAULT_MODEL_ID && model.id !== DEFAULT_MODEL_ID
@@ -132,10 +131,10 @@ function buildProviderModel(
 
 function buildClaudeProviderModels(
   models: ClaudeModel[],
-  port: number,
 ): Record<string, unknown> {
+  const baseURL = getClaudeProxyBaseUrl();
   const providerModels = Object.fromEntries(
-    models.map((model) => [model.id, buildProviderModel(model, model.id, port)]),
+    models.map((model) => [model.id, buildProviderModel(model, model.id, baseURL)]),
   );
   const defaultModel =
     models.find((m) => m.id === DEFAULT_MODEL_ID) || models[0];
@@ -143,7 +142,7 @@ function buildClaudeProviderModels(
     providerModels[DEFAULT_MODEL_ID] = buildProviderModel(
       defaultModel,
       DEFAULT_MODEL_ID,
-      port,
+      baseURL,
     );
   }
   return providerModels;
@@ -161,12 +160,12 @@ function ensureClaudeProviderConfig(
     return;
   }
 
-  const port = Number(new URL(CLAUDE_BASE_URL).port || 3457);
+  const baseURL = getClaudeProxyBaseUrl();
   config.provider[PROVIDER_ID] = {
     name: "Claude Code",
     npm: OPENAI_COMPATIBLE_NPM,
     options: {
-      baseURL: `http://127.0.0.1:${port}/v1`,
+      baseURL,
       apiKey: "claude-code-proxy",
     },
     models: Object.fromEntries(
@@ -262,17 +261,17 @@ async function loadClaudeRuntime(
 
   if (!accessToken && !detection.loggedIn) {
     // Still seed placeholder models + a proxy so the provider stays visible.
-    const port = await startProxy(async () => null);
-    const providerModels = buildClaudeProviderModels(models, port);
+    await startProxy(async () => null);
+    const providerModels = buildClaudeProviderModels(models);
     if (provider) provider.models = providerModels;
-    return { port, providerModels };
+    return { port: getProxyPort() ?? 8787, providerModels };
   }
 
   const port = await startProxy(async () => {
     return resolveAccessToken(input, getAuth);
   });
 
-  const providerModels = buildClaudeProviderModels(models, port);
+  const providerModels = buildClaudeProviderModels(models);
   if (provider) provider.models = providerModels;
   return { port, providerModels };
 }
@@ -367,7 +366,7 @@ export const ClaudeCodePlugin: Plugin = async (
         if (!runtime) return {};
 
         return {
-          baseURL: `http://127.0.0.1:${runtime.port}/v1`,
+          baseURL: getClaudeProxyBaseUrl(),
           apiKey: "claude-code-proxy",
           async fetch(
             requestInput: RequestInfo | URL,

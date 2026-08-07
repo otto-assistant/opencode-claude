@@ -17,7 +17,13 @@ let sdkModulePromise: Promise<SdkModule> | null = null;
 let sdkLoadError: Error | null = null;
 let sdkModule: SdkModule | null = null;
 
-const ALLOWED_PERMISSION_MODES = new Set(["default", "acceptEdits", "plan"]);
+const ALLOWED_PERMISSION_MODES = new Set([
+  "default",
+  "acceptEdits",
+  "plan",
+  "bypassPermissions",
+  "dontAsk",
+]);
 
 const trimmedString = (value: unknown): string =>
   typeof value === "string" ? value.trim() : "";
@@ -143,9 +149,14 @@ export type StartClaudeQueryParams = {
   allowedTools?: string[];
   /** Disable Claude built-in tools so OpenCode owns tool execution. */
   tools?: string[] | { type: string; [key: string]: unknown };
+  /** Redirect built-in tool names to OpenCode MCP tools. */
+  toolAliases?: Record<string, string>;
+  disallowedTools?: string[];
   skills?: string[] | "all";
   settingSources?: Array<"user" | "project" | "local">;
   pathToClaudeCodeExecutable?: string;
+  /** Required when permissionMode is bypassPermissions. */
+  allowDangerouslySkipPermissions?: boolean;
   queryImpl?: (mod: SdkModule) => unknown;
 };
 
@@ -198,6 +209,12 @@ export async function startClaudeQuery(
   if (ALLOWED_PERMISSION_MODES.has(permissionMode)) {
     options.permissionMode = permissionMode;
   }
+  if (
+    params.allowDangerouslySkipPermissions === true &&
+    permissionMode === "bypassPermissions"
+  ) {
+    options.allowDangerouslySkipPermissions = true;
+  }
 
   const effort = trimmedString(params.effort);
   if (isClaudeEffort(effort)) options.effort = effort;
@@ -241,8 +258,18 @@ export async function startClaudeQuery(
     );
   }
 
+  if (Array.isArray(params.disallowedTools) && params.disallowedTools.length > 0) {
+    options.disallowedTools = params.disallowedTools.filter(
+      (tool) => typeof tool === "string" && tool.trim(),
+    );
+  }
+
   if (params.tools !== undefined) {
     options.tools = params.tools;
+  }
+
+  if (nonEmptyRecord(params.toolAliases)) {
+    options.toolAliases = params.toolAliases;
   }
 
   if (params.skills === "all" || (Array.isArray(params.skills) && params.skills.length > 0)) {

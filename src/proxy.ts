@@ -12,6 +12,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   deleteBridge,
   findBridgeByConversation,
+  findBridgeByPendingTool,
   putBridge,
   type ParkedBridge,
   type ParkedToolCall,
@@ -31,7 +32,23 @@ import {
 } from "./session-store.js";
 import { log } from "./log.js";
 
-const FIXED_PROXY_PORT = Number(process.env.OPENCODE_CLAUDE_PROXY_PORT || 0);
+const DEFAULT_PROXY_PORT = 8787;
+const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
+
+/**
+ * Fixed port the proxy binds to. OpenCode resolves the provider base URL from
+ * static config, so the proxy must listen on a deterministic port that matches
+ * that URL (a random port leaves the SDK unable to connect).
+ * Override with OPENCODE_CLAUDE_PROXY_PORT if 8787 is taken.
+ */
+const CLAUDE_PROXY_PORT: number = (() => {
+  const raw = process.env.OPENCODE_CLAUDE_PROXY_PORT;
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isInteger(parsed) && parsed > 0 && parsed < 65536
+    ? parsed
+    : DEFAULT_PROXY_PORT;
+})();
+
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
@@ -74,34 +91,85 @@ let proxyPort: number | null = null;
 let getAccessToken: TokenProvider | null = null;
 
 export function getClaudeProxyBaseUrl(): string {
-  const port = proxyPort ?? (FIXED_PROXY_PORT || 3457);
-  return `http://127.0.0.1:${port}/v1`;
+  return `http://127.0.0.1:${CLAUDE_PROXY_PORT}/v1`;
 }
 
 export function getProxyPort(): number | null {
-  return proxyPort;
+  return proxyPort ?? CLAUDE_PROXY_PORT;
+}
+
+function isAddrInUseError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const code = (err as { code?: unknown }).code;
+  const message = (err as { message?: unknown }).message;
+  return (
+    code === "EADDRINUSE" ||
+    (typeof message === "string" &&
+      /eaddrinuse|address already in use|in use/i.test(message))
+  );
+}
+
+async function isSharedProxyHealthy(): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    SHARED_PROXY_HEALTH_TIMEOUT_MS,
+  );
+  try {
+    const res = await fetch(`${getClaudeProxyBaseUrl()}/models`, {
+      signal: controller.signal,
+    });
+    if (!res.ok) return false;
+    const body = (await res.json().catch(() => undefined)) as
+      | { object?: unknown; data?: unknown }
+      | undefined;
+    return (
+      !!body &&
+      body.object === "list" &&
+      Array.isArray(body.data)
+    );
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function startProxy(tokenProvider: TokenProvider): Promise<number> {
   getAccessToken = tokenProvider;
   if (server && proxyPort) return proxyPort;
 
-  const hostname = "127.0.0.1";
-  const preferred = FIXED_PROXY_PORT > 0 ? FIXED_PROXY_PORT : 0;
-
-  server = Bun.serve({
-    hostname,
-    port: preferred,
-    async fetch(req) {
-      return handleRequest(req);
-    },
-  });
-  proxyPort = server.port ?? null;
-  if (proxyPort == null) {
-    throw new Error("Failed to bind Claude Code proxy port");
+  if (await isSharedProxyHealthy()) {
+    proxyPort = CLAUDE_PROXY_PORT;
+    log.info(
+      `[opencode-claude] reusing healthy proxy on ${getClaudeProxyBaseUrl()}`,
+    );
+    return proxyPort;
   }
-  log.info(`[opencode-claude] proxy listening on ${getClaudeProxyBaseUrl()}`);
-  return proxyPort;
+
+  const hostname = "127.0.0.1";
+
+  try {
+    server = Bun.serve({
+      hostname,
+      port: CLAUDE_PROXY_PORT,
+      async fetch(req) {
+        return handleRequest(req);
+      },
+    });
+    proxyPort = server.port ?? CLAUDE_PROXY_PORT;
+    log.info(`[opencode-claude] proxy listening on ${getClaudeProxyBaseUrl()}`);
+    return proxyPort;
+  } catch (err) {
+    if (isAddrInUseError(err) && (await isSharedProxyHealthy())) {
+      proxyPort = CLAUDE_PROXY_PORT;
+      log.info(
+        `[opencode-claude] port ${CLAUDE_PROXY_PORT} in use; reusing existing proxy`,
+      );
+      return proxyPort;
+    }
+    throw err;
+  }
 }
 
 export async function stopProxy(): Promise<void> {
@@ -210,17 +278,33 @@ async function handleChatCompletions(
   const stream = body.stream !== false;
 
   // Resume a parked bridge if OpenCode returned tool results.
-  const existing = findBridgeByConversation(conversationKey);
+  const toolResults = collectToolResults(messages);
+  let existing = findBridgeByConversation(conversationKey);
+  // Fallback: match by tool_call_id when the session header is missing/changed.
+  if ((!existing || existing.pendingTools.size === 0) && toolResults.size > 0) {
+    for (const toolCallId of toolResults.keys()) {
+      const byTool = findBridgeByPendingTool(toolCallId);
+      if (byTool) {
+        existing = byTool;
+        break;
+      }
+    }
+  }
   if (existing && existing.pendingTools.size > 0) {
-    const results = collectToolResults(messages);
+    let resolved = 0;
     for (const [toolId, tool] of existing.pendingTools) {
-      const result = results.get(toolId);
+      const result = toolResults.get(toolId);
       if (result !== undefined) {
         tool.resolve(result);
         existing.pendingTools.delete(toolId);
+        resolved++;
       }
     }
     if (existing.pendingTools.size === 0 && existing.continueStream) {
+      log.info("[opencode-claude] resuming parked bridge", {
+        conversationKey: existing.conversationKey,
+        resolved,
+      });
       return streamOpenAIResponse(
         existing.continueStream(),
         body.model || model,
@@ -228,7 +312,35 @@ async function handleChatCompletions(
         existing,
       );
     }
+    // Still parked — do not start a parallel Claude turn (OpenCode may retry
+    // or send a follow-up before tool results arrive). Re-emit pending calls.
+    if (resolved === 0) {
+      log.info("[opencode-claude] re-emitting parked tool_calls", {
+        conversationKey: existing.conversationKey,
+        pending: existing.pendingTools.size,
+      });
+      return streamOpenAIResponse(
+        (async function* () {
+          yield { type: "__park__", tools: [...existing!.pendingTools.values()] };
+        })(),
+        body.model || model,
+        stream,
+        existing,
+      );
+    }
   }
+
+  log.info("[opencode-claude] chat completions", {
+    conversationKey,
+    sessionHeader: req.headers.get(SESSION_HEADER),
+    toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
+    messageCount: messages.length,
+    hasToolResults: toolResults.size > 0,
+    bridgePending: existing?.pendingTools.size ?? 0,
+  });
+
+  // Note: an in-flight bridge (pendingTools empty) is left alone here; putBridge
+  // supersedes same-conversation bridges when a new turn actually starts.
 
   const accessToken = getAccessToken ? await getAccessToken() : null;
   const env = accessToken
@@ -256,13 +368,44 @@ async function handleChatCompletions(
   const pendingTools = new Map<string, ParkedToolCall>();
   let handle: ClaudeQueryHandle | null = null;
   let parked = false;
+  let parkWaiters: Array<() => void> = [];
+
+  const notifyPark = () => {
+    parked = true;
+    const waiters = parkWaiters;
+    parkWaiters = [];
+    for (const resolve of waiters) resolve();
+  };
 
   const mcpServers =
     openCodeTools.length > 0
-      ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, () => {
-          parked = true;
-        })
+      ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, notifyPark)
       : undefined;
+
+  // When OpenCode supplies tools, Claude must not run its own Bash/Read/etc.
+  // Disable built-ins (`tools: []`) and only expose the OpenCode MCP bridge.
+  const bridgeOpenCodeTools = openCodeTools.length > 0;
+  const openCodeToolNames = openCodeTools
+    .map((t) => t.function?.name)
+    .filter((n): n is string => typeof n === "string" && n.length > 0);
+  const toolAliases = bridgeOpenCodeTools
+    ? Object.fromEntries(
+        openCodeToolNames.flatMap((name) => {
+          const mcpName = `mcp__opencode__${name}`;
+          // Redirect common Claude Code capitalizations to the MCP bridge.
+          const aliases: Array<[string, string]> = [[name, mcpName]];
+          const titled = name.charAt(0).toUpperCase() + name.slice(1);
+          if (titled !== name) aliases.push([titled, mcpName]);
+          if (name === "bash") aliases.push(["Bash", mcpName]);
+          if (name === "read") aliases.push(["Read", mcpName]);
+          if (name === "edit") aliases.push(["Edit", mcpName]);
+          if (name === "write") aliases.push(["Write", mcpName]);
+          if (name === "glob") aliases.push(["Glob", mcpName]);
+          if (name === "grep") aliases.push(["Grep", mcpName]);
+          return aliases;
+        }),
+      )
+    : undefined;
 
   handle = await startClaudeQuery({
     prompt,
@@ -272,12 +415,35 @@ async function handleChatCompletions(
     effort: selection.effort,
     env,
     mcpServers,
-    // When OpenCode supplies tools, prefer those via MCP and keep Claude
-    // permissions interactive-safe. Claude native tools still load from
-    // settings unless we restrict allowedTools — leave defaults so skills /
-    // project MCP from the harness still participate.
-    permissionMode: openCodeTools.length > 0 ? "default" : "acceptEdits",
-    systemPrompt: { type: "preset", preset: "claude_code" },
+    // OpenCode owns tool execution for bridged MCP tools.
+    tools: bridgeOpenCodeTools ? [] : undefined,
+    toolAliases,
+    allowedTools: bridgeOpenCodeTools
+      ? openCodeToolNames.map((n) => `mcp__opencode__${n}`)
+      : undefined,
+    permissionMode: bridgeOpenCodeTools
+      ? "bypassPermissions"
+      : "acceptEdits",
+    allowDangerouslySkipPermissions: bridgeOpenCodeTools,
+    // canUseTool is ignored under bypassPermissions; omit it to avoid SDK warnings.
+    ...(bridgeOpenCodeTools
+      ? {}
+      : {
+          canUseTool: async (
+            toolName: string,
+            input: Record<string, unknown>,
+          ) => ({ behavior: "allow" as const, updatedInput: input }),
+        }),
+    systemPrompt: {
+      type: "preset",
+      preset: "claude_code",
+      ...(bridgeOpenCodeTools
+        ? {
+            append:
+              "You are running inside OpenCode. Built-in Claude Code tools are disabled. Use only the mcp__opencode__* tools provided for this turn; they execute via OpenCode.",
+          }
+        : {}),
+    },
   });
 
   const bridge: ParkedBridge = {
@@ -289,9 +455,41 @@ async function handleChatCompletions(
   };
   putBridge(bridge);
 
-  async function* consume(): AsyncGenerator<unknown, void, unknown> {
+  async function* consumeStream(): AsyncGenerator<unknown, void, unknown> {
+    const iterator = handle!.stream[Symbol.asyncIterator]();
     try {
-      for await (const event of handle!.stream) {
+      while (true) {
+        const parkControl = {
+          cancel: null as (() => void) | null,
+        };
+        const parkPromise = new Promise<void>((resolve) => {
+          if (parked && pendingTools.size > 0) {
+            resolve();
+            return;
+          }
+          const entry = () => resolve();
+          parkWaiters.push(entry);
+          parkControl.cancel = () => {
+            parkWaiters = parkWaiters.filter((w) => w !== entry);
+          };
+        });
+
+        const nextPromise = iterator.next();
+        const raced = await Promise.race([
+          nextPromise.then((value) => ({ kind: "event" as const, value })),
+          parkPromise.then(() => ({ kind: "park" as const })),
+        ]);
+
+        if (raced.kind === "park" || (parked && pendingTools.size > 0)) {
+          parkControl.cancel?.();
+          await Promise.resolve();
+          yield { type: "__park__", tools: [...pendingTools.values()] };
+          return;
+        }
+
+        parkControl.cancel?.();
+        if (raced.value.done) break;
+        const event = raced.value.value;
         const sessionId = extractSessionId(event);
         if (sessionId) {
           setForeignSessionId(conversationKey, sessionId, {
@@ -299,14 +497,6 @@ async function handleChatCompletions(
             cwd,
           });
         }
-
-        // If tools were parked mid-stream, stop yielding so the HTTP response
-        // can close with tool_calls; continueStream resumes later.
-        if (parked && pendingTools.size > 0) {
-          yield { type: "__park__", tools: [...pendingTools.values()] };
-          return;
-        }
-
         yield event;
       }
     } finally {
@@ -319,30 +509,16 @@ async function handleChatCompletions(
 
   bridge.continueStream = async function* () {
     parked = false;
-    try {
-      for await (const event of handle!.stream) {
-        const sessionId = extractSessionId(event);
-        if (sessionId) {
-          setForeignSessionId(conversationKey, sessionId, {
-            modelId: model,
-            cwd,
-          });
-        }
-        if (parked && pendingTools.size > 0) {
-          yield { type: "__park__", tools: [...pendingTools.values()] };
-          return;
-        }
-        yield event;
-      }
-    } finally {
-      if (!parked) {
-        handle?.close();
-        deleteBridge(bridgeId);
-      }
-    }
+    parkWaiters = [];
+    yield* consumeStream();
   };
 
-  return streamOpenAIResponse(consume(), body.model || model, stream, bridge);
+  return streamOpenAIResponse(
+    consumeStream(),
+    body.model || model,
+    stream,
+    bridge,
+  );
 }
 
 function extractSessionId(event: unknown): string | null {
@@ -363,6 +539,7 @@ async function buildOpenCodeMcpServer(
 ): Promise<Record<string, unknown> | undefined> {
   try {
     const sdk = await import("@anthropic-ai/claude-agent-sdk");
+    const { z } = await import("zod");
     const createSdkMcpServer = (sdk as { createSdkMcpServer?: Function })
       .createSdkMcpServer;
     const toolFactory = (sdk as { tool?: Function }).tool;
@@ -371,38 +548,82 @@ async function buildOpenCodeMcpServer(
       return undefined;
     }
 
+    const jsonSchemaToZodShape = (
+      schema: Record<string, unknown> | undefined,
+    ): Record<string, unknown> => {
+      const props =
+        schema &&
+        typeof schema === "object" &&
+        schema.properties &&
+        typeof schema.properties === "object"
+          ? (schema.properties as Record<string, unknown>)
+          : {};
+      const required = new Set(
+        Array.isArray(schema?.required)
+          ? schema!.required.filter((x): x is string => typeof x === "string")
+          : [],
+      );
+      const shape: Record<string, unknown> = {};
+      for (const [key, prop] of Object.entries(props)) {
+        const type =
+          prop && typeof prop === "object"
+            ? (prop as { type?: unknown }).type
+            : undefined;
+        let field: unknown = z.any();
+        if (type === "string") field = z.string();
+        else if (type === "number" || type === "integer") field = z.number();
+        else if (type === "boolean") field = z.boolean();
+        else if (type === "array") field = z.array(z.any());
+        else if (type === "object") field = z.record(z.string(), z.any());
+        if (!required.has(key)) {
+          field = (field as { optional: () => unknown }).optional();
+        }
+        shape[key] = field;
+      }
+      return shape;
+    };
+
     const mcpTools = tools
       .map((t) => {
         const name = t.function?.name;
         if (!name) return null;
         const description = t.function?.description || name;
-        const schema = t.function?.parameters || { type: "object", properties: {} };
+        const shape = jsonSchemaToZodShape(
+          t.function?.parameters as Record<string, unknown> | undefined,
+        );
         return toolFactory(
           name,
           description,
-          schema,
+          shape,
           async (args: Record<string, unknown>) => {
             const id = `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
-            onPark();
-            const result = await new Promise<string>((resolve, reject) => {
-              pendingTools.set(id, {
-                id,
-                name,
-                arguments: JSON.stringify(args ?? {}),
-                resolve,
-                reject,
-              });
+            const pending: ParkedToolCall = {
+              id,
+              name,
+              arguments: JSON.stringify(args ?? {}),
+              resolve: () => {},
+              reject: () => {},
+            };
+            const resultPromise = new Promise<string>((resolve, reject) => {
+              pending.resolve = resolve;
+              pending.reject = reject;
             });
+            // Register before notifying so the stream consumer sees the tool.
+            pendingTools.set(id, pending);
+            onPark();
+            const result = await resultPromise;
             return {
               content: [{ type: "text", text: result }],
             };
           },
+          { alwaysLoad: true },
         );
       })
       .filter(Boolean);
 
     const server = createSdkMcpServer({
       name: "opencode",
+      alwaysLoad: true,
       tools: mcpTools,
     });
 
@@ -641,6 +862,13 @@ type MappedEvent =
   | { kind: "error"; text: string }
   | { kind: "ignore" };
 
+/**
+ * Map Claude Agent SDK events to OpenAI-style deltas.
+ *
+ * Prefer `stream_event` content_block_delta for text/reasoning. Full
+ * `assistant` message payloads repeat the same content after partials and
+ * would double-print if both were forwarded.
+ */
 function mapSdkEvent(event: unknown): MappedEvent {
   if (!event || typeof event !== "object") return { kind: "ignore" };
   const e = event as Record<string, unknown>;
@@ -649,7 +877,7 @@ function mapSdkEvent(event: unknown): MappedEvent {
     return { kind: "park", tools: e.tools as ParkedToolCall[] };
   }
 
-  // stream_event / partial message deltas
+  // stream_event / partial message deltas (authoritative while streaming)
   if (e.type === "stream_event" && e.event && typeof e.event === "object") {
     const ev = e.event as Record<string, unknown>;
     if (ev.type === "content_block_delta" && ev.delta && typeof ev.delta === "object") {
@@ -667,24 +895,13 @@ function mapSdkEvent(event: unknown): MappedEvent {
         };
       }
     }
+    return { kind: "ignore" };
   }
 
-  // Assistant message with content blocks
-  if (e.type === "assistant" && e.message && typeof e.message === "object") {
-    const message = e.message as { content?: unknown };
-    const blocks = Array.isArray(message.content) ? message.content : [];
-    let text = "";
-    let reasoning = "";
-    for (const block of blocks) {
-      if (!block || typeof block !== "object") continue;
-      const b = block as Record<string, unknown>;
-      if (b.type === "text" && typeof b.text === "string") text += b.text;
-      if (b.type === "thinking" && typeof b.thinking === "string") {
-        reasoning += b.thinking;
-      }
-    }
-    if (reasoning) return { kind: "reasoning", text: reasoning };
-    if (text) return { kind: "text", text };
+  // Assistant messages: skip text/thinking replay (already streamed via
+  // stream_event). Tool-use blocks are handled by the MCP park path.
+  if (e.type === "assistant") {
+    return { kind: "ignore" };
   }
 
   if (e.type === "result" && e.is_error) {
@@ -697,7 +914,7 @@ function mapSdkEvent(event: unknown): MappedEvent {
     return { kind: "error", text };
   }
 
-  // Partial message convenience fields used by some SDK builds
+  // Fallback for SDK builds that emit bare text deltas without stream_event
   if (typeof e.text === "string" && e.type === "text_delta") {
     return { kind: "text", text: e.text };
   }
