@@ -1,8 +1,33 @@
-# @otto-assistant/opencode-claude
+<p align="center">
+  <img src="docs/header.svg" width="828" alt="opencode-claude — Claude Code in OpenCode, subscription OAuth, Agent SDK">
+</p>
 
-**Claude Code inside OpenCode** — subscription auth, Claude Agent SDK harness, native effort variants, tools, skills, and streaming.
+<p align="center">
+  <a href="https://www.npmjs.com/package/@otto-assistant/opencode-claude"><img src="https://img.shields.io/npm/v/%40otto-assistant%2Fopencode-claude?style=flat-square&color=e8a87c&labelColor=140f0c&label=npm" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/@otto-assistant/opencode-claude"><img src="https://img.shields.io/npm/dm/%40otto-assistant%2Fopencode-claude?style=flat-square&color=e8a87c&labelColor=140f0c" alt="npm downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-e8a87c?style=flat-square&labelColor=140f0c" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/linux%20·%20macos%20·%20windows-e8a87c?style=flat-square&labelColor=140f0c" alt="linux, macos, windows">
+  <a href="https://github.com/otto-assistant/opencode-claude/releases"><img src="https://img.shields.io/github/v/release/otto-assistant/opencode-claude?style=flat-square&color=e8a87c&labelColor=140f0c&label=release" alt="latest release"></a>
+</p>
 
-Inspired by the [OpenChamber Claude Code harness](https://github.com/makeittech/openchamber-alpha/tree/claude) and the [@otto-assistant/opencode-cursor](https://github.com/otto-assistant/opencode-cursor) plugin shape.
+<p align="center">
+  <strong>Claude Code inside OpenCode</strong> — Pro/Max subscription OAuth,<br>
+  Agent SDK harness, effort variants, tools, images, and compact.
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#authenticate">Authenticate</a> ·
+  <a href="#why-this-plugin">Why this plugin</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
+
+---
+
+Run Claude Code from your Claude Pro/Max subscription inside OpenCode: Fable, Opus, Sonnet, Haiku — with thinking effort `low`→`max`, streaming, OpenCode tool calls that park and resume, MCP, image/PDF attachments, and auto-compact.
+
+Uses the same Agent SDK + `claude` CLI stack as the [OpenChamber Claude harness](https://github.com/makeittech/openchamber-alpha/tree/claude). Plugin shape mirrors [@otto-assistant/opencode-cursor](https://github.com/otto-assistant/opencode-cursor).
 
 ## Install
 
@@ -17,7 +42,7 @@ opencode plugin @otto-assistant/opencode-claude -g
 opencode plugin @otto-assistant/opencode-claude
 ```
 
-Optional: name the provider in config (OpenCode also seeds this when the plugin loads):
+Optional provider naming (also seeded when the plugin loads):
 
 ```jsonc
 {
@@ -29,7 +54,7 @@ Optional: name the provider in config (OpenCode also seeds this when the plugin 
 }
 ```
 
-Or build from source and point OpenCode at the local package:
+Or build from source:
 
 ```bash
 git clone https://github.com/otto-assistant/opencode-claude.git
@@ -42,24 +67,20 @@ opencode plugin file://$PWD
 
 Requires the plugin to be installed (see above).
 
-### Option A — Claude Code CLI (recommended)
-
 ```bash
+# Option A — sync from Claude Code CLI (recommended)
 claude auth login
 opencode auth login --provider claude-code
-```
+# pick "Use Claude Code CLI login"
 
-Pick **Use Claude Code CLI login**. The plugin syncs subscription OAuth from the CLI keychain / `~/.claude/.credentials.json`.
-
-### Option B — Browser OAuth
-
-```bash
+# Option B — browser OAuth (Pro/Max)
 opencode auth login --provider claude-code
+# pick "Login with Claude Pro/Max"
 ```
 
-Pick **Login with Claude Pro/Max**, open the URL, paste the redirect URL / `code#state`.
-
-Then:
+Then start OpenCode, pick provider **claude-code**, choose a model, and set the
+**effort** variant (`low` / `medium` / `high` / `xhigh` / `max`) when you want
+deeper thinking.
 
 ```bash
 opencode run "Summarise this repository in five bullets." --model claude-code/sonnet
@@ -69,29 +90,32 @@ opencode run "Summarise this repository in five bullets." --model claude-code/so
 
 | | |
 |---|---|
-| **Agent SDK harness** | Runs Claude through `@anthropic-ai/claude-agent-sdk` + the local `claude` CLI — same stack as OpenChamber's Claude harness. |
-| **Subscription auth** | Uses Claude Pro/Max OAuth. API keys are stripped from the child env so billing stays on the subscription. |
-| **Native effort** | Model variants `low` → `max` map to Claude `--effort`. |
-| **Native Claude Code** | System prompt preset, skills, project `.claude/` settings, and MCP from disk participate by default. |
-| **OpenCode tools** | OpenCode tool defs are bridged as an in-process MCP server; calls park and resume like the Cursor plugin. |
-| **Session resume** | Sticky foreign Claude session IDs so follow-ups resume the same Agent SDK session. |
+| **Agent SDK harness** | Runs Claude through `@anthropic-ai/claude-agent-sdk` + the local `claude` CLI — same stack as OpenChamber. |
+| **Subscription auth** | Claude Pro/Max OAuth (CLI sync or browser). API keys are stripped from the child env so billing stays on the subscription. |
+| **Effort / thinking** | Native OpenCode variants `low`→`max` map to Claude `--effort` + adaptive thinking. |
+| **Agent-grade tools** | OpenCode tools bridge as in-process MCP; calls park and resume instead of deadlocking or inventing output. |
+| **Attachments** | Images and PDFs from OpenCode reach Claude (data URLs + remote URLs). |
+| **Auto-compact** | Long sessions compact like Claude Code; boundary events are surfaced in the stream. |
+| **Session resume** | Sticky foreign Claude session IDs so follow-ups continue the same Agent SDK turn. |
 
 ## Architecture
 
 ```text
 OpenCode
   └─ /v1/chat/completions
-       └─ Bun.serve proxy
+       └─ Bun.serve proxy (port 8787)
             └─ Claude Agent SDK query()
                  └─ claude CLI (subscription OAuth)
 ```
 
-Model catalog mirrors the OpenChamber harness aliases (`fable`, `opus`, `sonnet`, `haiku`) plus pinned ids.
+Model catalog: aliases `fable` / `opus` / `sonnet` / `haiku` plus pinned ids.
+Effort selection is encoded in `x-opencode-claude-effort` so the proxy passes the
+exact `effort` (+ adaptive thinking) into the Agent SDK.
 
 ## Requirements
 
 - [OpenCode](https://opencode.ai)
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and on `PATH`
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) on `PATH`
 - Claude Pro/Max subscription (or CLI OAuth credentials)
 - Bun (plugin runtime) · Node.js ≥ 18
 
@@ -107,7 +131,7 @@ Debug logging: `OPENCODE_CLAUDE_DEBUG=1`.
 
 Optional knobs:
 
-- `OPENCODE_CLAUDE_PROXY_PORT` — fixed local proxy port (default `8787`; must match what OpenCode resolves from static config)
+- `OPENCODE_CLAUDE_PROXY_PORT` — fixed local proxy port (default `8787`; must match static config)
 - `OPENCODE_CLAUDE_CWD` — working directory passed to the Agent SDK
 - `CLAUDE_CODE_OAUTH_TOKEN` — inject a subscription token (CI / headless)
 
@@ -117,13 +141,11 @@ Publish via GitHub Actions → **Actions → Release → Run workflow**:
 
 | Input | Purpose |
 |---|---|
-| `version` | Explicit semver (`0.2.0`). Empty → use bump |
+| `version` | Explicit semver (`0.6.0`). Empty → use bump |
 | `bump` | `minor` (default) / `patch` / `major` |
 | `dry_run` | Skip npm publish; create a draft GitHub release |
 
-Requires repo secrets: `NPM_TOKEN` (npm publish), optional `DISCORD_WEBHOOK_URL`.
-
-The workflow: bump version → `bun test` → `bun build` → tag `vX.Y.Z` → `npm publish` → GitHub Release.
+Requires repo secrets: `NPM_TOKEN`, optional `DISCORD_WEBHOOK_URL`.
 
 Local pin refresh after a release:
 

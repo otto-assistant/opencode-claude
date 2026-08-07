@@ -31,6 +31,12 @@ import {
   setForeignSessionId,
 } from "./session-store.js";
 import { log } from "./log.js";
+import {
+  extractTextContent,
+  latestUserPrompt,
+  promptAsStream,
+  type SdkUserPrompt,
+} from "./prompt.js";
 
 const DEFAULT_PROXY_PORT = 8787;
 const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
@@ -216,31 +222,6 @@ async function handleRequest(req: Request): Promise<Response> {
   return new Response("Not Found", { status: 404 });
 }
 
-function extractTextContent(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((part) => {
-      if (!part || typeof part !== "object") return "";
-      const p = part as { type?: string; text?: string };
-      if (p.type === "text" && typeof p.text === "string") return p.text;
-      return "";
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
-function latestUserPrompt(messages: OpenAIMessage[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg?.role === "user") {
-      const text = extractTextContent(msg.content).trim();
-      if (text) return text;
-    }
-  }
-  return "";
-}
-
 function collectToolResults(
   messages: OpenAIMessage[],
 ): Map<string, string> {
@@ -354,7 +335,9 @@ async function handleChatCompletions(
 
   const openCodeTools = Array.isArray(body.tools) ? body.tools : [];
   const prompt = latestUserPrompt(messages);
-  if (!prompt && openCodeTools.length === 0) {
+  const promptEmpty =
+    typeof prompt === "string" ? prompt.length === 0 : false;
+  if (promptEmpty && openCodeTools.length === 0) {
     return Response.json(
       { error: { message: "No user message found", type: "invalid_request_error" } },
       { status: 400 },
@@ -407,14 +390,19 @@ async function handleChatCompletions(
       )
     : undefined;
 
+  // Multimodal turns must be streamed as SDKUserMessage (string prompt drops images).
+  const queryPrompt: string | AsyncIterable<SdkUserPrompt> =
+    typeof prompt === "string" ? prompt || " " : promptAsStream(prompt);
+
   handle = await startClaudeQuery({
-    prompt,
+    prompt: queryPrompt,
     cwd,
     model,
     resume,
     effort: selection.effort,
     env,
     mcpServers,
+    autoCompactEnabled: true,
     // OpenCode owns tool execution for bridged MCP tools.
     tools: bridgeOpenCodeTools ? [] : undefined,
     toolAliases,
@@ -430,7 +418,7 @@ async function handleChatCompletions(
       ? {}
       : {
           canUseTool: async (
-            toolName: string,
+            _toolName: string,
             input: Record<string, unknown>,
           ) => ({ behavior: "allow" as const, updatedInput: input }),
         }),
@@ -875,6 +863,15 @@ function mapSdkEvent(event: unknown): MappedEvent {
 
   if (e.type === "__park__" && Array.isArray(e.tools)) {
     return { kind: "park", tools: e.tools as ParkedToolCall[] };
+  }
+
+  // Auto-compact boundary — surface as a short reasoning note for the UI.
+  if (e.type === "system" && e.subtype === "compact_boundary") {
+    return { kind: "reasoning", text: "[compact] Conversation compacted.\n" };
+  }
+
+  if (e.type === "system" && e.status === "compacting") {
+    return { kind: "reasoning", text: "[compact] Compacting context…\n" };
   }
 
   // stream_event / partial message deltas (authoritative while streaming)

@@ -15,6 +15,17 @@ export type ClaudeModel = {
 const LIMIT_1M = { context: 1_000_000, output: 128_000 } as const;
 const LIMIT_200K = { context: 200_000, output: 64_000 } as const;
 
+/** OpenCode may inject these before merging plugin variants — disable extras. */
+export const GENERATED_VARIANT_KEYS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+
 function model(
   id: string,
   name: string,
@@ -84,11 +95,31 @@ export function resolveClaudeModelId(modelId: string): string {
   return match.resolvedId || match.id;
 }
 
+/**
+ * Runtime variants for the provider.models() hook.
+ * Keys are OpenCode UI choices; values carry the effort level for chat.headers.
+ */
 export function buildEffortVariants(
   model: ClaudeModel,
-): Record<string, { effort: ClaudeEffort }> {
+): Record<string, { effort: ClaudeEffort } | { disabled: true }> {
   if (!model.reasoning || isLoginPlaceholderModel(model.id)) return {};
-  return Object.fromEntries(
-    EFFORT_LEVELS.map((effort) => [effort, { effort }]),
-  );
+  const variants: Record<
+    string,
+    { effort: ClaudeEffort } | { disabled: true }
+  > = Object.fromEntries(EFFORT_LEVELS.map((effort) => [effort, { effort }]));
+  for (const key of GENERATED_VARIANT_KEYS) {
+    if (!(key in variants)) variants[key] = { disabled: true };
+  }
+  return variants;
+}
+
+/**
+ * Static config variants. Same effort map; OpenCode merges these into the menu.
+ * Mark config model `reasoning: false` so OpenCode does not prepend its own
+ * generic low/medium/high ahead of this map.
+ */
+export function buildConfigVariants(
+  model: ClaudeModel,
+): Record<string, { effort: ClaudeEffort } | { disabled: true }> {
+  return buildEffortVariants(model);
 }
