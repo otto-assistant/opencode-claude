@@ -98,7 +98,7 @@ Debug logging: `OPENCODE_CLAUDE_DEBUG=1`.
 
 Optional knobs:
 
-- `OPENCODE_CLAUDE_PROXY_PORT` — fix the local proxy port (default: ephemeral / 3457 for static config)
+- `OPENCODE_CLAUDE_PROXY_PORT` — fixed local proxy port (default `8787`; must match what OpenCode resolves from static config)
 - `OPENCODE_CLAUDE_CWD` — working directory passed to the Agent SDK
 - `CLAUDE_CODE_OAUTH_TOKEN` — inject a subscription token (CI / headless)
 

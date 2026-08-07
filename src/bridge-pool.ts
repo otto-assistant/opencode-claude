@@ -25,6 +25,21 @@ export type ParkedBridge = {
 const bridges = new Map<string, ParkedBridge>();
 
 export function putBridge(bridge: ParkedBridge): void {
+  // One active bridge per conversation — drop any prior turn for this key.
+  for (const [id, existing] of bridges) {
+    if (existing.conversationKey === bridge.conversationKey && id !== bridge.id) {
+      for (const tool of existing.pendingTools.values()) {
+        tool.reject(new Error("Superseded by a newer turn"));
+      }
+      existing.pendingTools.clear();
+      try {
+        existing.handle.close();
+      } catch {
+        // ignore
+      }
+      bridges.delete(id);
+    }
+  }
   bridges.set(bridge.id, bridge);
 }
 
@@ -37,6 +52,15 @@ export function findBridgeByConversation(
 ): ParkedBridge | undefined {
   for (const bridge of bridges.values()) {
     if (bridge.conversationKey === conversationKey) return bridge;
+  }
+  return undefined;
+}
+
+export function findBridgeByPendingTool(
+  toolCallId: string,
+): ParkedBridge | undefined {
+  for (const bridge of bridges.values()) {
+    if (bridge.pendingTools.has(toolCallId)) return bridge;
   }
   return undefined;
 }

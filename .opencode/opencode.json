@@ -2,5 +2,8 @@
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     "@otto-assistant/opencode-claude@0.1.0"
-  ]
+  ],
+  "provider": {
+    "claude-code": { "name": "Claude Code" }
+  }
 }
