@@ -224,11 +224,30 @@ async function main() {
   await runCase("proxy.health_models", async () => {
     const h = await fetch(`${getClaudeProxyBaseUrl().replace(/\/v1$/, "")}/health`);
     assert.equal(h.status, 200);
+    const healthBody = (await h.json()) as {
+      ok: boolean;
+      rateLimit?: { limited?: boolean };
+    };
+    assert.equal(healthBody.ok, true);
+    assert.equal(typeof healthBody.rateLimit?.limited, "boolean");
     const models = await fetch(`${getClaudeProxyBaseUrl()}/models`);
     assert.equal(models.status, 200);
     const body = (await models.json()) as { data: Array<{ id: string }> };
     assert.ok(body.data.some((m) => m.id === "haiku"));
-    return { detail: `models=${body.data.map((m) => m.id).join(",")}` };
+    return {
+      detail: `models=${body.data.map((m) => m.id).join(",")} limited=${healthBody.rateLimit?.limited}`,
+    };
+  });
+
+  // Rate-limit counter endpoint (pre-turn shape)
+  await runCase("proxy.rate_limit_endpoint", async () => {
+    const res = await fetch(`${getClaudeProxyBaseUrl()}/rate-limit`);
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as Record<string, unknown>;
+    assert.equal(typeof body.limited, "boolean");
+    return {
+      detail: `limited=${body.limited} status=${body.status ?? "n/a"} util=${body.utilization ?? "n/a"}`,
+    };
   });
 
   // 1) Simple non-stream text + usage
@@ -647,6 +666,23 @@ async function main() {
     );
     assert.equal(res.status, 400);
     return { detail: "status=400" };
+  });
+
+  // 12b) Rate-limit tracker recorded real SDK telemetry during live turns
+  await runCase("haiku.rate_limit_recorded", async () => {
+    const res = await fetch(`${getClaudeProxyBaseUrl()}/rate-limit`);
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as Record<string, unknown>;
+    assert.equal(typeof body.limited, "boolean");
+    // Live turns emit rate_limit_event → status/utilization must be recorded.
+    assert.ok(
+      typeof body.status === "string" && body.status.length > 0,
+      `expected recorded limiter status, got ${JSON.stringify(body)}`,
+    );
+    assert.ok(body.updatedAt, "expected updatedAt");
+    return {
+      detail: `status=${body.status} util=${body.utilization ?? "n/a"} resetsAt=${body.resetsAtISO ?? "n/a"} limited=${body.limited}`,
+    };
   });
 
   // 13) OpenCode CLI path with --file (PNG) — stop in-process proxy first

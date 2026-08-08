@@ -1,0 +1,373 @@
+/**
+ * Claude subscription rate-limit tracker.
+ *
+ * The Agent SDK emits structured `rate_limit_event` events
+ * ({ status, resetsAt, rateLimitType, utilization, ... }) and, on a hard
+ * session/usage limit, fails the turn with a human message like
+ * "You've hit your session limit · resets 1:10am (Europe/Kyiv)".
+ *
+ * This module records both into a small durable store so the proxy can:
+ * - answer `GET /v1/rate-limit` with a live countdown ("counter when limits
+ *   are back"),
+ * - fail fast with HTTP 429 + Retry-After while a confirmed hard limit is
+ *   active instead of spawning a doomed Agent SDK turn,
+ * - append the reset countdown to the streamed error note.
+ *
+ * Store: $XDG_DATA_HOME/opencode-claude/rate-limit.json
+ * Env:
+ * - OPENCODE_CLAUDE_RATE_LIMIT_STORE — override store path (tests)
+ * - OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0 — disable the 429 gate
+ */
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+
+export type ClaudeRateLimitState = {
+  /** Hard limit confirmed by an error result — gates new turns. */
+  limited: boolean;
+  /** Do not start new turns until this epoch ms (resetsAt or fallback). */
+  limitedUntil?: number;
+  /** Last SDK rate_limit_event status (allowed | allowed_warning | rejected…). */
+  status?: string;
+  /** e.g. "five_hour". */
+  rateLimitType?: string;
+  /** 0..1 when the SDK reports it. */
+  utilization?: number;
+  /** Epoch ms when the limited window resets (from SDK or parsed text). */
+  resetsAt?: number;
+  /** Last human-readable limit message. */
+  message?: string;
+  /** Overage pool disabled at org level (from SDK event). */
+  overageDisabled?: boolean;
+  updatedAt: number;
+};
+
+/** When a hard limit error carries no reset time, block new turns briefly. */
+const FALLBACK_BLOCK_MS = 10 * 60 * 1000;
+
+function storePath(): string {
+  const override = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+  if (override && override.trim()) return override.trim();
+  const xdg = process.env.XDG_DATA_HOME;
+  const base = xdg ? xdg : join(homedir(), ".local", "share");
+  return join(base, "opencode-claude", "rate-limit.json");
+}
+
+function readState(): ClaudeRateLimitState | null {
+  const path = storePath();
+  if (!existsSync(path)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (!parsed || typeof parsed !== "object") return null;
+    return parsed as ClaudeRateLimitState;
+  } catch {
+    return null;
+  }
+}
+
+function writeState(state: ClaudeRateLimitState): void {
+  try {
+    const path = storePath();
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify(state, null, 2) + "\n", "utf8");
+  } catch {
+    // never let the tracker break the proxy
+  }
+}
+
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/**
+ * Record a structured SDK `rate_limit_event` payload. Never sets `limited`
+ * on its own — the SDK reports "rejected" for turns that still complete
+ * (overage pool rejection); only a hard error result confirms the limit.
+ */
+export function recordRateLimitInfo(info: unknown): ClaudeRateLimitState | null {
+  if (!info || typeof info !== "object") return null;
+  const raw = info as Record<string, unknown>;
+  const prev = readState() ?? { limited: false, updatedAt: 0 };
+  const resetsAtSec = asNumber(raw.resetsAt);
+  const next: ClaudeRateLimitState = {
+    ...prev,
+    status: asString(raw.status) ?? prev.status,
+    rateLimitType: asString(raw.rateLimitType) ?? prev.rateLimitType,
+    utilization: asNumber(raw.utilization) ?? prev.utilization,
+    overageDisabled:
+      typeof raw.overageDisabledReason === "string" &&
+      raw.overageDisabledReason.length > 0
+        ? true
+        : prev.overageDisabled,
+    resetsAt:
+      resetsAtSec !== undefined
+        ? resetsAtSec > 1e12
+          ? resetsAtSec // already ms
+          : resetsAtSec * 1000 // SDK emits epoch seconds
+        : prev.resetsAt,
+    updatedAt: Date.now(),
+  };
+  writeState(next);
+  return next;
+}
+
+/** Match human-readable hard-limit error text from the Agent SDK / API. */
+export function isClaudeRateLimitText(text: string): boolean {
+  return (
+    /hit your (session|usage) limit/i.test(text) ||
+    /usage limit reached/i.test(text) ||
+    /rate[ -]?limit/i.test(text) ||
+    /too many requests/i.test(text) ||
+    /\b429\b/.test(text)
+  );
+}
+
+/**
+ * Parse "resets 1:10am (Europe/Kyiv)" / "reset at 2026-08-09T01:10:00" into
+ * epoch ms. Returns undefined when no reset hint is present.
+ */
+export function parseResetTimeFromText(
+  text: string,
+  now: number = Date.now(),
+): number | undefined {
+  // ISO-ish absolute timestamp
+  const iso = /resets?\s+(?:at\s+)?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/i.exec(
+    text,
+  );
+  if (iso) {
+    const parsed = Date.parse(iso[1].includes("T") ? iso[1] : iso[1].replace(" ", "T"));
+    if (Number.isFinite(parsed)) return parsed;
+  }
+
+  // "resets 1:10am (Europe/Kyiv)" / "resets at 13:05 (UTC)" style
+  const wall =
+    /resets?\s+(?:at\s+)?(\d{1,2}):(\d{2})\s*(am|pm)?\s*\(([^)]+)\)/i.exec(text);
+  if (!wall) return undefined;
+  let hour = Number(wall[1]);
+  const minute = Number(wall[2]);
+  const meridiem = wall[3]?.toLowerCase();
+  const zone = wall[4].trim();
+  if (meridiem === "pm" && hour < 12) hour += 12;
+  if (meridiem === "am" && hour === 12) hour = 0;
+  if (hour > 23 || minute > 59) return undefined;
+
+  // Find the earliest future instant whose wall clock in `zone` is hour:minute.
+  let fmt: Intl.DateTimeFormat;
+  try {
+    fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: zone,
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+  } catch {
+    return undefined; // unknown IANA zone
+  }
+  const target = hour * 60 + minute;
+  // Scan forward in 5-minute steps; limit resets are within ~24h by design.
+  for (let t = now + 60_000; t <= now + 26 * 3_600_000; t += 5 * 60_000) {
+    const parts = fmt.formatToParts(new Date(t));
+    const h = Number(parts.find((p) => p.type === "hour")?.value);
+    const m = Number(parts.find((p) => p.type === "minute")?.value);
+    const cur = (h === 24 ? 0 : h) * 60 + m;
+    if (Math.abs(cur - target) <= 2) return t;
+  }
+  return undefined;
+}
+
+/**
+ * Record a hard-limit error message. Returns the updated state, or null when
+ * the text is not a limit error.
+ */
+export function recordRateLimitErrorText(
+  text: string,
+): ClaudeRateLimitState | null {
+  if (!text || !isClaudeRateLimitText(text)) return null;
+  const prev = readState() ?? { limited: false, updatedAt: 0 };
+  const resetsAt = parseResetTimeFromText(text) ?? prev.resetsAt;
+  const now = Date.now();
+  const next: ClaudeRateLimitState = {
+    ...prev,
+    limited: true,
+    limitedUntil:
+      resetsAt && resetsAt > now ? resetsAt : now + FALLBACK_BLOCK_MS,
+    ...(resetsAt ? { resetsAt } : {}),
+    message: text.trim().slice(0, 300),
+    updatedAt: now,
+  };
+  writeState(next);
+  return next;
+}
+
+/** Strip wrapper prefixes so duplicate error emissions compare equal. */
+export function normalizeClaudeErrorText(text: string): string {
+  return text
+    .replace(/^\[claude-code error\]\s*/i, "")
+    .replace(/^claude code returned an error result:\s*/i, "")
+    .replace(/\s*·\s*limit resets in .*$/i, "") // appended countdown suffix
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+export function formatResetCountdown(ms: number): string {
+  if (ms <= 0) return "now";
+  const sec = Math.round(ms / 1000);
+  if (sec < 90) return `${sec}s`;
+  const min = Math.round(sec / 60);
+  if (min < 90) return `${min}m`;
+  const h = Math.floor(min / 60);
+  const remMin = min % 60;
+  return remMin ? `${h}h ${remMin}m` : `${h}h`;
+}
+
+export type RateLimitSnapshot = {
+  limited: boolean;
+  limitedUntil?: number;
+  resetsAt?: number;
+  resetsAtISO?: string;
+  resetInSeconds?: number;
+  status?: string;
+  rateLimitType?: string;
+  utilization?: number;
+  overageDisabled?: boolean;
+  message?: string;
+  updatedAt?: number;
+};
+
+/** Current snapshot; auto-clears an expired hard block (self-healing). */
+export function getRateLimitSnapshot(now: number = Date.now()): RateLimitSnapshot {
+  const state = readState();
+  if (!state) return { limited: false };
+  let { limited, limitedUntil } = state;
+  if (limited && limitedUntil !== undefined && now >= limitedUntil) {
+    limited = false;
+    writeState({ ...state, limited: false, updatedAt: now });
+  }
+  const resetsAt = state.resetsAt;
+  const resetInSeconds =
+    limited && limitedUntil !== undefined
+      ? Math.max(0, Math.round((limitedUntil - now) / 1000))
+      : resetsAt !== undefined
+        ? Math.max(0, Math.round((resetsAt - now) / 1000))
+        : undefined;
+  return {
+    limited,
+    ...(limitedUntil !== undefined ? { limitedUntil } : {}),
+    ...(resetsAt !== undefined
+      ? { resetsAt, resetsAtISO: new Date(resetsAt).toISOString() }
+      : {}),
+    ...(resetInSeconds !== undefined ? { resetInSeconds } : {}),
+    ...(state.status ? { status: state.status } : {}),
+    ...(state.rateLimitType ? { rateLimitType: state.rateLimitType } : {}),
+    ...(state.utilization !== undefined
+      ? { utilization: state.utilization }
+      : {}),
+    ...(state.overageDisabled !== undefined
+      ? { overageDisabled: state.overageDisabled }
+      : {}),
+    ...(state.message ? { message: state.message } : {}),
+    ...(state.updatedAt ? { updatedAt: state.updatedAt } : {}),
+  };
+}
+
+export type RateLimitGate =
+  | { blocked: false }
+  | {
+      blocked: true;
+      retryAfterSeconds: number;
+      resetsAt?: number;
+      message: string;
+    };
+
+/**
+ * Gate for new Agent SDK turns. Only a confirmed hard limit blocks, and only
+ * until the known/estimated reset. OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0
+ * disables the gate entirely.
+ */
+export function rateLimitGate(now: number = Date.now()): RateLimitGate {
+  const flag = (process.env.OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL ?? "")
+    .toLowerCase();
+  if (flag === "0" || flag === "false" || flag === "off") {
+    return { blocked: false };
+  }
+  const snap = getRateLimitSnapshot(now);
+  if (!snap.limited) return { blocked: false };
+  const until = snap.limitedUntil ?? snap.resetsAt;
+  const retryAfterSeconds =
+    until !== undefined
+      ? Math.max(1, Math.round((until - now) / 1000))
+      : Math.round(FALLBACK_BLOCK_MS / 1000);
+  const countdown = formatResetCountdown(retryAfterSeconds * 1000);
+  const base = snap.message || "Claude session/usage limit reached";
+  return {
+    blocked: true,
+    retryAfterSeconds,
+    ...(snap.resetsAt !== undefined ? { resetsAt: snap.resetsAt } : {}),
+    message: `${base} · limit resets in ${countdown}${
+      snap.resetsAtISO ? ` (${snap.resetsAtISO})` : ""
+    }`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Stream note dedupe — one rate-limit note per status/threshold per process.
+// ---------------------------------------------------------------------------
+
+let lastNoteSignature: string | null = null;
+
+/**
+ * Build a short user-facing note for a structured event, but only when the
+ * situation meaningfully changed (status change, or utilization crossing
+ * 0.9 / 0.95 / 0.99). Returns null when nothing new is worth surfacing.
+ */
+export function maybeRateLimitNote(
+  state: ClaudeRateLimitState | null,
+): string | null {
+  if (!state || !state.status) return null;
+  const status = state.status;
+  const interesting =
+    status === "rejected" ||
+    status === "allowed_warning" ||
+    (state.utilization !== undefined && state.utilization >= 0.9);
+  if (!interesting) {
+    lastNoteSignature = null;
+    return null;
+  }
+  const util = state.utilization ?? 0;
+  const bucket =
+    status === "rejected"
+      ? "rejected"
+      : util >= 0.99
+        ? "u99"
+        : util >= 0.95
+          ? "u95"
+          : "u90";
+  const signature = `${status}:${bucket}:${state.resetsAt ?? ""}`;
+  if (signature === lastNoteSignature) return null;
+  lastNoteSignature = signature;
+
+  const parts = ["[rate-limit] Claude"];
+  if (state.rateLimitType) parts.push(state.rateLimitType.replace(/_/g, " "));
+  if (status === "rejected") {
+    parts.push("request rejected by limiter");
+  } else if (util >= 0.9) {
+    parts.push(`${Math.round(util * 100)}% of window used`);
+  } else {
+    parts.push(status);
+  }
+  if (state.resetsAt) {
+    const ms = state.resetsAt - Date.now();
+    if (ms > 0) parts.push(`resets in ${formatResetCountdown(ms)}`);
+  }
+  return `${parts.join(" · ")}.\n`;
+}
+
+/** Test helper: reset process-local note dedupe. */
+export function __resetRateLimitNoteDedupe(): void {
+  lastNoteSignature = null;
+}

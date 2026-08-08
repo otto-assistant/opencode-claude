@@ -432,6 +432,345 @@ async function main() {
     assert.doesNotMatch(titleBody, /reasoning_content/);
   }
 
+  // ---- Rate-limit tracker + tool/plan behavior (mocked Agent SDK) ----
+  {
+    const {
+      __resetRateLimitNoteDedupe,
+      formatResetCountdown,
+      getRateLimitSnapshot,
+      isClaudeRateLimitText,
+      maybeRateLimitNote,
+      normalizeClaudeErrorText,
+      parseResetTimeFromText,
+      rateLimitGate,
+      recordRateLimitErrorText,
+      recordRateLimitInfo,
+    } = await import("../src/rate-limit.ts");
+    const { setClaudeQueryStarter } = await import("../src/proxy.ts");
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join: joinPath } = await import("node:path");
+
+    const tmpDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-rl-"));
+    const storeFile = joinPath(tmpDir, "rate-limit.json");
+    const prevStoreEnv = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+    process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = storeFile;
+
+    try {
+      // Unit: text detection + normalization
+      assert.equal(
+        isClaudeRateLimitText(
+          "You've hit your session limit · resets 1:10am (Europe/Kyiv)",
+        ),
+        true,
+      );
+      assert.equal(isClaudeRateLimitText("all good"), false);
+      assert.equal(
+        normalizeClaudeErrorText(
+          "Claude Code returned an error result: You've hit your session limit · resets 1:10am (Europe/Kyiv)",
+        ),
+        normalizeClaudeErrorText(
+          "[claude-code error] You've hit your session limit · resets 1:10am (Europe/Kyiv)",
+        ),
+      );
+
+      // Unit: reset-time parsing (wall clock + IANA zone, ISO, none)
+      const wallReset = parseResetTimeFromText(
+        "You've hit your session limit · resets 1:10am (Europe/Kyiv)",
+      );
+      assert.ok(wallReset, "expected wall-clock reset parse");
+      assert.ok(wallReset! > Date.now(), "reset must be in the future");
+      assert.ok(
+        wallReset! <= Date.now() + 26 * 3600_000,
+        "reset must be within 26h",
+      );
+      const isoReset = parseResetTimeFromText(
+        "usage limit reached, resets at 2099-01-02T03:04:05Z",
+      );
+      assert.equal(isoReset, Date.parse("2099-01-02T03:04:05Z"));
+      assert.equal(parseResetTimeFromText("no reset hint"), undefined);
+      assert.equal(formatResetCountdown(0), "now");
+      assert.equal(formatResetCountdown(3_900_000), "65m");
+      assert.match(formatResetCountdown(5_700_000), /^1h 35m$/);
+
+      // Unit: structured event recording (SDK emits epoch seconds)
+      const futureSec = Math.floor(Date.now() / 1000) + 5400;
+      const recorded = recordRateLimitInfo({
+        status: "allowed_warning",
+        resetsAt: futureSec,
+        rateLimitType: "five_hour",
+        utilization: 0.99,
+      });
+      assert.ok(recorded);
+      assert.equal(recorded!.limited, false); // events alone never gate
+      assert.equal(recorded!.resetsAt, futureSec * 1000);
+      assert.equal(recorded!.utilization, 0.99);
+
+      // Unit: note dedupe (first yes, same signature no)
+      __resetRateLimitNoteDedupe();
+      const note1 = maybeRateLimitNote(recorded);
+      assert.ok(note1 && /rate-limit/.test(note1) && /99%/.test(note1));
+      assert.equal(maybeRateLimitNote(recorded), null);
+
+      // Proxy: /v1/rate-limit counter endpoint reflects recorded state
+      const rlRes = await fetch(`http://127.0.0.1:${port}/v1/rate-limit`);
+      assert.equal(rlRes.status, 200);
+      const rlBody = (await rlRes.json()) as Record<string, unknown>;
+      assert.equal(rlBody.limited, false);
+      assert.equal(rlBody.status, "allowed_warning");
+      assert.equal(rlBody.utilization, 0.99);
+      assert.equal(rlBody.resetsAt, futureSec * 1000);
+
+      // /health carries a compact counter too
+      const healthRes = await fetch(`http://127.0.0.1:${port}/health`);
+      const healthBody = (await healthRes.json()) as {
+        rateLimit?: { limited?: boolean; utilization?: number };
+      };
+      assert.equal(healthBody.rateLimit?.limited, false);
+      assert.equal(healthBody.rateLimit?.utilization, 0.99);
+
+      // Proxy + mock SDK: successful turn streams text, note, usage — and the
+      // todowrite alias + plan-persistence prompt reach the query starter.
+      __resetRateLimitNoteDedupe();
+      let seenParams: Record<string, unknown> | null = null;
+      setClaudeQueryStarter(async (params) => {
+        seenParams = params as unknown as Record<string, unknown>;
+        const events = [
+          { type: "system", subtype: "init", session_id: "mock-sess-1" },
+          {
+            type: "rate_limit_event",
+            rate_limit_info: {
+              status: "allowed_warning",
+              resetsAt: futureSec,
+              rateLimitType: "five_hour",
+              utilization: 0.99,
+            },
+          },
+          {
+            type: "rate_limit_event",
+            rate_limit_info: {
+              status: "allowed_warning",
+              resetsAt: futureSec,
+              rateLimitType: "five_hour",
+              utilization: 0.99,
+            },
+          },
+          {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "MOCK_OK" },
+            },
+          },
+          {
+            type: "result",
+            is_error: false,
+            total_cost_usd: 0.001,
+            usage: { input_tokens: 11, output_tokens: 3 },
+          },
+        ];
+        return {
+          stream: (async function* () {
+            for (const ev of events) yield ev;
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        };
+      });
+
+      const okRes = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-opencode-claude-session": "smoke-mock-ok",
+        },
+        body: JSON.stringify({
+          model: "sonnet",
+          stream: false,
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: "todowrite",
+                description: "Write the todo list",
+                parameters: { type: "object", properties: {} },
+              },
+            },
+          ],
+          messages: [{ role: "user", content: "plan something" }],
+        }),
+      });
+      assert.equal(okRes.status, 200);
+      const okJson = (await okRes.json()) as {
+        choices?: Array<{ message?: Record<string, unknown> }>;
+        usage?: { prompt_tokens?: number };
+      };
+      const okMsg = okJson.choices?.[0]?.message ?? {};
+      assert.match(String(okMsg.content ?? ""), /MOCK_OK/);
+      // rate-limit note surfaced once (two identical events → one note)
+      const okReasoning = String(okMsg.reasoning_content ?? "");
+      assert.equal(okReasoning.match(/\[rate-limit\]/g)?.length ?? 0, 1);
+      assert.match(okReasoning, /99%/);
+      assert.equal(okJson.usage?.prompt_tokens, 11);
+
+      // Query starter received the todo alias + plan-persistence append
+      assert.ok(seenParams, "query starter params captured");
+      const aliases = (seenParams as { toolAliases?: Record<string, string> })
+        .toolAliases;
+      assert.equal(aliases?.TodoWrite, "mcp__opencode__todowrite");
+      assert.equal(aliases?.todowrite, "mcp__opencode__todowrite");
+      const sysPrompt = seenParams.systemPrompt as { append?: string };
+      assert.match(sysPrompt.append ?? "", /mcp__opencode__todowrite/);
+      assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
+
+      // Proxy + mock SDK: hard limit error — single error note, usage kept,
+      // store flips to limited, next request fails fast with 429.
+      setClaudeQueryStarter(async () => {
+        const limitText =
+          "You've hit your session limit · resets 1:10am (Europe/Kyiv)";
+        return {
+          stream: (async function* () {
+            yield { type: "system", subtype: "init", session_id: "mock-sess-2" };
+            yield {
+              type: "result",
+              is_error: true,
+              result: limitText,
+              total_cost_usd: 0.0005,
+              usage: { input_tokens: 7, output_tokens: 1 },
+            };
+            throw new Error(
+              `Claude Code returned an error result: ${limitText}`,
+            );
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        };
+      });
+
+      const errRes = await fetch(
+        `http://127.0.0.1:${port}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-opencode-claude-session": "smoke-mock-err",
+          },
+          body: JSON.stringify({
+            model: "sonnet",
+            stream: true,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        },
+      );
+      assert.equal(errRes.status, 200);
+      const errBody = await errRes.text();
+      // error streamed exactly once despite result event + iterator throw
+      assert.equal(errBody.match(/\[claude-code error\]/g)?.length ?? 0, 1);
+      assert.match(errBody, /session limit/);
+      assert.match(errBody, /limit resets in/);
+      assert.match(errBody, /"prompt_tokens":7/); // usage forwarded on error
+      assert.match(errBody, /\[DONE\]/);
+
+      const snap = getRateLimitSnapshot();
+      assert.equal(snap.limited, true);
+      assert.ok(
+        snap.resetInSeconds !== undefined && snap.resetInSeconds > 0,
+        "expected a countdown while limited",
+      );
+
+      const gate = rateLimitGate();
+      assert.equal(gate.blocked, true);
+      if (gate.blocked) assert.ok(gate.retryAfterSeconds > 0);
+
+      // Fast-fail: new main turns get HTTP 429 + Retry-After + reset headers
+      const blockedRes = await fetch(
+        `http://127.0.0.1:${port}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-opencode-claude-session": "smoke-mock-blocked",
+          },
+          body: JSON.stringify({
+            model: "sonnet",
+            stream: false,
+            messages: [{ role: "user", content: "hi again" }],
+          }),
+        },
+      );
+      assert.equal(blockedRes.status, 429);
+      assert.ok(blockedRes.headers.get("retry-after"));
+      const blockedJson = (await blockedRes.json()) as {
+        error?: { type?: string; message?: string; retry_after?: number };
+      };
+      assert.equal(blockedJson.error?.type, "rate_limit_error");
+      assert.match(blockedJson.error?.message ?? "", /limit resets in/);
+      assert.ok((blockedJson.error?.retry_after ?? 0) > 0);
+
+      // Meta (title) path is NOT gated — sessions still get named while limited
+      const metaRes = await fetch(
+        `http://127.0.0.1:${port}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-haiku-4-5",
+            stream: false,
+            messages: [
+              {
+                role: "system",
+                content:
+                  "You are a title generator. Generate a brief title. Output only the title.",
+              },
+              { role: "user", content: "Explain quicksort" },
+            ],
+          }),
+        },
+      );
+      assert.equal(metaRes.status, 200);
+
+      // Counter endpoint reports the active limit with countdown
+      const limitedRes = await fetch(`http://127.0.0.1:${port}/v1/rate-limit`);
+      const limitedBody = (await limitedRes.json()) as {
+        limited?: boolean;
+        resetInSeconds?: number;
+        message?: string;
+      };
+      assert.equal(limitedBody.limited, true);
+      assert.ok((limitedBody.resetInSeconds ?? 0) > 0);
+      assert.match(limitedBody.message ?? "", /session limit/);
+
+      // Gate env kill-switch
+      process.env.OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL = "0";
+      assert.equal(rateLimitGate().blocked, false);
+      delete process.env.OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL;
+      assert.equal(rateLimitGate().blocked, true);
+
+      // Expired hard block self-heals on read
+      const { writeFileSync } = await import("node:fs");
+      writeFileSync(
+        storeFile,
+        JSON.stringify({
+          limited: true,
+          limitedUntil: Date.now() - 1000,
+          updatedAt: Date.now() - 60_000,
+        }),
+      );
+      assert.equal(getRateLimitSnapshot().limited, false);
+      rmSync(storeFile, { force: true });
+    } finally {
+      setClaudeQueryStarter(null);
+      if (prevStoreEnv === undefined) {
+        delete process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+      } else {
+        process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = prevStoreEnv;
+      }
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
   await stopProxy();
 
   // TypeScript build

@@ -32,6 +32,15 @@ import {
 } from "./session-store.js";
 import { log } from "./log.js";
 import {
+  getRateLimitSnapshot,
+  maybeRateLimitNote,
+  normalizeClaudeErrorText,
+  rateLimitGate,
+  recordRateLimitErrorText,
+  recordRateLimitInfo,
+  formatResetCountdown,
+} from "./rate-limit.js";
+import {
   extractTextContent,
   latestUserPrompt,
   promptAsStream,
@@ -110,6 +119,15 @@ type ChatCompletionRequest = {
 let server: ReturnType<typeof Bun.serve> | null = null;
 let proxyPort: number | null = null;
 let getAccessToken: TokenProvider | null = null;
+
+/** Injectable for smoke tests — production path always uses startClaudeQuery. */
+let queryStarter: typeof startClaudeQuery = startClaudeQuery;
+
+export function setClaudeQueryStarter(
+  starter: typeof startClaudeQuery | null,
+): void {
+  queryStarter = starter ?? startClaudeQuery;
+}
 
 export function getClaudeProxyBaseUrl(): string {
   const port = proxyPort ?? (REQUESTED_PROXY_PORT > 0 ? REQUESTED_PROXY_PORT : null);
@@ -221,7 +239,29 @@ async function handleRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
 
   if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) {
-    return Response.json({ ok: true, provider: "claude-code" });
+    const rateLimit = getRateLimitSnapshot();
+    return Response.json({
+      ok: true,
+      provider: "claude-code",
+      rateLimit: {
+        limited: rateLimit.limited,
+        ...(rateLimit.resetsAtISO ? { resetsAt: rateLimit.resetsAtISO } : {}),
+        ...(rateLimit.resetInSeconds !== undefined
+          ? { resetInSeconds: rateLimit.resetInSeconds }
+          : {}),
+        ...(rateLimit.utilization !== undefined
+          ? { utilization: rateLimit.utilization }
+          : {}),
+      },
+    });
+  }
+
+  // Live "when are limits back" counter for OpenChamber / OpenCode UIs.
+  if (
+    req.method === "GET" &&
+    (url.pathname === "/rate-limit" || url.pathname === "/v1/rate-limit")
+  ) {
+    return Response.json(getRateLimitSnapshot());
   }
 
   if (req.method === "GET" && url.pathname === "/v1/models") {
@@ -491,6 +531,40 @@ async function handleChatCompletions(
     );
   }
 
+  // Confirmed hard subscription limit active? Fail fast with a proper 429 +
+  // Retry-After instead of spawning a doomed Agent SDK turn (which would
+  // surface as a fake "completed" assistant message and burn time).
+  // Placed after input validation so malformed requests still get 400.
+  const gate = rateLimitGate();
+  if (gate.blocked) {
+    log.warn("[opencode-claude] rate-limit gate blocked a turn", {
+      conversationKey,
+      retryAfterSeconds: gate.retryAfterSeconds,
+    });
+    return Response.json(
+      {
+        error: {
+          message: gate.message,
+          type: "rate_limit_error",
+          code: "claude_session_limit",
+          ...(gate.resetsAt !== undefined
+            ? { resets_at: new Date(gate.resetsAt).toISOString() }
+            : {}),
+          retry_after: gate.retryAfterSeconds,
+        },
+      },
+      {
+        status: 429,
+        headers: {
+          "Retry-After": String(gate.retryAfterSeconds),
+          ...(gate.resetsAt !== undefined
+            ? { "x-claude-rate-limit-reset": new Date(gate.resetsAt).toISOString() }
+            : {}),
+        },
+      },
+    );
+  }
+
   const resume = getForeignSessionId(conversationKey);
 
   const mcpServers =
@@ -515,6 +589,10 @@ async function handleChatCompletions(
           if (name === "write") aliases.push(["Write", mcpName]);
           if (name === "glob") aliases.push(["Glob", mcpName]);
           if (name === "grep") aliases.push(["Grep", mcpName]);
+          // Claude Code's built-in todo habit must land on OpenCode's todo
+          // tools or plans die with the turn (never persisted/transferred).
+          if (name === "todowrite") aliases.push(["TodoWrite", mcpName]);
+          if (name === "todoread") aliases.push(["TodoRead", mcpName]);
           return aliases;
         }),
       )
@@ -523,7 +601,8 @@ async function handleChatCompletions(
   const queryPrompt: string | AsyncIterable<SdkUserPrompt> =
     typeof prompt === "string" ? prompt || " " : promptAsStream(prompt);
 
-  handle = await startClaudeQuery({
+  const hasTodoWrite = openCodeToolNames.includes("todowrite");
+  handle = await queryStarter({
     prompt: queryPrompt,
     cwd,
     model,
@@ -554,8 +633,15 @@ async function handleChatCompletions(
       preset: "claude_code",
       ...(bridgeOpenCodeTools
         ? {
-            append:
+            append: [
               "You are running inside OpenCode. Built-in Claude Code tools are disabled. Use only the mcp__opencode__* tools provided for this turn; they execute via OpenCode.",
+              "Batch independent tool calls into a single turn instead of calling them one at a time.",
+              ...(hasTodoWrite
+                ? [
+                    "For any multi-step work, ALWAYS write the plan with the mcp__opencode__todowrite tool and keep it updated as you progress. A plan that only exists in your text is lost when the session is restored or handed to another agent.",
+                  ]
+                : []),
+            ].join(" "),
           }
         : {}),
     },
@@ -773,6 +859,7 @@ function streamOpenAIResponse(
       let content = "";
       let reasoning = "";
       let usage: OpenAIUsage | null = null;
+      let lastErrorNorm: string | null = null;
       const toolCalls: ParkedToolCall[] = [];
       for await (const event of events) {
         const mapped = mapSdkEvent(event);
@@ -784,6 +871,15 @@ function streamOpenAIResponse(
           if (!suppressReasoning) reasoning += mapped.text;
         } else if (mapped.kind === "usage") {
           usage = mapped.usage;
+        } else if (mapped.kind === "error") {
+          // SDK emits the failure twice (result event + iterator throw) —
+          // keep one copy, and keep any usage that came with it.
+          if (mapped.usage) usage = mapped.usage;
+          const norm = normalizeClaudeErrorText(mapped.text);
+          if (norm && norm !== lastErrorNorm) {
+            lastErrorNorm = norm;
+            content += `\n\n[claude-code error] ${mapped.text}`;
+          }
         }
       }
       return JSON.stringify({
@@ -824,6 +920,7 @@ function streamOpenAIResponse(
           controller.enqueue(new TextEncoder().encode(json));
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
+          recordRateLimitErrorText(message);
           controller.enqueue(
             new TextEncoder().encode(
               JSON.stringify({
@@ -860,6 +957,25 @@ function streamOpenAIResponse(
 
       let finishReason: string | null = "stop";
       let usage: OpenAIUsage | null = null;
+      let lastErrorNorm: string | null = null;
+      const sendError = (text: string) => {
+        const norm = normalizeClaudeErrorText(text);
+        if (!norm || norm === lastErrorNorm) return;
+        lastErrorNorm = norm;
+        send({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [
+            {
+              index: 0,
+              delta: { content: `\n\n[claude-code error] ${text}` },
+              finish_reason: null,
+            },
+          ],
+        });
+      };
 
       try {
         for await (const event of events) {
@@ -936,36 +1052,17 @@ function streamOpenAIResponse(
 
           if (mapped.kind === "error") {
             finishReason = "stop";
-            send({
-              id: completionId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [
-                {
-                  index: 0,
-                  delta: { content: `\n\n[claude-code error] ${mapped.text}` },
-                  finish_reason: null,
-                },
-              ],
-            });
+            if (mapped.usage) usage = mapped.usage;
+            sendError(mapped.text);
           }
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        send({
-          id: completionId,
-          object: "chat.completion.chunk",
-          created,
-          model,
-          choices: [
-            {
-              index: 0,
-              delta: { content: `\n\n[claude-code error] ${message}` },
-              finish_reason: null,
-            },
-          ],
-        });
+        // A limit/result failure typically arrives here right after the SDK
+        // emitted the same text as a result event — dedupe via sendError.
+        recordRateLimitErrorText(message);
+        sendError(message);
+        finishReason = "stop";
       }
 
       send({
@@ -989,7 +1086,7 @@ type MappedEvent =
   | { kind: "reasoning"; text: string }
   | { kind: "park"; tools: ParkedToolCall[] }
   | { kind: "usage"; usage: OpenAIUsage }
-  | { kind: "error"; text: string }
+  | { kind: "error"; text: string; usage?: OpenAIUsage | null }
   | { kind: "ignore" };
 
 /**
@@ -1005,6 +1102,14 @@ function mapSdkEvent(event: unknown): MappedEvent {
 
   if (e.type === "__park__" && Array.isArray(e.tools)) {
     return { kind: "park", tools: e.tools as ParkedToolCall[] };
+  }
+
+  // Structured subscription limit telemetry from the Agent SDK — record for
+  // the /v1/rate-limit counter; surface a note only on meaningful changes.
+  if (e.type === "rate_limit_event") {
+    const state = recordRateLimitInfo(e.rate_limit_info);
+    const note = maybeRateLimitNote(state);
+    return note ? { kind: "reasoning", text: note } : { kind: "ignore" };
   }
 
   // Auto-compact boundary — surface as a short reasoning note for the UI.
@@ -1055,7 +1160,21 @@ function mapSdkEvent(event: unknown): MappedEvent {
           : typeof e.error === "string"
             ? e.error
             : "Claude turn failed";
-      return { kind: "error", text };
+      // Hard subscription limit? Record it so the gate + counter activate.
+      const limited = recordRateLimitErrorText(text);
+      let note = text;
+      if (limited?.limited) {
+        const until = limited.limitedUntil ?? limited.resetsAt;
+        if (until !== undefined) {
+          const wait = formatResetCountdown(Math.max(0, until - Date.now()));
+          note = `${text} · limit resets in ${wait}${
+            limited.resetsAt
+              ? ` (${new Date(limited.resetsAt).toISOString()})`
+              : ""
+          }`;
+        }
+      }
+      return { kind: "error", text: note, usage };
     }
     if (usage) return { kind: "usage", usage };
     return { kind: "ignore" };
