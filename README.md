@@ -97,6 +97,7 @@ opencode run "Summarise this repository in five bullets." --model claude-code/so
 | **Attachments** | Images and PDFs from OpenCode reach Claude (data URLs + remote URLs). |
 | **Auto-compact** | Long sessions compact like Claude Code; boundary events are surfaced in the stream. |
 | **Session resume** | Sticky foreign Claude session IDs so follow-ups continue the same Agent SDK turn. |
+| **Rate-limit counter** | Subscription limit state is tracked with its reset time; `GET /v1/rate-limit` answers "when are limits back", and doomed turns fail fast with 429 + `Retry-After`. |
 
 ## Architecture
 
@@ -111,6 +112,22 @@ OpenCode
 Model catalog: aliases `fable` / `opus` / `sonnet` / `haiku` plus pinned ids.
 Effort selection is encoded in `x-opencode-claude-effort` so the proxy passes the
 exact `effort` (+ adaptive thinking) into the Agent SDK.
+
+### Rate-limit counter
+
+The proxy records Agent SDK `rate_limit_event` telemetry and hard session-limit
+errors (including the parsed reset time) to
+`~/.local/share/opencode-claude/rate-limit.json`.
+
+- `GET /v1/rate-limit` → `{ limited, status, rateLimitType, utilization, resetsAt, resetsAtISO, resetInSeconds, message, updatedAt }` — poll this for a "limits reset in …" countdown.
+- `GET /health` includes a compact `rateLimit` summary.
+- While a confirmed hard limit is active, new chat turns return HTTP **429**
+  with `Retry-After` + `x-claude-rate-limit-reset` headers and an
+  `error.type = "rate_limit_error"` body (title/summary meta requests are never
+  gated). The block lifts automatically at reset time; the next turn then
+  resumes the same Claude session (sticky session store is untouched).
+- `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0` disables the 429 gate (turns are
+  attempted and error normally).
 
 ## Requirements
 
@@ -134,6 +151,8 @@ Optional knobs:
 - `OPENCODE_CLAUDE_PROXY_PORT` — optional pinned proxy port (default: ephemeral / OS-assigned; live URL is published to OpenCode via config + auth loader)
 - `OPENCODE_CLAUDE_CWD` — working directory passed to the Agent SDK
 - `CLAUDE_CODE_OAUTH_TOKEN` — inject a subscription token (CI / headless)
+- `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL` — `0` disables the 429 rate-limit gate
+- `OPENCODE_CLAUDE_RATE_LIMIT_STORE` — override the rate-limit store path (tests)
 
 ## Release
 
