@@ -268,6 +268,66 @@ async function main() {
     /1000 → 100/,
   );
 
+  // Session auto-naming: detect title/summary meta requests + sanitize titles
+  {
+    const {
+      detectMetaRequestKind,
+      isTitleGenerationRequest,
+      requestKeyNamespace,
+      buildMetaPrompt,
+    } = await import("../src/request-kind.ts");
+    const {
+      sanitizeMetaOutput,
+      heuristicTitle,
+      metaChatCompletionResponse,
+    } = await import("../src/meta-completion.ts");
+
+    const titleMessages = [
+      {
+        role: "system",
+        content:
+          "You are a title generator. Generate a brief title for this conversation. Output only the title.",
+      },
+      { role: "user", content: "Explain binary trees and their basic operations" },
+    ];
+    assert.equal(isTitleGenerationRequest(titleMessages), true);
+    assert.equal(detectMetaRequestKind(titleMessages), "title");
+    assert.equal(requestKeyNamespace("title"), "title:");
+    assert.equal(requestKeyNamespace(null), "");
+
+    const meta = buildMetaPrompt(titleMessages);
+    assert.match(meta.system, /title generator/i);
+    assert.match(meta.prompt, /binary trees/i);
+
+    assert.equal(
+      sanitizeMetaOutput('"Binary Trees Basics"', "title"),
+      "Binary Trees Basics",
+    );
+    assert.equal(
+      sanitizeMetaOutput("Title: Foo Bar", "title"),
+      "Foo Bar",
+    );
+    assert.equal(
+      sanitizeMetaOutput("", "title", "user: Explain hashing"),
+      heuristicTitle("user: Explain hashing"),
+    );
+
+    const summaryMessages = [
+      {
+        role: "system",
+        content: "You are tasked with summarizing conversations for compaction.",
+      },
+      { role: "user", content: "Please summarize what was done in this conversation." },
+    ];
+    assert.equal(detectMetaRequestKind(summaryMessages), "summary");
+
+    const normalMessages = [
+      { role: "system", content: "You are a coding assistant." },
+      { role: "user", content: "fix a bug" },
+    ];
+    assert.equal(detectMetaRequestKind(normalMessages), null);
+  }
+
   // Logger: errors always emit; info is debug-gated; durable file mirror
   {
     const { spawnSync } = await import("node:child_process");
@@ -336,6 +396,41 @@ async function main() {
   const modelsJson = (await modelsRes.json()) as { data: unknown[] };
   assert.ok(Array.isArray(modelsJson.data));
   assert.ok(modelsJson.data.length > 0);
+
+  // Title meta path without OAuth → heuristic title via OpenAI SSE (fast)
+  {
+    const titleStarted = Date.now();
+    const titleRes = await fetch(
+      `http://127.0.0.1:${port}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5",
+          stream: true,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a title generator. Generate a brief title. Output only the title.",
+            },
+            {
+              role: "user",
+              content: "Explain how binary search trees work",
+            },
+          ],
+        }),
+      },
+    );
+    assert.equal(titleRes.status, 200);
+    const titleBody = await titleRes.text();
+    const titleMs = Date.now() - titleStarted;
+    assert.ok(titleMs < 2000, `title path too slow: ${titleMs}ms`);
+    assert.match(titleBody, /data: /);
+    assert.match(titleBody, /\[DONE\]/);
+    assert.match(titleBody, /binary search trees/i);
+    assert.doesNotMatch(titleBody, /reasoning_content/);
+  }
 
   await stopProxy();
 
