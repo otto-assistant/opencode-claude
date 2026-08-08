@@ -268,6 +268,52 @@ async function main() {
     /1000 → 100/,
   );
 
+  // Logger: errors always emit; info is debug-gated; durable file mirror
+  {
+    const { spawnSync } = await import("node:child_process");
+    const { readFileSync, unlinkSync, existsSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { homedir } = await import("node:os");
+    const logPath = join(homedir(), ".local", "share", "opencode-claude", "debug.log");
+    if (existsSync(logPath)) unlinkSync(logPath);
+
+    const off = spawnSync(
+      "bun",
+      [
+        "-e",
+        `import { log } from "./src/log.ts"; log.info("SILENT_INFO"); log.error("ALWAYS_ERROR");`,
+      ],
+      {
+        cwd: new URL("..", import.meta.url).pathname,
+        encoding: "utf8",
+        env: { ...process.env, OPENCODE_CLAUDE_DEBUG: "0" },
+      },
+    );
+    assert.equal(off.status, 0, off.stderr);
+    assert.doesNotMatch(off.stderr, /SILENT_INFO/);
+    assert.match(off.stderr, /ALWAYS_ERROR/);
+
+    const on = spawnSync(
+      "bun",
+      [
+        "-e",
+        `import { log } from "./src/log.ts"; log.info("DEBUG_INFO", { ok: true });`,
+      ],
+      {
+        cwd: new URL("..", import.meta.url).pathname,
+        encoding: "utf8",
+        env: { ...process.env, OPENCODE_CLAUDE_DEBUG: "1" },
+      },
+    );
+    assert.equal(on.status, 0, on.stderr);
+    assert.match(on.stderr, /DEBUG_INFO/);
+    assert.match(on.stderr, /"ok":true/);
+    assert.ok(existsSync(logPath), "expected durable debug.log");
+    const fileBody = readFileSync(logPath, "utf8");
+    assert.match(fileBody, /ALWAYS_ERROR/);
+    assert.match(fileBody, /DEBUG_INFO/);
+  }
+
   // Plugin export
   assert.equal(typeof ClaudeCodePlugin, "function");
   assert.equal(PROVIDER_ID, "claude-code");
