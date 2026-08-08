@@ -161,6 +161,58 @@ async function main() {
   assert.equal(blocks[0]?.type, "text");
   assert.equal(blocks[1]?.type, "image");
   assert.equal(contentHasAttachments([{ type: "image_url", image_url: { url: "x" } }]), true);
+
+  // OpenAI-compatible PDF shape from @ai-sdk/openai-compatible
+  const pdfB64 = "JVBERi0xLjAK"; // "%PDF-1.0" stub
+  const pdfBlocks = openaiContentToAnthropicBlocks([
+    { type: "text", text: "summarise" },
+    {
+      type: "file",
+      file: {
+        filename: "note.pdf",
+        file_data: `data:application/pdf;base64,${pdfB64}`,
+      },
+    },
+  ]);
+  assert.equal(pdfBlocks.length, 2);
+  assert.equal(pdfBlocks[0]?.type, "text");
+  assert.equal(pdfBlocks[1]?.type, "document");
+  assert.equal(
+    pdfBlocks[1] && "source" in pdfBlocks[1] && pdfBlocks[1].source.type === "base64"
+      ? pdfBlocks[1].source.media_type
+      : null,
+    "application/pdf",
+  );
+  assert.equal(
+    pdfBlocks[1] && "source" in pdfBlocks[1] && pdfBlocks[1].source.type === "base64"
+      ? pdfBlocks[1].source.data
+      : null,
+    pdfB64,
+  );
+  const pdfPrompt = buildPrompt([
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "read this" },
+        {
+          type: "file",
+          file: {
+            filename: "note.pdf",
+            file_data: `data:application/pdf;base64,${pdfB64}`,
+          },
+        },
+      ],
+    },
+  ]);
+  assert.equal(
+    typeof pdfPrompt === "object" &&
+      pdfPrompt !== null &&
+      pdfPrompt.type === "user" &&
+      Array.isArray(pdfPrompt.message.content) &&
+      pdfPrompt.message.content.some((b) => b.type === "document"),
+    true,
+  );
+
   const multi = buildPrompt([
     {
       role: "user",

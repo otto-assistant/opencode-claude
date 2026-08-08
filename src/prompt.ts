@@ -173,15 +173,38 @@ function convertPart(part: unknown, blocks: AnthropicContentBlock[]): void {
       string,
       unknown
     >;
-    const url = typeof file.url === "string" ? file.url : null;
-    const data = typeof file.data === "string" ? file.data : null;
+    // OpenAI / @ai-sdk/openai-compatible emit `file_data` (often a data URL).
+    // Older / alternate shapes use `url` or raw base64 `data`.
+    const fileData =
+      typeof file.file_data === "string" ? file.file_data : null;
+    const url =
+      typeof file.url === "string"
+        ? file.url
+        : fileData && /^data:/i.test(fileData)
+          ? fileData
+          : null;
+    const data =
+      typeof file.data === "string"
+        ? file.data
+        : fileData && !/^data:/i.test(fileData)
+          ? fileData
+          : null;
+    const name =
+      typeof file.filename === "string"
+        ? file.filename
+        : typeof p.filename === "string"
+          ? p.filename
+          : "";
     const mediaType =
       typeof file.media_type === "string"
         ? file.media_type
         : typeof file.mime_type === "string"
           ? file.mime_type
-          : "application/octet-stream";
-    const name = typeof file.filename === "string" ? file.filename : "";
+          : typeof file.mime === "string"
+            ? file.mime
+            : mediaLooksLikePdf("", name)
+              ? "application/pdf"
+              : "application/octet-stream";
 
     if (url) {
       if (pushDataUrl(blocks, url)) return;
@@ -189,6 +212,11 @@ function convertPart(part: unknown, blocks: AnthropicContentBlock[]): void {
       return;
     }
     if (data) {
+      // data may still be a bare data-URL string without the file_data key
+      if (/^data:/i.test(data)) {
+        pushDataUrl(blocks, data);
+        return;
+      }
       if (mediaLooksLikeImage(mediaType)) {
         blocks.push({
           type: "image",
