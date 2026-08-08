@@ -1,6 +1,6 @@
 {
   "name": "@otto-assistant/opencode-claude",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Claude Code in OpenCode — subscription OAuth, Agent SDK harness, effort variants, tools/MCP, images & compact.",
   "license": "MIT",
   "type": "module",
