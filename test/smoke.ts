@@ -245,6 +245,29 @@ async function main() {
   ]);
   assert.ok(key.startsWith("conv_"));
 
+  // Usage + compact helpers
+  const { usageFromSdkResult, formatCompactNote } = await import(
+    "../src/usage.ts"
+  );
+  const usage = usageFromSdkResult({
+    type: "result",
+    is_error: false,
+    total_cost_usd: 0.01,
+    usage: {
+      input_tokens: 50,
+      output_tokens: 10,
+      cache_read_input_tokens: 5,
+      cache_creation_input_tokens: 0,
+    },
+  });
+  assert.equal(usage?.prompt_tokens, 50);
+  assert.equal(usage?.completion_tokens, 10);
+  assert.equal(usage?.prompt_tokens_details?.cached_tokens, 5);
+  assert.match(
+    formatCompactNote({ trigger: "auto", pre_tokens: 1000, post_tokens: 100 }),
+    /1000 → 100/,
+  );
+
   // Plugin export
   assert.equal(typeof ClaudeCodePlugin, "function");
   assert.equal(PROVIDER_ID, "claude-code");
