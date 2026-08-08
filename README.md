@@ -103,7 +103,7 @@ opencode run "Summarise this repository in five bullets." --model claude-code/so
 ```text
 OpenCode
   └─ /v1/chat/completions
-       └─ Bun.serve proxy (port 8787)
+       └─ Bun.serve proxy (ephemeral port; published via auth loader)
             └─ Claude Agent SDK query()
                  └─ claude CLI (subscription OAuth)
 ```
@@ -131,7 +131,7 @@ Debug logging: `OPENCODE_CLAUDE_DEBUG=1`.
 
 Optional knobs:
 
-- `OPENCODE_CLAUDE_PROXY_PORT` — fixed local proxy port (default `8787`; must match static config)
+- `OPENCODE_CLAUDE_PROXY_PORT` — optional pinned proxy port (default: ephemeral / OS-assigned; live URL is published to OpenCode via config + auth loader)
 - `OPENCODE_CLAUDE_CWD` — working directory passed to the Agent SDK
 - `CLAUDE_CODE_OAUTH_TOKEN` — inject a subscription token (CI / headless)
 

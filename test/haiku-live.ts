@@ -222,7 +222,7 @@ async function main() {
 
   // Health
   await runCase("proxy.health_models", async () => {
-    const h = await fetch("http://127.0.0.1:8787/health");
+    const h = await fetch(`${getClaudeProxyBaseUrl().replace(/\/v1$/, "")}/health`);
     assert.equal(h.status, 200);
     const models = await fetch(`${getClaudeProxyBaseUrl()}/models`);
     assert.equal(models.status, 200);
@@ -650,7 +650,7 @@ async function main() {
   });
 
   // 13) OpenCode CLI path with --file (PNG) — stop in-process proxy first
-  // so OpenCode can bind :8787 itself.
+  // so OpenCode's plugin can bind its own ephemeral port.
   await runCase("haiku.opencode_cli_file_png", async () => {
     await stopProxy();
     // Wait briefly for port release

@@ -202,7 +202,8 @@ function ensureClaudeProviderConfig(
       ? existing.models
       : {};
 
-  const baseURL = getClaudeProxyBaseUrl();
+  const port = getProxyPort();
+  const baseURL = port ? `http://127.0.0.1:${port}/v1` : undefined;
   const seededModels = Object.fromEntries(
     models.map((model) => [model.id, buildConfigModelEntry(model)]),
   );
@@ -223,10 +224,11 @@ function ensureClaudeProviderConfig(
         : "Claude Code",
     npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
     options: {
-      baseURL,
       apiKey: "claude-code-proxy",
       includeUsage: true,
       ...existingOptions,
+      // Live listener URL must win over any stale pinned baseURL in user config.
+      ...(baseURL ? { baseURL } : {}),
     },
     // Seeded catalog first; user-declared model entries win.
     models: {
@@ -312,10 +314,10 @@ async function loadClaudeRuntime(
 
   if (!accessToken && !detection.loggedIn) {
     // Still seed placeholder models + a proxy so the provider stays visible.
-    await startProxy(async () => null);
+    const port = await startProxy(async () => null);
     const providerModels = buildClaudeProviderModels(models);
     if (provider) provider.models = providerModels;
-    return { port: getProxyPort() ?? 8787, providerModels };
+    return { port, providerModels };
   }
 
   const port = await startProxy(async () => {
@@ -351,15 +353,12 @@ export const ClaudeCodePlugin: Plugin = async (
         detection.loggedIn || detection.status === "ready"
           ? getClaudeModels()
           : LOGIN_PLACEHOLDER_MODELS;
-      ensureClaudeProviderConfig(config as Record<string, any>, models);
 
-      // Start proxy early so static baseURL hits a live listener.
-      // Never fail the config hook on bind errors — OpenCode would otherwise
-      // surface "plugin config hook failed" and leave the provider half-wired.
+      // Bind first (ephemeral port by default), then seed provider baseURL so
+      // OpenCode's static config matches the live listener for this process.
       try {
         await startProxy(async () => {
           try {
-            // Prefer live OpenCode auth store; fall back to CLI sync.
             const authClient = input.client.auth as {
               get?: (args: { path: { id: string } }) => Promise<unknown>;
             };
@@ -383,6 +382,8 @@ export const ClaudeCodePlugin: Plugin = async (
           err instanceof Error ? err.message : err,
         );
       }
+
+      ensureClaudeProviderConfig(config as Record<string, any>, models);
     },
 
     "chat.headers": async (hookInput, output) => {
@@ -426,7 +427,7 @@ export const ClaudeCodePlugin: Plugin = async (
         if (!runtime) return {};
 
         return {
-          baseURL: getClaudeProxyBaseUrl(),
+          baseURL: `http://127.0.0.1:${runtime.port}/v1`,
           apiKey: "claude-code-proxy",
           async fetch(
             requestInput: RequestInfo | URL,

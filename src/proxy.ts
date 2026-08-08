@@ -54,21 +54,20 @@ import {
   type OpenAIUsage,
 } from "./usage.js";
 
-const DEFAULT_PROXY_PORT = 8787;
 const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
 
 /**
- * Fixed port the proxy binds to. OpenCode resolves the provider base URL from
- * static config, so the proxy must listen on a deterministic port that matches
- * that URL (a random port leaves the SDK unable to connect).
- * Override with OPENCODE_CLAUDE_PROXY_PORT if 8787 is taken.
+ * Optional pinned port via OPENCODE_CLAUDE_PROXY_PORT.
+ * Default is `0` — Bun binds an ephemeral free port; the live URL is then
+ * published through the config hook + auth loader so OpenCode always hits the
+ * process that owns the listener (no static 8787 requirement).
  */
-const CLAUDE_PROXY_PORT: number = (() => {
+const REQUESTED_PROXY_PORT: number = (() => {
   const raw = process.env.OPENCODE_CLAUDE_PROXY_PORT;
   const parsed = raw ? Number(raw) : NaN;
-  return Number.isInteger(parsed) && parsed > 0 && parsed < 65536
+  return Number.isInteger(parsed) && parsed >= 0 && parsed < 65536
     ? parsed
-    : DEFAULT_PROXY_PORT;
+    : 0;
 })();
 
 const SSE_HEADERS = {
@@ -113,11 +112,17 @@ let proxyPort: number | null = null;
 let getAccessToken: TokenProvider | null = null;
 
 export function getClaudeProxyBaseUrl(): string {
-  return `http://127.0.0.1:${CLAUDE_PROXY_PORT}/v1`;
+  const port = proxyPort ?? (REQUESTED_PROXY_PORT > 0 ? REQUESTED_PROXY_PORT : null);
+  if (!port) {
+    throw new Error(
+      "Claude proxy is not listening yet — call startProxy() before getClaudeProxyBaseUrl()",
+    );
+  }
+  return `http://127.0.0.1:${port}/v1`;
 }
 
 export function getProxyPort(): number | null {
-  return proxyPort ?? CLAUDE_PROXY_PORT;
+  return proxyPort;
 }
 
 function isAddrInUseError(err: unknown): boolean {
@@ -131,14 +136,14 @@ function isAddrInUseError(err: unknown): boolean {
   );
 }
 
-async function isSharedProxyHealthy(): Promise<boolean> {
+async function isProxyHealthyAt(baseUrl: string): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(
     () => controller.abort(),
     SHARED_PROXY_HEALTH_TIMEOUT_MS,
   );
   try {
-    const res = await fetch(`${getClaudeProxyBaseUrl()}/models`, {
+    const res = await fetch(`${baseUrl}/models`, {
       signal: controller.signal,
     });
     if (!res.ok) return false;
@@ -161,32 +166,42 @@ export async function startProxy(tokenProvider: TokenProvider): Promise<number> 
   getAccessToken = tokenProvider;
   if (server && proxyPort) return proxyPort;
 
-  if (await isSharedProxyHealthy()) {
-    proxyPort = CLAUDE_PROXY_PORT;
-    log.info(
-      `[opencode-claude] reusing healthy proxy on ${getClaudeProxyBaseUrl()}`,
-    );
-    return proxyPort;
+  // Only reuse a sibling listener when the operator pinned a port.
+  if (REQUESTED_PROXY_PORT > 0) {
+    const pinnedUrl = `http://127.0.0.1:${REQUESTED_PROXY_PORT}/v1`;
+    if (await isProxyHealthyAt(pinnedUrl)) {
+      proxyPort = REQUESTED_PROXY_PORT;
+      log.info(`[opencode-claude] reusing healthy proxy on ${pinnedUrl}`);
+      return proxyPort;
+    }
   }
 
   const hostname = "127.0.0.1";
+  const bindPort = REQUESTED_PROXY_PORT; // 0 → ephemeral
 
   try {
     server = Bun.serve({
       hostname,
-      port: CLAUDE_PROXY_PORT,
+      port: bindPort,
       async fetch(req) {
         return handleRequest(req);
       },
     });
-    proxyPort = server.port ?? CLAUDE_PROXY_PORT;
+    proxyPort = server.port ?? null;
+    if (!proxyPort) {
+      throw new Error("Failed to bind Claude proxy to a port");
+    }
     log.info(`[opencode-claude] proxy listening on ${getClaudeProxyBaseUrl()}`);
     return proxyPort;
   } catch (err) {
-    if (isAddrInUseError(err) && (await isSharedProxyHealthy())) {
-      proxyPort = CLAUDE_PROXY_PORT;
+    if (
+      REQUESTED_PROXY_PORT > 0 &&
+      isAddrInUseError(err) &&
+      (await isProxyHealthyAt(`http://127.0.0.1:${REQUESTED_PROXY_PORT}/v1`))
+    ) {
+      proxyPort = REQUESTED_PROXY_PORT;
       log.info(
-        `[opencode-claude] port ${CLAUDE_PROXY_PORT} in use; reusing existing proxy`,
+        `[opencode-claude] port ${REQUESTED_PROXY_PORT} in use; reusing existing proxy`,
       );
       return proxyPort;
     }
