@@ -354,26 +354,35 @@ export const ClaudeCodePlugin: Plugin = async (
       ensureClaudeProviderConfig(config as Record<string, any>, models);
 
       // Start proxy early so static baseURL hits a live listener.
-      await startProxy(async () => {
-        try {
-          // Prefer live OpenCode auth store; fall back to CLI sync.
-          const authClient = input.client.auth as {
-            get?: (args: { path: { id: string } }) => Promise<unknown>;
-          };
-          if (typeof authClient.get === "function") {
-            const auth = await authClient.get({ path: { id: PROVIDER_ID } });
-            const payload =
-              auth && typeof auth === "object" && "data" in auth
-                ? (auth as { data: unknown }).data
-                : auth;
-            return resolveAccessToken(input, async () => payload);
+      // Never fail the config hook on bind errors — OpenCode would otherwise
+      // surface "plugin config hook failed" and leave the provider half-wired.
+      try {
+        await startProxy(async () => {
+          try {
+            // Prefer live OpenCode auth store; fall back to CLI sync.
+            const authClient = input.client.auth as {
+              get?: (args: { path: { id: string } }) => Promise<unknown>;
+            };
+            if (typeof authClient.get === "function") {
+              const auth = await authClient.get({ path: { id: PROVIDER_ID } });
+              const payload =
+                auth && typeof auth === "object" && "data" in auth
+                  ? (auth as { data: unknown }).data
+                  : auth;
+              return resolveAccessToken(input, async () => payload);
+            }
+          } catch {
+            // ignore
           }
-        } catch {
-          // ignore
-        }
-        const synced = syncClaudeCliCredentialsToOpenCode();
-        return synced?.access ?? null;
-      });
+          const synced = syncClaudeCliCredentialsToOpenCode();
+          return synced?.access ?? null;
+        });
+      } catch (err) {
+        log.error(
+          "[opencode-claude] proxy failed to start during config",
+          err instanceof Error ? err.message : err,
+        );
+      }
     },
 
     "chat.headers": async (hookInput, output) => {

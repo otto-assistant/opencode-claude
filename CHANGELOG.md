@@ -6,6 +6,7 @@
 - Fix image attachments: convert AI SDK `{ type: "image" }` parts (previously detected then dropped); tolerate data-URL name params
 - Surface OpenAI-compatible `usage` (tokens + cost_usd + model_usage) from Agent SDK result events; richer compact notes with token counts
 - Live Haiku matrix (`bun run test:haiku`): attachments, tools/MCP park-resume, session resume, context/usage, OpenCode CLI `--file`
+- Logging: warn/error always on stderr; info gated by `OPENCODE_CLAUDE_DEBUG`; durable mirror at `~/.local/share/opencode-claude/debug.log`; config hook no longer dies on proxy bind errors
 - README + package description aligned with opencode-cursor style (header, badges, effort docs)
 - Effort variants `low`→`max` exposed as OpenCode model variants (disable generic `none`/`minimal`)
 - Multimodal prompts: OpenAI `image_url` / file parts → Claude image & document blocks
