@@ -335,6 +335,26 @@ async function handleChatCompletions(
 
   const openCodeTools = Array.isArray(body.tools) ? body.tools : [];
   const prompt = latestUserPrompt(messages);
+  if (typeof prompt !== "string") {
+    const parts = Array.isArray(prompt.message.content)
+      ? prompt.message.content.map((b) => b.type)
+      : ["text"];
+    log.info("[opencode-claude] multimodal user prompt", {
+      blockTypes: parts,
+    });
+  } else {
+    const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    const content = lastUser?.content;
+    if (Array.isArray(content)) {
+      log.info("[opencode-claude] user content parts", {
+        partTypes: content.map((p) =>
+          p && typeof p === "object" && "type" in p
+            ? (p as { type?: unknown }).type
+            : typeof p,
+        ),
+      });
+    }
+  }
   const promptEmpty =
     typeof prompt === "string" ? prompt.length === 0 : false;
   if (promptEmpty && openCodeTools.length === 0) {

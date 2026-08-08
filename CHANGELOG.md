@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Fix file/PDF attachments: accept OpenAI `file.file_data` and seed `modalities.input` with `pdf` so OpenCode does not strip documents
+- Fix image attachments: convert AI SDK `{ type: "image" }` parts (previously detected then dropped); tolerate data-URL name params
 - README + package description aligned with opencode-cursor style (header, badges, effort docs)
 - Effort variants `low`→`max` exposed as OpenCode model variants (disable generic `none`/`minimal`)
 - Multimodal prompts: OpenAI `image_url` / file parts → Claude image & document blocks

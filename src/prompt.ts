@@ -27,9 +27,9 @@ function parseDataUrl(url: string): {
   mediaType: string;
   data: string;
 } | null {
-  const match = /^data:([^;,]+)?(?:;charset=[^;,]+)?;base64,(.+)$/i.exec(
-    url.trim(),
-  );
+  // Allow extra parameters between media type and base64
+  // (e.g. data:image/png;name=photo.png;base64,...).
+  const match = /^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$/i.exec(url.trim());
   if (!match) return null;
   return {
     mediaType: (match[1] || "application/octet-stream").toLowerCase(),
@@ -146,6 +146,115 @@ function convertPart(part: unknown, blocks: AnthropicContentBlock[]): void {
     if (!url) return;
     if (pushDataUrl(blocks, url)) return;
     if (isHttpUrl(url)) pushRemoteUrl(blocks, url);
+    return;
+  }
+
+  // AI SDK / Anthropic-shaped image parts (not OpenAI image_url).
+  // contentHasAttachments treats these as attachments — must convert or
+  // the image is detected then silently dropped.
+  if (type === "image") {
+    const mediaType =
+      typeof p.media_type === "string"
+        ? p.media_type
+        : typeof p.mimeType === "string"
+          ? p.mimeType
+          : typeof p.mime === "string"
+            ? p.mime
+            : "image/png";
+    const source = p.source;
+    if (source && typeof source === "object") {
+      const s = source as Record<string, unknown>;
+      if (s.type === "base64" && typeof s.data === "string") {
+        blocks.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type:
+              typeof s.media_type === "string" ? s.media_type : mediaType,
+            data: s.data,
+          },
+        });
+        return;
+      }
+      if (s.type === "url" && typeof s.url === "string") {
+        if (pushDataUrl(blocks, s.url)) return;
+        if (isHttpUrl(s.url)) pushRemoteUrl(blocks, s.url, mediaType);
+        return;
+      }
+    }
+    const image = p.image;
+    if (typeof image === "string") {
+      if (pushDataUrl(blocks, image)) return;
+      if (isHttpUrl(image)) {
+        pushRemoteUrl(blocks, image, mediaType);
+        return;
+      }
+      // Bare base64 payload
+      blocks.push({
+        type: "image",
+        source: { type: "base64", media_type: mediaType, data: image },
+      });
+      return;
+    }
+    if (image instanceof URL) {
+      const href = image.toString();
+      if (pushDataUrl(blocks, href)) return;
+      if (isHttpUrl(href)) pushRemoteUrl(blocks, href, mediaType);
+      return;
+    }
+    if (image && typeof image === "object" && "url" in image) {
+      const url = (image as { url?: unknown }).url;
+      if (typeof url === "string") {
+        if (pushDataUrl(blocks, url)) return;
+        if (isHttpUrl(url)) pushRemoteUrl(blocks, url, mediaType);
+      }
+    }
+    return;
+  }
+
+  if (type === "document") {
+    const mediaType =
+      typeof p.media_type === "string"
+        ? p.media_type
+        : typeof p.mimeType === "string"
+          ? p.mimeType
+          : "application/pdf";
+    const source = p.source;
+    if (source && typeof source === "object") {
+      const s = source as Record<string, unknown>;
+      if (s.type === "base64" && typeof s.data === "string") {
+        blocks.push({
+          type: "document",
+          source: {
+            type: "base64",
+            media_type:
+              typeof s.media_type === "string" ? s.media_type : mediaType,
+            data: s.data,
+          },
+        });
+        return;
+      }
+      if (s.type === "url" && typeof s.url === "string") {
+        if (pushDataUrl(blocks, s.url)) return;
+        if (isHttpUrl(s.url)) pushRemoteUrl(blocks, s.url, mediaType);
+        return;
+      }
+    }
+    const data = typeof p.data === "string" ? p.data : null;
+    if (data) {
+      if (/^data:/i.test(data)) {
+        pushDataUrl(blocks, data);
+        return;
+      }
+      blocks.push({
+        type: "document",
+        source: {
+          type: "base64",
+          media_type: mediaLooksLikePdf(mediaType) ? "application/pdf" : mediaType,
+          data,
+        },
+      });
+    }
     return;
   }
 

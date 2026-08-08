@@ -213,6 +213,21 @@ async function main() {
     true,
   );
 
+  // AI SDK-style { type: "image", image: dataUrl } must not be dropped
+  const sdkImage = openaiContentToAnthropicBlocks([
+    { type: "text", text: "see?" },
+    { type: "image", image: `data:image/png;base64,${png}` },
+  ]);
+  assert.equal(sdkImage.some((b) => b.type === "image"), true);
+  const namedDataUrl = openaiContentToAnthropicBlocks([
+    {
+      type: "image_url",
+      image_url: { url: `data:image/png;name=x.png;base64,${png}` },
+    },
+  ]);
+  assert.equal(namedDataUrl.length, 1);
+  assert.equal(namedDataUrl[0]?.type, "image");
+
   const multi = buildPrompt([
     {
       role: "user",
