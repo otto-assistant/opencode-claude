@@ -114,8 +114,10 @@ function buildProviderModel(
       },
       interleaved: true,
     },
+    // OpenCode derives capabilities.input from modalities.input — include
+    // "pdf" or PDFs are replaced with unsupported-modality errors.
     modalities: {
-      input: ["text", "image"],
+      input: ["text", "image", "pdf"],
       output: ["text"],
     },
     cost: zeroCost(),
@@ -141,15 +143,16 @@ function buildConfigModelEntry(model: ClaudeModel): Record<string, unknown> {
     // low/medium/high ahead of our explicit effort map (cursor pattern).
     reasoning: false,
     tool_call: true,
-    // Without modalities.input including "image", OpenCode strips attachments
-    // before they reach the proxy.
+    // OpenCode config merge sets capabilities.input from modalities.input.
+    // Missing "image"/"pdf" strips attachments before they reach the proxy.
+    attachment: true,
     modalities: {
-      input: ["text", "image"],
+      input: ["text", "image", "pdf"],
       output: ["text"],
     },
     capabilities: {
       tools: true,
-      input: ["text", "image"],
+      input: ["text", "image", "pdf"],
       output: ["text"],
     },
     limit: {

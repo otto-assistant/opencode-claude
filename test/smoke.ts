@@ -161,6 +161,73 @@ async function main() {
   assert.equal(blocks[0]?.type, "text");
   assert.equal(blocks[1]?.type, "image");
   assert.equal(contentHasAttachments([{ type: "image_url", image_url: { url: "x" } }]), true);
+
+  // OpenAI-compatible PDF shape from @ai-sdk/openai-compatible
+  const pdfB64 = "JVBERi0xLjAK"; // "%PDF-1.0" stub
+  const pdfBlocks = openaiContentToAnthropicBlocks([
+    { type: "text", text: "summarise" },
+    {
+      type: "file",
+      file: {
+        filename: "note.pdf",
+        file_data: `data:application/pdf;base64,${pdfB64}`,
+      },
+    },
+  ]);
+  assert.equal(pdfBlocks.length, 2);
+  assert.equal(pdfBlocks[0]?.type, "text");
+  assert.equal(pdfBlocks[1]?.type, "document");
+  assert.equal(
+    pdfBlocks[1] && "source" in pdfBlocks[1] && pdfBlocks[1].source.type === "base64"
+      ? pdfBlocks[1].source.media_type
+      : null,
+    "application/pdf",
+  );
+  assert.equal(
+    pdfBlocks[1] && "source" in pdfBlocks[1] && pdfBlocks[1].source.type === "base64"
+      ? pdfBlocks[1].source.data
+      : null,
+    pdfB64,
+  );
+  const pdfPrompt = buildPrompt([
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "read this" },
+        {
+          type: "file",
+          file: {
+            filename: "note.pdf",
+            file_data: `data:application/pdf;base64,${pdfB64}`,
+          },
+        },
+      ],
+    },
+  ]);
+  assert.equal(
+    typeof pdfPrompt === "object" &&
+      pdfPrompt !== null &&
+      pdfPrompt.type === "user" &&
+      Array.isArray(pdfPrompt.message.content) &&
+      pdfPrompt.message.content.some((b) => b.type === "document"),
+    true,
+  );
+
+  // AI SDK-style { type: "image", image: dataUrl } must not be dropped
+  const sdkImage = openaiContentToAnthropicBlocks([
+    { type: "text", text: "see?" },
+    { type: "image", image: `data:image/png;base64,${png}` },
+  ]);
+  assert.equal(sdkImage.some((b) => b.type === "image"), true);
+  const namedDataUrl = openaiContentToAnthropicBlocks([
+    {
+      type: "image_url",
+      image_url: { url: `data:image/png;name=x.png;base64,${png}` },
+    },
+  ]);
+  assert.equal(namedDataUrl.length, 1);
+  assert.equal(namedDataUrl[0]?.type, "image");
+
   const multi = buildPrompt([
     {
       role: "user",
@@ -177,6 +244,29 @@ async function main() {
     { role: "user", content: "hello world" },
   ]);
   assert.ok(key.startsWith("conv_"));
+
+  // Usage + compact helpers
+  const { usageFromSdkResult, formatCompactNote } = await import(
+    "../src/usage.ts"
+  );
+  const usage = usageFromSdkResult({
+    type: "result",
+    is_error: false,
+    total_cost_usd: 0.01,
+    usage: {
+      input_tokens: 50,
+      output_tokens: 10,
+      cache_read_input_tokens: 5,
+      cache_creation_input_tokens: 0,
+    },
+  });
+  assert.equal(usage?.prompt_tokens, 50);
+  assert.equal(usage?.completion_tokens, 10);
+  assert.equal(usage?.prompt_tokens_details?.cached_tokens, 5);
+  assert.match(
+    formatCompactNote({ trigger: "auto", pre_tokens: 1000, post_tokens: 100 }),
+    /1000 → 100/,
+  );
 
   // Plugin export
   assert.equal(typeof ClaudeCodePlugin, "function");

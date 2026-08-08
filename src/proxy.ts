@@ -37,6 +37,11 @@ import {
   promptAsStream,
   type SdkUserPrompt,
 } from "./prompt.js";
+import {
+  formatCompactNote,
+  usageFromSdkResult,
+  type OpenAIUsage,
+} from "./usage.js";
 
 const DEFAULT_PROXY_PORT = 8787;
 const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
@@ -295,10 +300,12 @@ async function handleChatCompletions(
     }
     // Still parked — do not start a parallel Claude turn (OpenCode may retry
     // or send a follow-up before tool results arrive). Re-emit pending calls.
-    if (resolved === 0) {
+    // Also covers partial tool results (resolved > 0 but others still pending).
+    if (existing.pendingTools.size > 0) {
       log.info("[opencode-claude] re-emitting parked tool_calls", {
         conversationKey: existing.conversationKey,
         pending: existing.pendingTools.size,
+        resolved,
       });
       return streamOpenAIResponse(
         (async function* () {
@@ -335,6 +342,26 @@ async function handleChatCompletions(
 
   const openCodeTools = Array.isArray(body.tools) ? body.tools : [];
   const prompt = latestUserPrompt(messages);
+  if (typeof prompt !== "string") {
+    const parts = Array.isArray(prompt.message.content)
+      ? prompt.message.content.map((b) => b.type)
+      : ["text"];
+    log.info("[opencode-claude] multimodal user prompt", {
+      blockTypes: parts,
+    });
+  } else {
+    const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    const content = lastUser?.content;
+    if (Array.isArray(content)) {
+      log.info("[opencode-claude] user content parts", {
+        partTypes: content.map((p) =>
+          p && typeof p === "object" && "type" in p
+            ? (p as { type?: unknown }).type
+            : typeof p,
+        ),
+      });
+    }
+  }
   const promptEmpty =
     typeof prompt === "string" ? prompt.length === 0 : false;
   if (promptEmpty && openCodeTools.length === 0) {
@@ -642,6 +669,7 @@ function streamOpenAIResponse(
     const collect = async (): Promise<string> => {
       let content = "";
       let reasoning = "";
+      let usage: OpenAIUsage | null = null;
       const toolCalls: ParkedToolCall[] = [];
       for await (const event of events) {
         const mapped = mapSdkEvent(event);
@@ -651,6 +679,8 @@ function streamOpenAIResponse(
           content += mapped.text;
         } else if (mapped.kind === "reasoning") {
           reasoning += mapped.text;
+        } else if (mapped.kind === "usage") {
+          usage = mapped.usage;
         }
       }
       return JSON.stringify({
@@ -678,6 +708,7 @@ function streamOpenAIResponse(
             finish_reason: toolCalls.length ? "tool_calls" : "stop",
           },
         ],
+        ...(usage ? { usage } : {}),
       });
     };
 
@@ -725,6 +756,7 @@ function streamOpenAIResponse(
       });
 
       let finishReason: string | null = "stop";
+      let usage: OpenAIUsage | null = null;
 
       try {
         for await (const event of events) {
@@ -794,6 +826,10 @@ function streamOpenAIResponse(
             });
           }
 
+          if (mapped.kind === "usage") {
+            usage = mapped.usage;
+          }
+
           if (mapped.kind === "error") {
             finishReason = "stop";
             send({
@@ -834,6 +870,7 @@ function streamOpenAIResponse(
         created,
         model,
         choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+        ...(usage ? { usage } : {}),
       });
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       controller.close();
@@ -847,6 +884,7 @@ type MappedEvent =
   | { kind: "text"; text: string }
   | { kind: "reasoning"; text: string }
   | { kind: "park"; tools: ParkedToolCall[] }
+  | { kind: "usage"; usage: OpenAIUsage }
   | { kind: "error"; text: string }
   | { kind: "ignore" };
 
@@ -867,7 +905,10 @@ function mapSdkEvent(event: unknown): MappedEvent {
 
   // Auto-compact boundary — surface as a short reasoning note for the UI.
   if (e.type === "system" && e.subtype === "compact_boundary") {
-    return { kind: "reasoning", text: "[compact] Conversation compacted.\n" };
+    return {
+      kind: "reasoning",
+      text: formatCompactNote(e.compact_metadata),
+    };
   }
 
   if (e.type === "system" && e.status === "compacting") {
@@ -901,14 +942,19 @@ function mapSdkEvent(event: unknown): MappedEvent {
     return { kind: "ignore" };
   }
 
-  if (e.type === "result" && e.is_error) {
-    const text =
-      typeof e.result === "string"
-        ? e.result
-        : typeof e.error === "string"
-          ? e.error
-          : "Claude turn failed";
-    return { kind: "error", text };
+  if (e.type === "result") {
+    const usage = usageFromSdkResult(event);
+    if (e.is_error) {
+      const text =
+        typeof e.result === "string"
+          ? e.result
+          : typeof e.error === "string"
+            ? e.error
+            : "Claude turn failed";
+      return { kind: "error", text };
+    }
+    if (usage) return { kind: "usage", usage };
+    return { kind: "ignore" };
   }
 
   // Fallback for SDK builds that emit bare text deltas without stream_event
