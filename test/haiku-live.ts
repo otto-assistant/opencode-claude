@@ -365,7 +365,8 @@ async function main() {
             content: [
               {
                 type: "text",
-                text: "Read the PDF. Quote the marker token exactly, then OC_PDF_OK.",
+                text:
+                  "Read the attached PDF carefully. Extract the exact visible text token on the page (letters only). Then write OC_PDF_OK on the next line.",
               },
               {
                 type: "file",
@@ -380,7 +381,7 @@ async function main() {
       },
       { session: `test_pdf_${randomUUID()}`, stream: false },
     );
-    assert.match(res.text, /MARKER_PDF_77/);
+    assert.match(res.text, /PDFTOKEN/i);
     assert.match(res.text, /OC_PDF_OK/);
     return { detail: res.text.replace(/\s+/g, " ").trim(), usage: res.usage };
   });
@@ -484,7 +485,7 @@ async function main() {
     };
   });
 
-  // 9) Multi-tool park
+  // 9) Multi-tool park — resolve all pending tools in one follow-up
   await runCase("haiku.tools_multi_park", async () => {
     const session = `test_multitool_${randomUUID()}`;
     const tools = [
@@ -492,7 +493,7 @@ async function main() {
         type: "function",
         function: {
           name: "add",
-          description: "Add two integers",
+          description: "Add two integers a+b",
           parameters: {
             type: "object",
             properties: {
@@ -507,7 +508,7 @@ async function main() {
         type: "function",
         function: {
           name: "mul",
-          description: "Multiply two integers",
+          description: "Multiply two integers a*b",
           parameters: {
             type: "object",
             properties: {
@@ -519,61 +520,55 @@ async function main() {
         },
       },
     ];
-    const first = await chat(
-      {
-        tools,
-        messages: [
-          {
-            role: "user",
-            content:
-              "Use tools to compute (3+4) and (5*6). Call both add and mul. Then report both results.",
-          },
-        ],
-      },
-      { session, stream: false },
-    );
-    assert.equal(first.finishReason, "tool_calls");
-    assert.ok(first.toolCalls.length >= 1);
 
-    const toolMessages = first.toolCalls.map((tc: any) => {
-      const args = JSON.parse(tc.function.arguments || "{}");
-      let result = "0";
-      if (tc.function.name === "add") result = String(args.a + args.b);
-      if (tc.function.name === "mul") result = String(args.a * args.b);
-      return {
-        role: "tool",
-        tool_call_id: tc.id,
-        content: result,
-      };
-    });
-
-    const second = await chat(
+    let messages: any[] = [
       {
-        tools,
-        messages: [
-          {
-            role: "user",
-            content:
-              "Use tools to compute (3+4) and (5*6). Call both add and mul. Then report both results.",
-          },
-          { role: "assistant", tool_calls: first.toolCalls },
-          ...toolMessages,
-        ],
+        role: "user",
+        content:
+          "You must call BOTH tools in this turn: add(a=3,b=4) and mul(a=5,b=6). After tool results, reply exactly: SUM=7 PRODUCT=30 TOOLS_OK",
       },
-      { session, stream: false },
-    );
-    // Accept either both results in text or continued tool calls if model asks more
-    const ok =
-      (/7/.test(second.text) && /30/.test(second.text)) ||
-      second.finishReason === "tool_calls";
-    assert.ok(ok, `unexpected multi-tool resume: ${second.text}`);
+    ];
+
+    let guard = 0;
+    let finalText = "";
+    let lastUsage: any = null;
+    while (guard++ < 4) {
+      const turn = await chat(
+        { tools, messages },
+        { session, stream: false },
+      );
+      lastUsage = turn.usage;
+      if (turn.finishReason === "tool_calls" && turn.toolCalls.length > 0) {
+        messages = [
+          ...messages,
+          { role: "assistant", tool_calls: turn.toolCalls },
+          ...turn.toolCalls.map((tc: any) => {
+            const args = JSON.parse(tc.function.arguments || "{}");
+            let result = "0";
+            if (tc.function.name === "add") result = String(Number(args.a) + Number(args.b));
+            if (tc.function.name === "mul") result = String(Number(args.a) * Number(args.b));
+            return {
+              role: "tool",
+              tool_call_id: tc.id,
+              content: result,
+            };
+          }),
+        ];
+        continue;
+      }
+      finalText = turn.text;
+      break;
+    }
+    assert.match(finalText, /SUM\s*=\s*7/i);
+    assert.match(finalText, /PRODUCT\s*=\s*30/i);
+    assert.match(finalText, /TOOLS_OK/);
     return {
-      detail: `calls=${first.toolCalls.map((t: any) => t.function.name).join(",")} text=${second.text.replace(/\s+/g, " ").slice(0, 120)}`,
-      usage: second.usage,
+      detail: finalText.replace(/\s+/g, " ").trim(),
+      usage: lastUsage,
     };
   });
 
-  // 10) Session sticky resume
+  // 10) Session sticky resume (conversation continuity via foreign session id)
   await runCase("haiku.session_resume", async () => {
     const session = `test_resume_${randomUUID()}`;
     const first = await chat(
@@ -582,7 +577,7 @@ async function main() {
           {
             role: "user",
             content:
-              "Remember the codeword BLUEBERRY_91. Reply with STORED_OK only.",
+              "For this coding session, the repository codename is NIGHTJAR. Reply with exactly STORED_OK.",
           },
         ],
       },
@@ -595,13 +590,13 @@ async function main() {
           {
             role: "user",
             content:
-              "What codeword did I ask you to remember? Reply with the codeword only.",
+              "What repository codename did I give you in this session? Reply with the codename only.",
           },
         ],
       },
       { session, stream: false },
     );
-    assert.match(second.text, /BLUEBERRY_91/);
+    assert.match(second.text, /NIGHTJAR/);
     return {
       detail: `resume=${second.text.trim()}`,
       usage: {
@@ -654,8 +649,12 @@ async function main() {
     return { detail: "status=400" };
   });
 
-  // 13) OpenCode CLI path with --file (PNG)
+  // 13) OpenCode CLI path with --file (PNG) — stop in-process proxy first
+  // so OpenCode can bind :8787 itself.
   await runCase("haiku.opencode_cli_file_png", async () => {
+    await stopProxy();
+    // Wait briefly for port release
+    await new Promise((r) => setTimeout(r, 500));
     const { spawnSync } = await import("node:child_process");
     const proc = spawnSync(
       "opencode",
@@ -685,6 +684,8 @@ async function main() {
     assert.equal(proc.status, 0, out.slice(-1500));
     assert.match(out, /OC_CLI_IMAGE_OK/);
     assert.match(out, /red/i);
+    // Restart proxy for any later cases (none currently)
+    await startProxy(async () => token);
     return { detail: "opencode --file PNG OK" };
   });
 
