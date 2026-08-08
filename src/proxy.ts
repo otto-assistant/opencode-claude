@@ -38,6 +38,17 @@ import {
   type SdkUserPrompt,
 } from "./prompt.js";
 import {
+  completeMetaRequest,
+  heuristicTitle,
+  metaChatCompletionResponse,
+  sanitizeMetaOutput,
+} from "./meta-completion.js";
+import {
+  buildMetaPrompt,
+  detectMetaRequestKind,
+  requestKeyNamespace,
+} from "./request-kind.js";
+import {
   formatCompactNote,
   usageFromSdkResult,
   type OpenAIUsage,
@@ -256,9 +267,11 @@ async function handleChatCompletions(
   body: ChatCompletionRequest,
 ): Promise<Response> {
   const messages = Array.isArray(body.messages) ? body.messages : [];
+  const metaKind = detectMetaRequestKind(messages);
+  const sessionHeader = req.headers.get(SESSION_HEADER);
   const conversationKey =
-    req.headers.get(SESSION_HEADER) ||
-    conversationKeyFromMessages(messages);
+    requestKeyNamespace(metaKind) +
+    (sessionHeader || conversationKeyFromMessages(messages));
   const selection = selectionFromRequest(req, body);
   const model = resolveClaudeModelId(selection.modelId);
   const stream = body.stream !== false;
@@ -320,27 +333,119 @@ async function handleChatCompletions(
 
   log.info("[opencode-claude] chat completions", {
     conversationKey,
-    sessionHeader: req.headers.get(SESSION_HEADER),
+    sessionHeader,
+    metaKind,
     toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
     messageCount: messages.length,
     hasToolResults: toolResults.size > 0,
     bridgePending: existing?.pendingTools.size ?? 0,
   });
 
-  // Note: an in-flight bridge (pendingTools empty) is left alone here; putBridge
-  // supersedes same-conversation bridges when a new turn actually starts.
-
   const accessToken = getAccessToken ? await getAccessToken() : null;
+
+  // Title / summary: fast Anthropic Messages API path (not Agent SDK).
+  // OpenCode fires these in parallel with the main turn and disposes the
+  // session ~2–3s later — Agent SDK is too slow, so titles stayed "New session".
+  if (metaKind) {
+    const meta = buildMetaPrompt(messages);
+    if (!meta.prompt.trim() || meta.prompt === " ") {
+      return Response.json(
+        {
+          error: {
+            message: "No user message found",
+            type: "invalid_request_error",
+          },
+        },
+        { status: 400 },
+      );
+    }
+    const completionId = `chatcmpl_${createHash("sha1")
+      .update(`${conversationKey}:${metaKind}:${Date.now()}`)
+      .digest("hex")
+      .slice(0, 24)}`;
+    const started = Date.now();
+    log.info("[opencode-claude] meta request (fast path)", {
+      kind: metaKind,
+      systemChars: meta.system.length,
+      promptChars: meta.prompt.length,
+    });
+
+    let content: string;
+    let usage: { prompt_tokens: number; completion_tokens: number } | undefined;
+    let responseModel = body.model || "claude-haiku-4-5";
+
+    if (!accessToken) {
+      content =
+        metaKind === "title"
+          ? heuristicTitle(meta.prompt)
+          : sanitizeMetaOutput("", metaKind, meta.prompt);
+      log.warn("[opencode-claude] meta request without OAuth; using heuristic", {
+        kind: metaKind,
+        content,
+      });
+    } else {
+      try {
+        const result = await completeMetaRequest({
+          body: { messages },
+          kind: metaKind,
+          accessToken,
+          model: "claude-haiku-4-5",
+        });
+        content = result.text;
+        usage = result.usage;
+        responseModel = body.model || result.model;
+        log.info("[opencode-claude] meta request complete", {
+          kind: metaKind,
+          ms: Date.now() - started,
+          chars: content.length,
+          content: metaKind === "title" ? content : undefined,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        content =
+          metaKind === "title"
+            ? heuristicTitle(meta.prompt)
+            : `Summary unavailable: ${message}`;
+        log.warn("[opencode-claude] meta fast path failed; falling back", {
+          kind: metaKind,
+          message,
+          content: metaKind === "title" ? content : undefined,
+        });
+      }
+    }
+
+    return metaChatCompletionResponse({
+      stream,
+      id: completionId,
+      model: responseModel,
+      content,
+      usage,
+    });
+  }
+
   const env = accessToken
     ? withClaudeOAuthToken(accessToken)
     : withClaudeOAuthToken("", process.env);
 
-  // Empty token → still strip API keys; CLI credentials on disk may auth.
   if (!accessToken) {
     delete env.CLAUDE_CODE_OAUTH_TOKEN;
   }
 
   const openCodeTools = Array.isArray(body.tools) ? body.tools : [];
+  const cwd = process.env.OPENCODE_CLAUDE_CWD || process.cwd();
+  const bridgeId = randomUUID();
+  const pendingTools = new Map<string, ParkedToolCall>();
+  let handle: ClaudeQueryHandle | null = null;
+  let parked = false;
+  let parkWaiters: Array<() => void> = [];
+
+  const notifyPark = () => {
+    parked = true;
+    const waiters = parkWaiters;
+    parkWaiters = [];
+    for (const resolve of waiters) resolve();
+  };
+
   const prompt = latestUserPrompt(messages);
   if (typeof prompt !== "string") {
     const parts = Array.isArray(prompt.message.content)
@@ -372,28 +477,12 @@ async function handleChatCompletions(
   }
 
   const resume = getForeignSessionId(conversationKey);
-  const cwd = process.env.OPENCODE_CLAUDE_CWD || process.cwd();
-
-  const bridgeId = randomUUID();
-  const pendingTools = new Map<string, ParkedToolCall>();
-  let handle: ClaudeQueryHandle | null = null;
-  let parked = false;
-  let parkWaiters: Array<() => void> = [];
-
-  const notifyPark = () => {
-    parked = true;
-    const waiters = parkWaiters;
-    parkWaiters = [];
-    for (const resolve of waiters) resolve();
-  };
 
   const mcpServers =
     openCodeTools.length > 0
       ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, notifyPark)
       : undefined;
 
-  // When OpenCode supplies tools, Claude must not run its own Bash/Read/etc.
-  // Disable built-ins (`tools: []`) and only expose the OpenCode MCP bridge.
   const bridgeOpenCodeTools = openCodeTools.length > 0;
   const openCodeToolNames = openCodeTools
     .map((t) => t.function?.name)
@@ -402,7 +491,6 @@ async function handleChatCompletions(
     ? Object.fromEntries(
         openCodeToolNames.flatMap((name) => {
           const mcpName = `mcp__opencode__${name}`;
-          // Redirect common Claude Code capitalizations to the MCP bridge.
           const aliases: Array<[string, string]> = [[name, mcpName]];
           const titled = name.charAt(0).toUpperCase() + name.slice(1);
           if (titled !== name) aliases.push([titled, mcpName]);
@@ -417,7 +505,6 @@ async function handleChatCompletions(
       )
     : undefined;
 
-  // Multimodal turns must be streamed as SDKUserMessage (string prompt drops images).
   const queryPrompt: string | AsyncIterable<SdkUserPrompt> =
     typeof prompt === "string" ? prompt || " " : promptAsStream(prompt);
 
@@ -430,7 +517,6 @@ async function handleChatCompletions(
     env,
     mcpServers,
     autoCompactEnabled: true,
-    // OpenCode owns tool execution for bridged MCP tools.
     tools: bridgeOpenCodeTools ? [] : undefined,
     toolAliases,
     allowedTools: bridgeOpenCodeTools
@@ -440,7 +526,6 @@ async function handleChatCompletions(
       ? "bypassPermissions"
       : "acceptEdits",
     allowDangerouslySkipPermissions: bridgeOpenCodeTools,
-    // canUseTool is ignored under bypassPermissions; omit it to avoid SDK warnings.
     ...(bridgeOpenCodeTools
       ? {}
       : {
@@ -535,6 +620,7 @@ async function handleChatCompletions(
     bridge,
   );
 }
+
 
 function extractSessionId(event: unknown): string | null {
   if (!event || typeof event !== "object") return null;
@@ -657,7 +743,9 @@ function streamOpenAIResponse(
   model: string,
   stream: boolean,
   bridge: ParkedBridge,
+  options?: { suppressReasoning?: boolean },
 ): Response {
+  const suppressReasoning = options?.suppressReasoning === true;
   const completionId = `chatcmpl_${createHash("sha1")
     .update(bridge.id)
     .digest("hex")
@@ -678,7 +766,7 @@ function streamOpenAIResponse(
         } else if (mapped.kind === "text") {
           content += mapped.text;
         } else if (mapped.kind === "reasoning") {
-          reasoning += mapped.text;
+          if (!suppressReasoning) reasoning += mapped.text;
         } else if (mapped.kind === "usage") {
           usage = mapped.usage;
         }
@@ -811,6 +899,7 @@ function streamOpenAIResponse(
           }
 
           if (mapped.kind === "reasoning" && mapped.text) {
+            if (suppressReasoning) continue;
             send({
               id: completionId,
               object: "chat.completion.chunk",
