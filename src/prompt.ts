@@ -429,3 +429,166 @@ export async function* promptAsStream(
   }
   yield prompt;
 }
+
+/**
+ * Conversation-history transfer.
+ *
+ * The Agent SDK turn only receives the latest user message; earlier context
+ * comes from resuming the sticky Claude session. When no session can be
+ * resumed (first claude-code turn after a model switch, lost store, deleted
+ * session file), the proxy injects the serialized prior conversation instead
+ * so Claude still sees the whole chat.
+ */
+
+export type ConversationHistoryMessage = {
+  role?: string;
+  content?: unknown;
+  tool_calls?: Array<{
+    id?: string;
+    type?: string;
+    function?: { name?: string; arguments?: string };
+  }>;
+  tool_call_id?: string;
+  name?: string;
+};
+
+/** Default history budget — generous on purpose ("keep it big"). */
+const DEFAULT_HISTORY_MAX_CHARS = 400_000;
+const TOOL_RESULT_MAX_CHARS = 1_000;
+const ATTACHMENT_NOTE = "[attachment(s) omitted from transferred history]";
+
+export function historyMaxChars(): number {
+  const raw = process.env.OPENCODE_CLAUDE_HISTORY_MAX_CHARS;
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isInteger(parsed) && parsed >= 0
+    ? parsed
+    : DEFAULT_HISTORY_MAX_CHARS;
+}
+
+function truncateMiddle(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const head = text.slice(0, Math.floor(max / 2));
+  const tail = text.slice(text.length - Math.floor(max / 2));
+  return `${head}\n… [${text.length - max} chars omitted] …\n${tail}`;
+}
+
+function serializeHistoryMessage(
+  msg: ConversationHistoryMessage,
+): string | null {
+  if (!msg || typeof msg !== "object") return null;
+  const role = msg.role;
+  // System prompts are OpenCode-internal and huge; the Claude Code preset
+  // supplies the agent system prompt instead.
+  if (role === "system") return null;
+
+  if (role === "user") {
+    const text = extractTextContent(msg.content).trim();
+    const hasAttach = contentHasAttachments(msg.content);
+    if (!text && !hasAttach) return null;
+    return `User:\n${text}${hasAttach ? `\n${ATTACHMENT_NOTE}` : ""}`.trim();
+  }
+
+  if (role === "assistant") {
+    const parts: string[] = [];
+    const text = extractTextContent(msg.content).trim();
+    if (text) parts.push(text);
+    for (const call of msg.tool_calls ?? []) {
+      const name = call?.function?.name;
+      if (name) parts.push(`[called tool: ${name}]`);
+    }
+    if (parts.length === 0) return null;
+    return `Assistant:\n${parts.join("\n")}`;
+  }
+
+  if (role === "tool") {
+    const text = extractTextContent(msg.content).trim();
+    if (!text) return null;
+    const label =
+      (typeof msg.name === "string" && msg.name) ||
+      (typeof msg.tool_call_id === "string" && msg.tool_call_id) ||
+      "tool";
+    return `Tool result (${label}):\n${truncateMiddle(text, TOOL_RESULT_MAX_CHARS)}`;
+  }
+
+  return null;
+}
+
+/** Messages before the latest user turn — the context Claude is missing. */
+export function priorMessagesOf(
+  messages: ConversationHistoryMessage[],
+): ConversationHistoryMessage[] {
+  let lastUser = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "user") {
+      lastUser = i;
+      break;
+    }
+  }
+  return lastUser > 0 ? messages.slice(0, lastUser) : [];
+}
+
+/**
+ * Serialize prior conversation into a compact transcript, keeping the NEWEST
+ * messages within the char budget (older turns are dropped first).
+ */
+export function buildConversationTranscript(
+  messages: ConversationHistoryMessage[],
+  maxChars: number = historyMaxChars(),
+): string {
+  if (maxChars <= 0) return "";
+  const serialized: string[] = [];
+  for (const msg of messages) {
+    const line = serializeHistoryMessage(msg);
+    if (line) serialized.push(line);
+  }
+  if (serialized.length === 0) return "";
+
+  const kept: string[] = [];
+  let total = 0;
+  let omitted = 0;
+  for (let i = serialized.length - 1; i >= 0; i--) {
+    const entry = serialized[i];
+    if (total + entry.length > maxChars) {
+      omitted = i + 1;
+      break;
+    }
+    kept.unshift(entry);
+    total += entry.length;
+  }
+  const header = omitted > 0 ? `[${omitted} earlier message(s) omitted]\n\n` : "";
+  return header + kept.join("\n\n");
+}
+
+/**
+ * Prepend a transferred-history block to a prompt. Text prompts get a plain
+ * prefix; multimodal prompts get an extra leading text block so attachments
+ * still reach Claude.
+ */
+export function withConversationContext(
+  prompt: string | SdkUserPrompt,
+  transcript: string,
+): string | SdkUserPrompt {
+  const body = transcript.trim();
+  if (!body) return prompt;
+  const prefix =
+    "<conversation_history>\n" +
+    "The earlier conversation of this chat is included below because the previous " +
+    "Claude session could not be resumed. Treat it as established context — do not " +
+    "re-do completed work — and respond to the user's latest message, which follows " +
+    "the history.\n\n" +
+    body +
+    "\n</conversation_history>\n\nLatest user message:\n";
+  if (typeof prompt === "string") {
+    return prefix + prompt;
+  }
+  const content = Array.isArray(prompt.message.content)
+    ? prompt.message.content
+    : [];
+  return {
+    ...prompt,
+    message: {
+      role: "user",
+      content: [{ type: "text", text: prefix }, ...content],
+    },
+  };
+}

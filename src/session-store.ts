@@ -2,7 +2,7 @@
  * Sticky foreign Claude session IDs for Agent SDK resume
  * (OpenChamber harness session-bindings pattern, scoped to this proxy).
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -70,7 +70,12 @@ export function clearForeignSessionId(conversationKey: string): void {
   writeStore(store);
 }
 
-/** Stable key from OpenAI messages so follow-ups resume the same Claude session. */
+/**
+ * Stable key from OpenAI messages so follow-ups resume the same Claude session.
+ * Hashes the first user message only — including the message count made the key
+ * change on every turn, which defeated resume entirely when the session header
+ * is absent.
+ */
 export function conversationKeyFromMessages(
   messages: Array<{ role?: string; content?: unknown }>,
 ): string {
@@ -83,5 +88,32 @@ export function conversationKeyFromMessages(
   for (let i = 0; i < seed.length; i++) {
     hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
   }
-  return `conv_${hash.toString(16)}_${messages.length}`;
+  return `conv_${hash.toString(16)}`;
+}
+
+/**
+ * Locate the Claude Code transcript for a foreign session id. The Agent SDK
+ * resumes via the claude CLI, which looks the session up under
+ * ~/.claude/projects/<cwd-slug>/ — a missing file means resume silently starts
+ * (or errors into) a context-free session, so callers must fall back to
+ * history injection instead.
+ */
+export function findClaudeSessionFile(
+  foreignSessionId: string,
+): string | null {
+  const id = foreignSessionId.trim();
+  if (!id) return null;
+  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  const projectsDir = join(configDir, "projects");
+  let projectDirs: string[];
+  try {
+    projectDirs = readdirSync(projectsDir);
+  } catch {
+    return null;
+  }
+  for (const dir of projectDirs) {
+    const candidate = join(projectsDir, dir, `${id}.jsonl`);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
 }

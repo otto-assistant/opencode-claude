@@ -26,7 +26,9 @@ import { resolveClaudeModelId } from "./models.js";
 import { SESSION_HEADER, type ClaudeEffort } from "./constants.js";
 import { startClaudeQuery, type ClaudeQueryHandle } from "./query.js";
 import {
+  clearForeignSessionId,
   conversationKeyFromMessages,
+  findClaudeSessionFile,
   getForeignSessionId,
   setForeignSessionId,
 } from "./session-store.js";
@@ -41,9 +43,12 @@ import {
   formatResetCountdown,
 } from "./rate-limit.js";
 import {
+  buildConversationTranscript,
   extractTextContent,
   latestUserPrompt,
+  priorMessagesOf,
   promptAsStream,
+  withConversationContext,
   type SdkUserPrompt,
 } from "./prompt.js";
 import {
@@ -565,7 +570,34 @@ async function handleChatCompletions(
     );
   }
 
-  const resume = getForeignSessionId(conversationKey);
+  let resume = getForeignSessionId(conversationKey);
+  if (resume && !findClaudeSessionFile(resume)) {
+    // The claude CLI resumes by looking the session up on disk. A missing
+    // transcript (cleanup, different machine, pruned projects dir) would
+    // silently start a context-free session — drop the stale binding and
+    // transfer the conversation history into the prompt instead.
+    log.warn("[opencode-claude] stored Claude session file missing; transferring history", {
+      conversationKey,
+      foreignSessionId: resume,
+    });
+    clearForeignSessionId(conversationKey);
+    resume = undefined;
+  }
+
+  // No resumable Claude session (first claude-code turn of this chat, model
+  // switch mid-conversation, lost store): serialize the prior OpenCode
+  // messages into the prompt so Claude sees the whole conversation.
+  const transcript = resume
+    ? ""
+    : buildConversationTranscript(priorMessagesOf(messages));
+  if (transcript) {
+    log.info("[opencode-claude] injecting transferred conversation history", {
+      conversationKey,
+      transcriptChars: transcript.length,
+      historyMessages: priorMessagesOf(messages).length,
+    });
+  }
+  const contextualPrompt = withConversationContext(prompt, transcript);
 
   const mcpServers =
     openCodeTools.length > 0
@@ -599,7 +631,9 @@ async function handleChatCompletions(
     : undefined;
 
   const queryPrompt: string | AsyncIterable<SdkUserPrompt> =
-    typeof prompt === "string" ? prompt || " " : promptAsStream(prompt);
+    typeof contextualPrompt === "string"
+      ? contextualPrompt || " "
+      : promptAsStream(contextualPrompt);
 
   const hasTodoWrite = openCodeToolNames.includes("todowrite");
   handle = await queryStarter({
@@ -875,6 +909,7 @@ function streamOpenAIResponse(
           // SDK emits the failure twice (result event + iterator throw) —
           // keep one copy, and keep any usage that came with it.
           if (mapped.usage) usage = mapped.usage;
+          forgetDeadSession(bridge.conversationKey, mapped.text);
           const norm = normalizeClaudeErrorText(mapped.text);
           if (norm && norm !== lastErrorNorm) {
             lastErrorNorm = norm;
@@ -921,6 +956,7 @@ function streamOpenAIResponse(
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           recordRateLimitErrorText(message);
+          forgetDeadSession(bridge.conversationKey, message);
           controller.enqueue(
             new TextEncoder().encode(
               JSON.stringify({
@@ -1053,6 +1089,7 @@ function streamOpenAIResponse(
           if (mapped.kind === "error") {
             finishReason = "stop";
             if (mapped.usage) usage = mapped.usage;
+            forgetDeadSession(bridge.conversationKey, mapped.text);
             sendError(mapped.text);
           }
         }
@@ -1061,6 +1098,7 @@ function streamOpenAIResponse(
         // A limit/result failure typically arrives here right after the SDK
         // emitted the same text as a result event — dedupe via sendError.
         recordRateLimitErrorText(message);
+        forgetDeadSession(bridge.conversationKey, message);
         sendError(message);
         finishReason = "stop";
       }
@@ -1089,6 +1127,22 @@ type MappedEvent =
   | { kind: "error"; text: string; usage?: OpenAIUsage | null }
   | { kind: "ignore" };
 
+/** claude CLI text when `resume` points at a session it cannot load. */
+const LOST_SESSION_PATTERN =
+  /no conversation found|session\b.*\bnot found|could not (?:find|load|resume).*(?:session|conversation)/i;
+
+/**
+ * A resume-target-missing error means the stored foreign session id is dead.
+ * Clear it so the next turn transfers history instead of failing forever.
+ */
+function forgetDeadSession(conversationKey: string, errorText: string): void {
+  if (!LOST_SESSION_PATTERN.test(errorText)) return;
+  log.warn("[opencode-claude] Claude session lost; clearing stored binding", {
+    conversationKey,
+  });
+  clearForeignSessionId(conversationKey);
+}
+
 /**
  * Map Claude Agent SDK events to OpenAI-style deltas.
  *
@@ -1106,9 +1160,15 @@ function mapSdkEvent(event: unknown): MappedEvent {
 
   // Structured subscription limit telemetry from the Agent SDK — record for
   // the /v1/rate-limit counter; surface a note only on meaningful changes.
+  // The note decision must use THIS event's own payload (fresh), never
+  // merged store history — see maybeRateLimitNote.
   if (e.type === "rate_limit_event") {
-    const state = recordRateLimitInfo(e.rate_limit_info);
-    const note = maybeRateLimitNote(state);
+    const rawInfo =
+      e.rate_limit_info && typeof e.rate_limit_info === "object"
+        ? (e.rate_limit_info as Record<string, unknown>)
+        : undefined;
+    const state = recordRateLimitInfo(rawInfo);
+    const note = maybeRateLimitNote(state, rawInfo);
     return note ? { kind: "reasoning", text: note } : { kind: "ignore" };
   }
 

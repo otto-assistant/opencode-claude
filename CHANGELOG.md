@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.9.0
+
+- **Stale rate-limit fix**: a fresh `rate_limit_event` with status `allowed`
+  but no `utilization` field used to resurrect the previous window's stale
+  utilization from `rate-limit.json` — after a limit window reset, normal
+  chats could print a bogus "[rate-limit] Claude · five hour · 99% of window
+  used · resets in …" note. Utilization is now window-scoped: only what the
+  current event reports is stored, and warning notes are driven by the
+  triggering event's own status/utilization (never merged history), so a
+  healthy `allowed` event is always quiet
+- **Conversation-history transfer**: when no Claude session can be resumed
+  (first claude-code turn of a chat, switching from another provider/model
+  mid-conversation, lost session store), the proxy serialized nothing and
+  Claude started blind — answering "no prior context" on long-running chats.
+  The prior OpenCode messages are now serialized into the prompt
+  (`<conversation_history>` block, newest-first within a 400k char budget,
+  tool calls/results condensed, system prompts excluded). Configurable via
+  `OPENCODE_CLAUDE_HISTORY_MAX_CHARS` (`0` disables)
+- **Dead resume detection**: a stored foreign session id whose Claude
+  transcript file is missing (`~/.claude/projects/*/<id>.jsonl`) is dropped
+  before the turn instead of producing a context-free fresh session; SDK
+  "no conversation found" errors clear the stored binding so the next turn
+  self-heals via history transfer
+- **Stable fallback conversation key**: `conversationKeyFromMessages` hashed
+  the message count into the key, so it changed on every turn and resume
+  never matched when the session header was absent; the key is now stable
+  across turns of the same conversation
+
 ## 0.7.1
 
 - **Rate-limit counter + gate**: structured SDK `rate_limit_event`s and hard

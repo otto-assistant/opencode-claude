@@ -244,6 +244,127 @@ async function main() {
     { role: "user", content: "hello world" },
   ]);
   assert.ok(key.startsWith("conv_"));
+  // Key must be stable as the conversation grows — a per-turn changing key
+  // defeats Claude session resume when the session header is absent.
+  const keyLater = conversationKeyFromMessages([
+    { role: "user", content: "hello world" },
+    { role: "assistant", content: "hi!" },
+    { role: "user", content: "follow up" },
+  ]);
+  assert.equal(keyLater, key);
+
+  // ---- Conversation-history transfer (context when resume is impossible) ----
+  {
+    const {
+      buildConversationTranscript,
+      priorMessagesOf,
+      withConversationContext,
+    } = await import("../src/prompt.ts");
+
+    const history = [
+      { role: "system", content: "You are a huge internal system prompt." },
+      { role: "user", content: "remember the codename AXIOM-9042" },
+      { role: "assistant", content: "Got it — codename AXIOM-9042 noted." },
+      { role: "user", content: "what is the codename?" },
+    ];
+
+    // priorMessagesOf excludes the latest user turn
+    const prior = priorMessagesOf(history);
+    assert.equal(prior.length, 3);
+    assert.equal(prior[prior.length - 1]?.role, "assistant");
+
+    const transcript = buildConversationTranscript(prior);
+    assert.match(transcript, /AXIOM-9042/);
+    assert.match(transcript, /^User:/m);
+    assert.match(transcript, /^Assistant:/m);
+    // system prompt never leaks into the transfer
+    assert.doesNotMatch(transcript, /huge internal system prompt/);
+
+    // tool calls/results are condensed but present
+    const withTools = buildConversationTranscript([
+      { role: "user", content: "run tests" },
+      {
+        role: "assistant",
+        content: "running",
+        tool_calls: [
+          { id: "c1", function: { name: "bash", arguments: "{}" } },
+        ],
+      },
+      { role: "tool", tool_call_id: "c1", content: "x".repeat(5000) },
+    ]);
+    assert.match(withTools, /\[called tool: bash\]/);
+    assert.match(withTools, /Tool result/);
+    assert.match(withTools, /chars omitted/);
+
+    // budget keeps the NEWEST messages, drops oldest first
+    const tight = buildConversationTranscript(
+      [
+        { role: "user", content: "OLD-MESSAGE-MARKER " + "y".repeat(200) },
+        { role: "user", content: "NEW-MESSAGE-MARKER" },
+      ],
+      100,
+    );
+    assert.match(tight, /NEW-MESSAGE-MARKER/);
+    assert.doesNotMatch(tight, /OLD-MESSAGE-MARKER/);
+    assert.match(tight, /earlier message\(s\) omitted/);
+
+    // zero budget disables transfer entirely
+    assert.equal(buildConversationTranscript(prior, 0), "");
+
+    // attachments in history leave an explicit note
+    const withImage = buildConversationTranscript([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "look" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,AA" } },
+        ],
+      },
+    ]);
+    assert.match(withImage, /attachment\(s\) omitted/);
+
+    // withConversationContext: string prompt gets the history prefix
+    const wrapped = withConversationContext("what is the codename?", transcript);
+    assert.equal(typeof wrapped, "string");
+    assert.match(wrapped as string, /<conversation_history>/);
+    assert.match(wrapped as string, /AXIOM-9042/);
+    assert.match(wrapped as string, /Latest user message:\nwhat is the codename\?/);
+
+    // empty transcript leaves the prompt untouched
+    assert.equal(withConversationContext("hi", ""), "hi");
+
+    // multimodal prompt gets a leading text block, attachments preserved
+    const multiWrapped = withConversationContext(
+      {
+        type: "user" as const,
+        message: {
+          role: "user" as const,
+          content: [
+            { type: "text" as const, text: "see this" },
+            {
+              type: "image" as const,
+              source: {
+                type: "base64" as const,
+                media_type: "image/png",
+                data: "AA",
+              },
+            },
+          ],
+        },
+        parent_tool_use_id: null,
+      },
+      transcript,
+    );
+    assert.equal(typeof multiWrapped, "object");
+    const mwContent = (multiWrapped as { message: { content: unknown[] } })
+      .message.content;
+    assert.equal((mwContent[0] as { type: string }).type, "text");
+    assert.match(
+      (mwContent[0] as { text: string }).text,
+      /<conversation_history>/,
+    );
+    assert.equal((mwContent[2] as { type: string }).type, "image");
+  }
 
   // Usage + compact helpers
   const { usageFromSdkResult, formatCompactNote } = await import(
@@ -529,6 +650,41 @@ async function main() {
       assert.equal(healthBody.rateLimit?.limited, false);
       assert.equal(healthBody.rateLimit?.utilization, 0.99);
 
+      // Regression: an "allowed" event that omits utilization (the SDK does
+      // this on plenty of events) must NOT resurrect the previous window's
+      // stale 99% — the store drops utilization and no warning note fires.
+      const staleResetSec = futureSec + 3600; // new window
+      const staleState = recordRateLimitInfo({
+        status: "allowed",
+        resetsAt: staleResetSec,
+        rateLimitType: "five_hour",
+        // utilization deliberately absent
+      });
+      assert.equal(
+        staleState!.utilization,
+        undefined,
+        "stale utilization must be cleared by an allowed event",
+      );
+      __resetRateLimitNoteDedupe();
+      assert.equal(
+        maybeRateLimitNote(staleState, {
+          status: "allowed",
+          resetsAt: staleResetSec,
+          rateLimitType: "five_hour",
+        }),
+        null,
+        "no warning note for an allowed event without fresh utilization",
+      );
+      // Fresh utilization the event itself reports still surfaces.
+      const freshWarn = maybeRateLimitNote(staleState, {
+        status: "allowed_warning",
+        resetsAt: staleResetSec,
+        rateLimitType: "five_hour",
+        utilization: 0.95,
+      });
+      assert.ok(freshWarn && /95%/.test(freshWarn), "fresh warning noted");
+      __resetRateLimitNoteDedupe();
+
       // Proxy + mock SDK: successful turn streams text, note, usage — and the
       // todowrite alias + plan-persistence prompt reach the query starter.
       __resetRateLimitNoteDedupe();
@@ -553,6 +709,16 @@ async function main() {
               resetsAt: futureSec,
               rateLimitType: "five_hour",
               utilization: 0.99,
+            },
+          },
+          {
+            type: "rate_limit_event",
+            rate_limit_info: {
+              status: "allowed",
+              resetsAt: futureSec,
+              rateLimitType: "five_hour",
+              // utilization deliberately absent — stale 0.99 must NOT
+              // produce a second bogus "99% of window used" note
             },
           },
           {
@@ -608,7 +774,9 @@ async function main() {
       };
       const okMsg = okJson.choices?.[0]?.message ?? {};
       assert.match(String(okMsg.content ?? ""), /MOCK_OK/);
-      // rate-limit note surfaced once (two identical events → one note)
+      // rate-limit note surfaced once (two identical warning events → one
+      // note; the trailing "allowed" event without utilization must NOT add
+      // a stale-utilization note — regression for the 99%-after-reset bug)
       const okReasoning = String(okMsg.reasoning_content ?? "");
       assert.equal(okReasoning.match(/\[rate-limit\]/g)?.length ?? 0, 1);
       assert.match(okReasoning, /99%/);
@@ -768,6 +936,130 @@ async function main() {
         process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = prevStoreEnv;
       }
       rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  // ---- History injection through the proxy (mocked Agent SDK) ----
+  {
+    const { setClaudeQueryStarter } = await import("../src/proxy.ts");
+    const {
+      clearForeignSessionId,
+      findClaudeSessionFile,
+      getForeignSessionId,
+      setForeignSessionId,
+    } = await import("../src/session-store.ts");
+    const { mkdirSync, rmSync, writeFileSync } = await import("node:fs");
+    const { homedir } = await import("node:os");
+    const { join: joinPath } = await import("node:path");
+
+    const mockTurn = (
+      seen: { params: Record<string, unknown> | null },
+      sessionId: string | null,
+    ) => {
+      setClaudeQueryStarter(async (params) => {
+        seen.params = params as unknown as Record<string, unknown>;
+        return {
+          stream: (async function* () {
+            if (sessionId) {
+              yield { type: "system", subtype: "init", session_id: sessionId };
+            }
+            yield {
+              type: "stream_event",
+              event: {
+                type: "content_block_delta",
+                delta: { type: "text_delta", text: "MOCK_OK" },
+              },
+            };
+            yield { type: "result", is_error: false, usage: {} };
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        };
+      });
+    };
+
+    const postChat = (sessionHeader: string, messages: unknown[]) =>
+      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-opencode-claude-session": sessionHeader,
+        },
+        body: JSON.stringify({ model: "sonnet", stream: false, messages }),
+      });
+
+    try {
+      const historyMessages = [
+        { role: "system", content: "internal system prompt" },
+        { role: "user", content: "remember the codename AXIOM-9042" },
+        { role: "assistant", content: "Codename AXIOM-9042 noted." },
+        { role: "user", content: "what is the codename?" },
+      ];
+
+      // 1. No stored binding → history injected, no resume attempted
+      clearForeignSessionId("smoke-history-fresh");
+      const seen1 = { params: null as Record<string, unknown> | null };
+      mockTurn(seen1, "mock-sess-fresh");
+      const res1 = await postChat("smoke-history-fresh", historyMessages);
+      assert.equal(res1.status, 200);
+      const res1Json = (await res1.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      assert.match(String(res1Json.choices?.[0]?.message?.content ?? ""), /MOCK_OK/);
+      assert.ok(seen1.params, "query starter called");
+      assert.equal(seen1.params!.resume, undefined);
+      const promptText = String(seen1.params!.prompt ?? "");
+      assert.match(promptText, /<conversation_history>/);
+      assert.match(promptText, /AXIOM-9042/);
+      assert.match(promptText, /Latest user message:\nwhat is the codename\?/);
+      assert.doesNotMatch(promptText, /internal system prompt/);
+      // turn stored the new foreign session for follow-up resume
+      assert.equal(
+        getForeignSessionId("smoke-history-fresh"),
+        "mock-sess-fresh",
+      );
+
+      // 2. Stored binding whose transcript file EXISTS → resume, no injection
+      const fakeProjectsDir = joinPath(
+        homedir(),
+        ".claude",
+        "projects",
+        "opencode-claude-smoke",
+      );
+      mkdirSync(fakeProjectsDir, { recursive: true });
+      writeFileSync(joinPath(fakeProjectsDir, "mock-sess-live.jsonl"), "{}\n");
+      assert.ok(findClaudeSessionFile("mock-sess-live"));
+      setForeignSessionId("smoke-history-resume", "mock-sess-live");
+      const seen2 = { params: null as Record<string, unknown> | null };
+      mockTurn(seen2, "mock-sess-live");
+      const res2 = await postChat("smoke-history-resume", historyMessages);
+      assert.equal(res2.status, 200);
+      await res2.text();
+      assert.equal(seen2.params!.resume, "mock-sess-live");
+      assert.doesNotMatch(
+        String(seen2.params!.prompt ?? ""),
+        /<conversation_history>/,
+      );
+      rmSync(fakeProjectsDir, { recursive: true, force: true });
+
+      // 3. Stored binding with a MISSING transcript file → binding dropped,
+      //    history injected instead of a doomed resume
+      setForeignSessionId("smoke-history-dead", "mock-sess-gone");
+      const seen3 = { params: null as Record<string, unknown> | null };
+      mockTurn(seen3, null); // no init event → store not rewritten
+      const res3 = await postChat("smoke-history-dead", historyMessages);
+      assert.equal(res3.status, 200);
+      await res3.text();
+      assert.equal(seen3.params!.resume, undefined);
+      assert.match(String(seen3.params!.prompt ?? ""), /<conversation_history>/);
+      assert.equal(getForeignSessionId("smoke-history-dead"), undefined);
+
+      clearForeignSessionId("smoke-history-fresh");
+      clearForeignSessionId("smoke-history-resume");
+      clearForeignSessionId("smoke-history-dead");
+    } finally {
+      setClaudeQueryStarter(null);
     }
   }
 

@@ -97,6 +97,7 @@ opencode run "Summarise this repository in five bullets." --model claude-code/so
 | **Attachments** | Images and PDFs from OpenCode reach Claude (data URLs + remote URLs). |
 | **Auto-compact** | Long sessions compact like Claude Code; boundary events are surfaced in the stream. |
 | **Session resume** | Sticky foreign Claude session IDs so follow-ups continue the same Agent SDK turn. |
+| **History transfer** | When no Claude session can be resumed (first claude-code turn of a chat, model switch mid-conversation, pruned transcript), the full prior conversation is serialized into the prompt — Claude never starts blind. |
 | **Rate-limit counter** | Subscription limit state is tracked with its reset time; `GET /v1/rate-limit` answers "when are limits back", and doomed turns fail fast with 429 + `Retry-After`. |
 
 ## Architecture
@@ -119,7 +120,7 @@ The proxy records Agent SDK `rate_limit_event` telemetry and hard session-limit
 errors (including the parsed reset time) to
 `~/.local/share/opencode-claude/rate-limit.json`.
 
-- `GET /v1/rate-limit` → `{ limited, status, rateLimitType, utilization, resetsAt, resetsAtISO, resetInSeconds, message, updatedAt }` — poll this for a "limits reset in …" countdown.
+- `GET /v1/rate-limit` → `{ limited, status, rateLimitType, utilization, resetsAt, resetsAtISO, resetInSeconds, message, updatedAt }` — poll this for a "limits reset in …" countdown. `utilization` is only present when the latest SDK event reported it — it is never carried over from an earlier limit window, so a freshly reset window never shows a stale percentage.
 - `GET /health` includes a compact `rateLimit` summary.
 - While a confirmed hard limit is active, new chat turns return HTTP **429**
   with `Retry-After` + `x-claude-rate-limit-reset` headers and an
@@ -153,6 +154,7 @@ Optional knobs:
 - `CLAUDE_CODE_OAUTH_TOKEN` — inject a subscription token (CI / headless)
 - `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL` — `0` disables the 429 rate-limit gate
 - `OPENCODE_CLAUDE_RATE_LIMIT_STORE` — override the rate-limit store path (tests)
+- `OPENCODE_CLAUDE_HISTORY_MAX_CHARS` — budget for transferred conversation history when a Claude session cannot be resumed (default `400000`; newest messages are kept, `0` disables transfer)
 
 ## Release
 

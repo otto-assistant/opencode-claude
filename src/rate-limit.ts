@@ -97,7 +97,12 @@ export function recordRateLimitInfo(info: unknown): ClaudeRateLimitState | null 
     ...prev,
     status: asString(raw.status) ?? prev.status,
     rateLimitType: asString(raw.rateLimitType) ?? prev.rateLimitType,
-    utilization: asNumber(raw.utilization) ?? prev.utilization,
+    // Utilization is window-scoped: keep only what the CURRENT event
+    // reports. Carrying an earlier event's value forward (the SDK omits
+    // utilization on plenty of events) resurrects an exhausted window's
+    // ~100% long after the reset — bogus "99% of window used" notes and
+    // counter values on later healthy "allowed" events.
+    utilization: asNumber(raw.utilization),
     overageDisabled:
       typeof raw.overageDisabledReason === "string" &&
       raw.overageDisabledReason.length > 0
@@ -324,27 +329,40 @@ let lastNoteSignature: string | null = null;
  * Build a short user-facing note for a structured event, but only when the
  * situation meaningfully changed (status change, or utilization crossing
  * 0.9 / 0.95 / 0.99). Returns null when nothing new is worth surfacing.
+ *
+ * `fresh` is the raw `rate_limit_info` payload of the event that triggered
+ * the call. When provided it is authoritative: the note decision and text
+ * use ONLY the event's own status/utilization, never merged store history —
+ * a stale utilization from an earlier event or an earlier limit window must
+ * not resurrect a "99% of window used" warning on a healthy "allowed" event.
  */
 export function maybeRateLimitNote(
   state: ClaudeRateLimitState | null,
+  fresh?: Record<string, unknown>,
 ): string | null {
   if (!state || !state.status) return null;
-  const status = state.status;
+  const freshStatus = fresh ? asString(fresh.status) : undefined;
+  const freshUtil = fresh ? asNumber(fresh.utilization) : undefined;
+  const status = freshStatus ?? state.status;
+  const util = freshUtil ?? state.utilization;
+  // Without a fresh event (legacy direct calls) fall back to stored values;
+  // with a fresh event, only data the event itself carried can trigger a
+  // warning — "allowed" with no fresh utilization is always quiet.
   const interesting =
     status === "rejected" ||
     status === "allowed_warning" ||
-    (state.utilization !== undefined && state.utilization >= 0.9);
+    (fresh ? freshUtil !== undefined && freshUtil >= 0.9
+          : util !== undefined && util >= 0.9);
   if (!interesting) {
     lastNoteSignature = null;
     return null;
   }
-  const util = state.utilization ?? 0;
   const bucket =
     status === "rejected"
       ? "rejected"
-      : util >= 0.99
+      : (util ?? 0) >= 0.99
         ? "u99"
-        : util >= 0.95
+        : (util ?? 0) >= 0.95
           ? "u95"
           : "u90";
   const signature = `${status}:${bucket}:${state.resetsAt ?? ""}`;
@@ -355,7 +373,7 @@ export function maybeRateLimitNote(
   if (state.rateLimitType) parts.push(state.rateLimitType.replace(/_/g, " "));
   if (status === "rejected") {
     parts.push("request rejected by limiter");
-  } else if (util >= 0.9) {
+  } else if (util !== undefined && util >= 0.9) {
     parts.push(`${Math.round(util * 100)}% of window used`);
   } else {
     parts.push(status);
