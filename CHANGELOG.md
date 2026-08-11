@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.9.1
+
+- **Fail-fast on dead turns**: a Claude turn that dies before producing any
+  content (bad/revoked token, session limit, spawn failure) used to be
+  streamed back as a fake-200 response whose only "assistant text" was the
+  error message. Hosts retried those turns in a loop, and each retry
+  re-sent the entire conversation context to Anthropic — burning quota for
+  zero output (observed: ~4% of a weekly usage cap in one incident). The
+  proxy now probes the turn before committing the response head and answers
+  with a truthful HTTP status: 401 for auth failures, 429 + Retry-After for
+  subscription limits (also activating the fast-fail gate), 500 otherwise.
+  Errors after content is already streaming stay inline as before.
+- **Pre-flight auth check**: with no credentials at all, the proxy returns
+  401 immediately instead of spawning a doomed CLI turn.
+- **Single-flight token refresh**: OpenCode fires the main turn and the
+  title/summary request in parallel; both used to refresh the same OAuth
+  token concurrently. Anthropic rotates the refresh token on every use, so
+  the loser replayed a stale token — treated as token theft and the whole
+  grant got revoked (invalid_grant → revoked chain). Refreshes are now
+  deduped per refresh token, run with a 2-minute margin before expiry, and
+  re-read the auth store after a rejection (a sibling process may already
+  have rotated).
+- **Chain ownership**: CLI-synced credentials are tagged (`cli-shared-` /
+  `cli-sync-`) and never rotated through the token endpoint by the plugin —
+  the CLI stays the sole owner of its chain. Expired CLI credentials are no
+  longer synced (they shadowed healthy creds and blocked the CLI's own
+  auto-refresh), and a newer `auth.json` entry is never clobbered by older
+  CLI creds. The stock `anthropic` provider is no longer seeded with the
+  plugin's tokens (two owners of one chain = revoked grant).
+- **Model visibility decoupled from the CLI**: the model catalog collapsed
+  to `login + sonnet` whenever the CLI was logged out, even with a valid
+  plugin-owned OAuth token in `auth.json`. The plugin now reads its own
+  `auth.json` entry directly (fallback when the host's auth store lags the
+  file) and uses it for both model visibility and token resolution.
+- **Wire-identical meta requests**: title/summary requests to the Messages
+  API now mirror the real Claude CLI — Claude Code system-prompt preamble as
+  the first system block (required for OAuth-gated inference), `claude-cli`
+  user-agent, `x-app: cli`, and `anthropic-dangerous-direct-browser-access`
+  — so they can never be flagged as non-CLI traffic.
+
 ## 0.9.0
 
 - **Stale rate-limit fix**: a fresh `rate_limit_event` with status `allowed`
