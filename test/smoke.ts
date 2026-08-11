@@ -503,6 +503,11 @@ async function main() {
   // Proxy health (without Agent SDK turn)
   await stopProxy();
   const port = await startProxy(async () => null);
+  // Deterministic pre-flight: pretend CLI credentials exist (the smoke host
+  // may or may not have real ones). The dedicated pre-flight test below
+  // overrides this with `false`.
+  const { setClaudeCredentialProbe } = await import("../src/proxy.ts");
+  setClaudeCredentialProbe(() => true);
   assert.ok(port > 0);
   assert.equal(getProxyPort(), port);
   assert.ok(getClaudeProxyBaseUrl().includes(String(port)));
@@ -792,8 +797,9 @@ async function main() {
       assert.match(sysPrompt.append ?? "", /mcp__opencode__todowrite/);
       assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
 
-      // Proxy + mock SDK: hard limit error — single error note, usage kept,
-      // store flips to limited, next request fails fast with 429.
+      // Proxy + mock SDK: hard limit error BEFORE any content — the proxy
+      // must answer with a truthful HTTP 429 (not a fake-200 error stream),
+      // flip the store to limited, and fail fast on the next request.
       setClaudeQueryStarter(async () => {
         const limitText =
           "You've hit your session limit · resets 1:10am (Europe/Kyiv)";
@@ -832,14 +838,33 @@ async function main() {
           }),
         },
       );
-      assert.equal(errRes.status, 200);
-      const errBody = await errRes.text();
-      // error streamed exactly once despite result event + iterator throw
-      assert.equal(errBody.match(/\[claude-code error\]/g)?.length ?? 0, 1);
-      assert.match(errBody, /session limit/);
-      assert.match(errBody, /limit resets in/);
-      assert.match(errBody, /"prompt_tokens":7/); // usage forwarded on error
-      assert.match(errBody, /\[DONE\]/);
+      assert.equal(errRes.status, 429, "hard limit must fail fast with 429");
+      assert.ok(errRes.headers.get("retry-after"), "429 carries Retry-After");
+      const errJson = (await errRes.json()) as {
+        error?: { type?: string; message?: string; code?: string };
+      };
+      assert.equal(errJson.error?.type, "rate_limit_error");
+      assert.equal(errJson.error?.code, "claude_session_limit");
+      assert.match(errJson.error?.message ?? "", /session limit/);
+      assert.match(errJson.error?.message ?? "", /limit resets in/);
+
+      // Same death on the non-streaming path → same 429, not a fake-200.
+      const errRes2 = await fetch(
+        `http://127.0.0.1:${port}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-opencode-claude-session": "smoke-mock-err2",
+          },
+          body: JSON.stringify({
+            model: "sonnet",
+            stream: false,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        },
+      );
+      assert.equal(errRes2.status, 429, "non-stream hard limit also 429");
 
       const snap = getRateLimitSnapshot();
       assert.equal(snap.limited, true);
@@ -1063,7 +1088,327 @@ async function main() {
     }
   }
 
+  // ---- Fail-fast taxonomy: dead turns get truthful HTTP statuses ----
+  {
+    const { setClaudeQueryStarter, setClaudeCredentialProbe } = await import(
+      "../src/proxy.ts"
+    );
+    const { classifyClaudeFailure } = await import("../src/failure.ts");
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join: joinPath } = await import("node:path");
+
+    // Isolate the rate-limit store so this section starts clean.
+    const tmpDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-ff-"));
+    const prevStoreEnv = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+    process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = joinPath(
+      tmpDir,
+      "rate-limit.json",
+    );
+
+    const postTurn = (sessionHeader: string, stream: boolean) =>
+      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-opencode-claude-session": sessionHeader,
+        },
+        body: JSON.stringify({
+          model: "sonnet",
+          stream,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+
+    const mockDeath = (text: string) => {
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield { type: "system", subtype: "init", session_id: "ff-sess" };
+          yield { type: "result", is_error: true, result: text };
+          throw new Error(`Claude Code returned an error result: ${text}`);
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      }));
+    };
+
+    try {
+      // Unit: classifier
+      assert.equal(
+        classifyClaudeFailure(
+          "token refresh rejected (HTTP 400): invalid_grant",
+        ),
+        "auth",
+      );
+      assert.equal(
+        classifyClaudeFailure("Invalid API key · Please run /login"),
+        "auth",
+      );
+      assert.equal(
+        classifyClaudeFailure("You've hit your session limit · resets 1:10am"),
+        "rate_limit",
+      );
+      assert.equal(classifyClaudeFailure("boom"), "unknown");
+
+      // Auth death before content → 401 (non-retryable), both modes
+      mockDeath("Invalid API key · Please run /login");
+      const authStream = await postTurn("ff-auth-stream", true);
+      assert.equal(authStream.status, 401);
+      const authStreamJson = (await authStream.json()) as {
+        error?: { type?: string; code?: string; message?: string };
+      };
+      assert.equal(authStreamJson.error?.type, "authentication_error");
+      assert.equal(authStreamJson.error?.code, "claude_auth");
+      assert.match(authStreamJson.error?.message ?? "", /Re-authenticate/);
+
+      const authBuffered = await postTurn("ff-auth-buffered", false);
+      assert.equal(authBuffered.status, 401);
+      assert.equal(
+        ((await authBuffered.json()) as { error?: { type?: string } }).error
+          ?.type,
+        "authentication_error",
+      );
+
+      // Unknown death before content → 500
+      mockDeath("Claude Code process exploded unexpectedly");
+      const boomRes = await postTurn("ff-boom", true);
+      assert.equal(boomRes.status, 500);
+      assert.equal(
+        ((await boomRes.json()) as { error?: { type?: string } }).error?.type,
+        "server_error",
+      );
+
+      // Error AFTER content → still a 200 stream with the inline note once
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield { type: "system", subtype: "init", session_id: "ff-late" };
+          yield {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "partial answer" },
+            },
+          };
+          yield {
+            type: "result",
+            is_error: true,
+            result: "Claude Code process exploded unexpectedly",
+          };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      }));
+      const lateRes = await postTurn("ff-late-content", true);
+      assert.equal(lateRes.status, 200);
+      const lateBody = await lateRes.text();
+      assert.match(lateBody, /partial answer/);
+      assert.equal(
+        lateBody.match(/\[claude-code error\]/g)?.length ?? 0,
+        1,
+        "mid-stream error note appears exactly once",
+      );
+      assert.match(lateBody, /\[DONE\]/);
+
+      // Empty-but-successful turn → legit 200 with empty content
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield { type: "system", subtype: "init", session_id: "ff-empty" };
+          yield { type: "result", is_error: false, usage: {} };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      }));
+      const emptyRes = await postTurn("ff-empty-ok", true);
+      assert.equal(emptyRes.status, 200);
+      assert.match(await emptyRes.text(), /\[DONE\]/);
+
+      // Pre-flight: no token provider result AND no CLI credentials → 401
+      // without ever starting a turn.
+      let starterCalled = false;
+      setClaudeQueryStarter(async () => {
+        starterCalled = true;
+        throw new Error("must not be called");
+      });
+      setClaudeCredentialProbe(() => false);
+      const noCredRes = await postTurn("ff-no-creds", true);
+      assert.equal(noCredRes.status, 401);
+      const noCredJson = (await noCredRes.json()) as {
+        error?: { code?: string };
+      };
+      assert.equal(noCredJson.error?.code, "claude_auth_required");
+      assert.equal(starterCalled, false, "no doomed turn was spawned");
+      setClaudeCredentialProbe(() => true);
+    } finally {
+      setClaudeQueryStarter(null);
+      setClaudeCredentialProbe(null);
+      if (prevStoreEnv === undefined) {
+        delete process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+      } else {
+        process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = prevStoreEnv;
+      }
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  // ---- CLI credential sync poisoning guards ----
+  {
+    const { syncClaudeCliCredentialsToOpenCode } = await import(
+      "../src/auth-login.ts"
+    );
+    const { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } =
+      await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join: joinPath } = await import("node:path");
+
+    const tmpDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-sync-"));
+    const fakeHome = joinPath(tmpDir, "home");
+    mkdirSync(joinPath(fakeHome, ".claude"), { recursive: true });
+    const prevXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = joinPath(tmpDir, "data");
+    const authFile = joinPath(tmpDir, "data", "opencode", "auth.json");
+    const writeCliCreds = (accessToken: string, expiresAt: number) =>
+      writeFileSync(
+        joinPath(fakeHome, ".claude", ".credentials.json"),
+        JSON.stringify({
+          claudeAiOauth: {
+            accessToken,
+            refreshToken: "cli-refresh",
+            expiresAt,
+            scopes: ["user:inference"],
+          },
+        }),
+      );
+
+    try {
+      // 1. Expired CLI token must NOT be synced (would shadow healthy creds
+      //    and block the CLI's own auto-refresh via env override).
+      writeCliCreds("dead-access", Date.now() - 60_000);
+      const syncedDead = syncClaudeCliCredentialsToOpenCode({
+        homeDir: fakeHome,
+        env: {},
+      });
+      assert.equal(syncedDead, null, "expired CLI token is not synced");
+
+      // 2. Fresh-but-older CLI token must not clobber a newer auth entry.
+      writeCliCreds("cli-access", Date.now() + 3600_000);
+      mkdirSync(joinPath(tmpDir, "data", "opencode"), { recursive: true });
+      writeFileSync(
+        authFile,
+        JSON.stringify({
+          "claude-code": {
+            type: "oauth",
+            access: "oauth-access",
+            refresh: "oauth-refresh",
+            expires: Date.now() + 8 * 3600_000,
+          },
+        }),
+      );
+      const syncedOlder = syncClaudeCliCredentialsToOpenCode({
+        homeDir: fakeHome,
+        env: {},
+      });
+      assert.equal(syncedOlder, null, "older CLI creds do not clobber newer");
+      const kept = JSON.parse(readFileSync(authFile, "utf8")) as {
+        "claude-code": { access: string };
+      };
+      assert.equal(kept["claude-code"].access, "oauth-access");
+
+      // 3. Newer CLI token wins and is written through. The refresh token is
+      //    TAGGED as CLI-owned so the plugin never rotates it (rotation is
+      //    the CLI's job — dual ownership gets grants revoked).
+      writeCliCreds("cli-access-new", Date.now() + 9 * 3600_000);
+      const syncedNewer = syncClaudeCliCredentialsToOpenCode({
+        homeDir: fakeHome,
+        env: {},
+      });
+      assert.equal(syncedNewer?.access, "cli-access-new");
+      const rewritten = JSON.parse(readFileSync(authFile, "utf8")) as {
+        "claude-code": { access: string; refresh: string };
+      };
+      assert.equal(rewritten["claude-code"].access, "cli-access-new");
+      assert.equal(rewritten["claude-code"].refresh, "cli-shared-cli-refresh");
+
+      const { isCliOwnedRefreshToken, readStoredClaudeOAuth } = await import(
+        "../src/auth-login.ts"
+      );
+      assert.equal(isCliOwnedRefreshToken("cli-shared-cli-refresh"), true);
+      assert.equal(isCliOwnedRefreshToken("cli-sync-credentials-file"), true);
+      assert.equal(isCliOwnedRefreshToken("sk-ant-ort01-real"), false);
+
+      // On-disk OAuth entry is readable regardless of the host's auth store
+      const stored = readStoredClaudeOAuth();
+      assert.equal(stored?.access, "cli-access-new");
+      assert.equal(stored?.refresh, "cli-shared-cli-refresh");
+    } finally {
+      if (prevXdg === undefined) {
+        delete process.env.XDG_DATA_HOME;
+      } else {
+        process.env.XDG_DATA_HOME = prevXdg;
+      }
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  // ---- Meta fast path is wire-identical to Claude Code CLI ----
+  {
+    const { completeMetaRequest } = await import("../src/meta-completion.ts");
+    const realFetch = globalThis.fetch;
+    let captured: { url: unknown; init?: RequestInit } | null = null;
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      captured = { url, init };
+      return new Response(
+        JSON.stringify({
+          model: "claude-haiku-4-5",
+          content: [{ type: "text", text: "Mock Title" }],
+          usage: { input_tokens: 3, output_tokens: 2 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    try {
+      const result = await completeMetaRequest({
+        body: {
+          messages: [
+            { role: "system", content: "You are a title generator." },
+            { role: "user", content: "hello there" },
+          ],
+        },
+        kind: "title",
+        accessToken: "oauth-token-xyz",
+      });
+      assert.equal(result.text, "Mock Title");
+      assert.ok(captured, "meta request captured");
+      const headers = captured!.init?.headers as Record<string, string>;
+      assert.equal(headers.authorization, "Bearer oauth-token-xyz");
+      assert.equal(headers["anthropic-version"], "2023-06-01");
+      assert.equal(headers["anthropic-beta"], "oauth-2025-04-20");
+      assert.equal(headers["x-app"], "cli");
+      assert.equal(
+        headers["anthropic-dangerous-direct-browser-access"],
+        "true",
+      );
+      assert.match(headers["user-agent"] ?? "", /^claude-cli\/\d+\.\d+\.\d+ /);
+      const body = JSON.parse(String(captured!.init?.body)) as {
+        system?: Array<{ type: string; text: string }>;
+      };
+      assert.ok(Array.isArray(body.system), "system sent as block array");
+      assert.equal(
+        body.system![0]!.text,
+        "You are Claude Code, Anthropic's official CLI.",
+        "CLI preamble is the first system block",
+      );
+      assert.match(body.system![1]?.text ?? "", /title generator/);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
   await stopProxy();
+  setClaudeCredentialProbe(null);
 
   // TypeScript build
   const build = spawnSync("bun", ["run", "build"], {

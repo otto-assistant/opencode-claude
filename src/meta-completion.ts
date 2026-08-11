@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process"
+import { findBinaryOnPath } from "./executable-path.js"
 import { buildMetaPrompt, type MetaRequestKind } from "./request-kind.js"
 
 type MetaMessagesBody = {
@@ -7,6 +9,40 @@ type MetaMessagesBody = {
 const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 const ANTHROPIC_VERSION = "2023-06-01"
 const OAUTH_BETA = "oauth-2025-04-20"
+
+/**
+ * Requests carrying a Claude Code OAuth token must be indistinguishable from
+ * genuine Claude Code CLI traffic: the CLI's system prompt preamble is
+ * required (the API rejects/flags OAuth inference without it), and the
+ * headers mirror what the CLI's own SDK stack sends.
+ */
+const CLAUDE_CODE_SYSTEM_PREAMBLE =
+  "You are Claude Code, Anthropic's official CLI."
+
+let cliVersion: string | null = null
+
+/** CLI version for the user-agent (cosmetic only — never auth-relevant). */
+function claudeCliUserAgent(): string {
+  if (!cliVersion) {
+    try {
+      const bin = findBinaryOnPath("claude", process.env)
+      if (bin) {
+        const out = spawnSync(bin, ["--version"], {
+          encoding: "utf8",
+          timeout: 4000,
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+        })
+        const match = `${out.stdout || ""}`.trim().match(/(\d+\.\d+\.\d+)/)
+        cliVersion = match?.[1] ?? null
+      }
+    } catch {
+      cliVersion = null
+    }
+    if (!cliVersion) cliVersion = "2.0.0"
+  }
+  return `claude-cli/${cliVersion} (external, cli)`
+}
 
 export type MetaCompletionResult = {
   text: string
@@ -43,12 +79,20 @@ export async function completeMetaRequest(params: {
       authorization: `Bearer ${params.accessToken}`,
       "anthropic-version": ANTHROPIC_VERSION,
       "anthropic-beta": OAUTH_BETA,
+      "anthropic-dangerous-direct-browser-access": "true",
+      "user-agent": claudeCliUserAgent(),
+      "x-app": "cli",
     },
     body: JSON.stringify({
       model,
       max_tokens: maxTokens,
       temperature: 0,
-      system,
+      // Claude Code sends its system prompt as an array whose first block is
+      // always the CLI preamble; the caller's instruction follows.
+      system: [
+        { type: "text", text: CLAUDE_CODE_SYSTEM_PREAMBLE },
+        { type: "text", text: system },
+      ],
       messages: [{ role: "user", content: prompt }],
     }),
     signal: params.signal,

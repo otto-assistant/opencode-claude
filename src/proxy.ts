@@ -18,6 +18,13 @@ import {
   type ParkedToolCall,
 } from "./bridge-pool.js";
 import { withClaudeOAuthToken } from "./auth-env.js";
+import { hasClaudeCliOAuthCredentials } from "./credentials.js";
+import {
+  classifyClaudeFailure,
+  failureHintFor,
+  failureStatusFor,
+  failureTypeFor,
+} from "./failure.js";
 import {
   decodeClaudeModelSelection,
   EFFORT_HEADER,
@@ -132,6 +139,18 @@ export function setClaudeQueryStarter(
   starter: typeof startClaudeQuery | null,
 ): void {
   queryStarter = starter ?? startClaudeQuery;
+}
+
+/**
+ * Pre-flight credential probe (file reads only, no caching). Injectable for
+ * smoke tests so they can simulate a host with no Claude credentials at all.
+ */
+let credentialProbe: () => boolean = () => hasClaudeCliOAuthCredentials();
+
+export function setClaudeCredentialProbe(
+  probe: (() => boolean) | null,
+): void {
+  credentialProbe = probe ?? (() => hasClaudeCliOAuthCredentials());
 }
 
 export function getClaudeProxyBaseUrl(): string {
@@ -364,12 +383,17 @@ async function handleChatCompletions(
         conversationKey: existing.conversationKey,
         resolved,
       });
-      return streamOpenAIResponse(
-        existing.continueStream(),
-        body.model || model,
-        stream,
-        existing,
-      );
+      return stream
+        ? streamOpenAIResponse(
+            existing.continueStream(),
+            body.model || model,
+            existing,
+          )
+        : collectTurnResponse(
+            existing.continueStream(),
+            body.model || model,
+            existing,
+          );
     }
     // Still parked — do not start a parallel Claude turn (OpenCode may retry
     // or send a follow-up before tool results arrive). Re-emit pending calls.
@@ -380,14 +404,12 @@ async function handleChatCompletions(
         pending: existing.pendingTools.size,
         resolved,
       });
-      return streamOpenAIResponse(
-        (async function* () {
-          yield { type: "__park__", tools: [...existing!.pendingTools.values()] };
-        })(),
-        body.model || model,
-        stream,
-        existing,
-      );
+      const parkedEvents = (async function* () {
+        yield { type: "__park__", tools: [...existing!.pendingTools.values()] };
+      })();
+      return stream
+        ? streamOpenAIResponse(parkedEvents, body.model || model, existing)
+        : collectTurnResponse(parkedEvents, body.model || model, existing);
     }
   }
 
@@ -481,6 +503,29 @@ async function handleChatCompletions(
       content,
       usage,
     });
+  }
+
+  // Pre-flight: without any credentials at all, a spawned turn is guaranteed
+  // to die with a 401 AFTER burning time (and previously surfaced as a
+  // fake-200 error text that hosts retried in a loop). Fail fast with a real
+  // 401 — nothing is sent to Anthropic. When CLI credentials exist we still
+  // proceed WITHOUT injecting an env token so the CLI can auto-refresh its
+  // own credentials file.
+  if (!accessToken && !credentialProbe()) {
+    log.warn("[opencode-claude] no Claude credentials; failing fast", {
+      conversationKey,
+    });
+    return Response.json(
+      {
+        error: {
+          message:
+            "Claude Code is not authenticated. Sign in via the plugin OAuth flow or `claude auth login` — no request was sent to Anthropic.",
+          type: "authentication_error",
+          code: "claude_auth_required",
+        },
+      },
+      { status: 401 },
+    );
   }
 
   const env = accessToken
@@ -748,12 +793,19 @@ async function handleChatCompletions(
     yield* consumeStream();
   };
 
-  return streamOpenAIResponse(
-    consumeStream(),
-    body.model || model,
-    stream,
-    bridge,
-  );
+  // A turn that dies BEFORE producing any content (bad token, session limit,
+  // spawn failure) must surface as a truthful HTTP error — never as a
+  // fake-200 stream whose only "assistant text" is the error. Hosts retry
+  // fake-200 turns in a loop and each retry re-sends the whole conversation
+  // to Anthropic: that doom loop burned ~4% of a weekly quota on 2026-08-11.
+  if (stream) {
+    const probe = await probeTurnEvents(consumeStream());
+    if (probe.status === "failed") {
+      return failureResponse(probe.errorText, conversationKey);
+    }
+    return streamOpenAIResponse(probe.replay, body.model || model, bridge);
+  }
+  return collectTurnResponse(consumeStream(), body.model || model, bridge);
 }
 
 
@@ -873,10 +925,280 @@ async function buildOpenCodeMcpServer(
   }
 }
 
+/**
+ * Buffer a whole turn and answer with one JSON completion. When the turn
+ * died without producing any real content, answer with a truthful HTTP error
+ * status instead of a fake-200 whose body is just the error text.
+ */
+async function collectTurnResponse(
+  events: AsyncIterable<unknown>,
+  model: string,
+  bridge: ParkedBridge,
+  options?: { suppressReasoning?: boolean },
+): Promise<Response> {
+  const suppressReasoning = options?.suppressReasoning === true;
+  const completionId = `chatcmpl_${createHash("sha1")
+    .update(bridge.id)
+    .digest("hex")
+    .slice(0, 24)}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  let content = "";
+  let reasoning = "";
+  let usage: OpenAIUsage | null = null;
+  let lastErrorNorm: string | null = null;
+  let errorText: string | null = null;
+  let sawContent = false;
+  const toolCalls: ParkedToolCall[] = [];
+
+  const noteError = (text: string) => {
+    const norm = normalizeClaudeErrorText(text);
+    if (!norm || norm === lastErrorNorm) return;
+    lastErrorNorm = norm;
+    errorText = text;
+    content += `\n\n[claude-code error] ${text}`;
+  };
+
+  try {
+    for await (const event of events) {
+      const mapped = mapSdkEvent(event);
+      if (mapped.kind === "park") {
+        toolCalls.push(...mapped.tools);
+        sawContent = true;
+      } else if (mapped.kind === "text") {
+        if (mapped.text) sawContent = true;
+        content += mapped.text;
+      } else if (mapped.kind === "reasoning") {
+        if (!suppressReasoning) reasoning += mapped.text;
+      } else if (mapped.kind === "usage") {
+        usage = mapped.usage;
+      } else if (mapped.kind === "error") {
+        // SDK emits the failure twice (result event + iterator throw) —
+        // keep one copy, and keep any usage that came with it.
+        if (mapped.usage) usage = mapped.usage;
+        forgetDeadSession(bridge.conversationKey, mapped.text);
+        noteError(mapped.text);
+      }
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    recordRateLimitErrorText(message);
+    forgetDeadSession(bridge.conversationKey, message);
+    noteError(message);
+  }
+
+  if (!sawContent && errorText) {
+    return failureResponse(errorText, bridge.conversationKey);
+  }
+
+  return Response.json({
+    id: completionId,
+    object: "chat.completion",
+    created,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content,
+          ...(reasoning ? { reasoning_content: reasoning } : {}),
+          ...(toolCalls.length
+            ? {
+                tool_calls: toolCalls.map((t) => ({
+                  id: t.id,
+                  type: "function",
+                  function: { name: t.name, arguments: t.arguments },
+                })),
+              }
+            : {}),
+        },
+        finish_reason: toolCalls.length ? "tool_calls" : "stop",
+      },
+    ],
+    ...(usage ? { usage } : {}),
+  });
+}
+
+/**
+ * Hold the response head until the turn proves it is alive (first real
+ * content / tool call / successful result). If it dies first, close the
+ * generator (killing the CLI process via consumeStream's finally) and report
+ * the failure so the caller can answer with a proper HTTP status.
+ */
+type TurnProbe =
+  | { status: "alive"; replay: AsyncIterable<unknown> }
+  | { status: "failed"; errorText: string };
+
+function rawProbeKind(event: unknown): "content" | "error" | "neutral" {
+  if (!event || typeof event !== "object") return "neutral";
+  const e = event as Record<string, unknown>;
+  if (e.type === "__park__") return "content";
+  if (e.type === "assistant") return "content";
+  if (e.type === "result") return e.is_error ? "error" : "content";
+  if (e.type === "stream_event" && e.event && typeof e.event === "object") {
+    const ev = e.event as Record<string, unknown>;
+    if (
+      ev.type === "content_block_delta" &&
+      ev.delta &&
+      typeof ev.delta === "object"
+    ) {
+      const delta = ev.delta as Record<string, unknown>;
+      if (
+        delta.type === "text_delta" &&
+        typeof delta.text === "string" &&
+        delta.text
+      ) {
+        return "content";
+      }
+      if (
+        (delta.type === "thinking_delta" ||
+          delta.type === "reasoning_delta") &&
+        typeof (delta.thinking ?? delta.text) === "string" &&
+        String(delta.thinking ?? delta.text)
+      ) {
+        return "content";
+      }
+    }
+    return "neutral";
+  }
+  if (e.type === "text_delta" && typeof e.text === "string" && e.text) {
+    return "content";
+  }
+  return "neutral";
+}
+
+function rawErrorText(event: unknown): string {
+  const e = (event ?? {}) as Record<string, unknown>;
+  if (typeof e.result === "string" && e.result) return e.result;
+  if (typeof e.error === "string" && e.error) return e.error;
+  return "Claude turn failed";
+}
+
+async function* chainBuffered(
+  buffered: unknown[],
+  iterator: AsyncIterator<unknown>,
+): AsyncGenerator<unknown, void, unknown> {
+  for (const event of buffered) yield event;
+  try {
+    while (true) {
+      const next = await iterator.next();
+      if (next.done) break;
+      yield next.value;
+    }
+  } finally {
+    try {
+      await iterator.return?.(undefined as never);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+async function probeTurnEvents(
+  events: AsyncIterable<unknown>,
+): Promise<TurnProbe> {
+  const iterator = events[Symbol.asyncIterator]();
+  const buffered: unknown[] = [];
+  const fail = async (errorText: string): Promise<TurnProbe> => {
+    try {
+      await iterator.return?.(undefined as never);
+    } catch {
+      // ignore
+    }
+    return { status: "failed", errorText };
+  };
+  try {
+    while (true) {
+      const next = await iterator.next();
+      if (next.done) break;
+      const kind = rawProbeKind(next.value);
+      if (kind === "error") {
+        return fail(rawErrorText(next.value));
+      }
+      buffered.push(next.value);
+      if (kind === "content") {
+        return { status: "alive", replay: chainBuffered(buffered, iterator) };
+      }
+    }
+  } catch (err) {
+    return fail(err instanceof Error ? err.message : String(err));
+  }
+  return fail("Claude Code ended the turn without any output");
+}
+
+/**
+ * Truthful HTTP error for a turn that died before producing content.
+ * Also records hard subscription limits so the fast-fail gate activates and
+ * follow-up requests get a cheap 429 without spawning a doomed CLI turn.
+ */
+function failureResponse(
+  errorText: string,
+  conversationKey: string,
+): Response {
+  recordRateLimitErrorText(errorText);
+  forgetDeadSession(conversationKey, errorText);
+  const kind = classifyClaudeFailure(errorText);
+  log.warn("[opencode-claude] turn failed fast", {
+    kind,
+    conversationKey,
+    message: errorText.slice(0, 300),
+  });
+
+  if (kind === "rate_limit") {
+    const snap = getRateLimitSnapshot();
+    const until = snap.limitedUntil ?? snap.resetsAt;
+    const retryAfterSeconds =
+      until !== undefined
+        ? Math.max(1, Math.round((until - Date.now()) / 1000))
+        : 600;
+    const countdown = formatResetCountdown(retryAfterSeconds * 1000);
+    return Response.json(
+      {
+        error: {
+          message: `${errorText} · limit resets in ${countdown}${
+            snap.resetsAtISO ? ` (${snap.resetsAtISO})` : ""
+          }`,
+          type: failureTypeFor(kind),
+          code: "claude_session_limit",
+          ...(snap.resetsAt !== undefined
+            ? { resets_at: new Date(snap.resetsAt).toISOString() }
+            : {}),
+          retry_after: retryAfterSeconds,
+        },
+      },
+      {
+        status: 429,
+        headers: {
+          "Retry-After": String(retryAfterSeconds),
+          ...(snap.resetsAt !== undefined
+            ? {
+                "x-claude-rate-limit-reset": new Date(
+                  snap.resetsAt,
+                ).toISOString(),
+              }
+            : {}),
+        },
+      },
+    );
+  }
+
+  const hint = failureHintFor(kind);
+  return Response.json(
+    {
+      error: {
+        message: hint ? `${errorText} ${hint}` : errorText,
+        type: failureTypeFor(kind),
+        code: kind === "auth" ? "claude_auth" : "claude_turn_failed",
+      },
+    },
+    { status: failureStatusFor(kind) },
+  );
+}
+
 function streamOpenAIResponse(
   events: AsyncIterable<unknown>,
   model: string,
-  stream: boolean,
   bridge: ParkedBridge,
   options?: { suppressReasoning?: boolean },
 ): Response {
@@ -886,93 +1208,6 @@ function streamOpenAIResponse(
     .digest("hex")
     .slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
-
-  if (!stream) {
-    // Buffer the full completion then return JSON (non-streaming clients).
-    const collect = async (): Promise<string> => {
-      let content = "";
-      let reasoning = "";
-      let usage: OpenAIUsage | null = null;
-      let lastErrorNorm: string | null = null;
-      const toolCalls: ParkedToolCall[] = [];
-      for await (const event of events) {
-        const mapped = mapSdkEvent(event);
-        if (mapped.kind === "park") {
-          toolCalls.push(...mapped.tools);
-        } else if (mapped.kind === "text") {
-          content += mapped.text;
-        } else if (mapped.kind === "reasoning") {
-          if (!suppressReasoning) reasoning += mapped.text;
-        } else if (mapped.kind === "usage") {
-          usage = mapped.usage;
-        } else if (mapped.kind === "error") {
-          // SDK emits the failure twice (result event + iterator throw) —
-          // keep one copy, and keep any usage that came with it.
-          if (mapped.usage) usage = mapped.usage;
-          forgetDeadSession(bridge.conversationKey, mapped.text);
-          const norm = normalizeClaudeErrorText(mapped.text);
-          if (norm && norm !== lastErrorNorm) {
-            lastErrorNorm = norm;
-            content += `\n\n[claude-code error] ${mapped.text}`;
-          }
-        }
-      }
-      return JSON.stringify({
-        id: completionId,
-        object: "chat.completion",
-        created,
-        model,
-        choices: [
-          {
-            index: 0,
-            message: {
-              role: "assistant",
-              content,
-              ...(reasoning ? { reasoning_content: reasoning } : {}),
-              ...(toolCalls.length
-                ? {
-                    tool_calls: toolCalls.map((t) => ({
-                      id: t.id,
-                      type: "function",
-                      function: { name: t.name, arguments: t.arguments },
-                    })),
-                  }
-                : {}),
-            },
-            finish_reason: toolCalls.length ? "tool_calls" : "stop",
-          },
-        ],
-        ...(usage ? { usage } : {}),
-      });
-    };
-
-    // Kick off collection; Response accepts a Promise body via async IIFE wrapped
-    // in a stream for type-safe BodyInit.
-    const bodyStream = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        try {
-          const json = await collect();
-          controller.enqueue(new TextEncoder().encode(json));
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          recordRateLimitErrorText(message);
-          forgetDeadSession(bridge.conversationKey, message);
-          controller.enqueue(
-            new TextEncoder().encode(
-              JSON.stringify({
-                error: { message, type: "server_error" },
-              }),
-            ),
-          );
-        } finally {
-          controller.close();
-        }
-      },
-    });
-    return new Response(bodyStream, {
-      headers: { "Content-Type": "application/json" },
-    });
-  }
 
   const encoder = new TextEncoder();
   const readable = new ReadableStream({
@@ -1090,6 +1325,11 @@ function streamOpenAIResponse(
             finishReason = "stop";
             if (mapped.usage) usage = mapped.usage;
             forgetDeadSession(bridge.conversationKey, mapped.text);
+            log.warn("[opencode-claude] mid-stream turn error", {
+              conversationKey: bridge.conversationKey,
+              kind: classifyClaudeFailure(mapped.text),
+              message: mapped.text.slice(0, 300),
+            });
             sendError(mapped.text);
           }
         }
@@ -1099,6 +1339,11 @@ function streamOpenAIResponse(
         // emitted the same text as a result event — dedupe via sendError.
         recordRateLimitErrorText(message);
         forgetDeadSession(bridge.conversationKey, message);
+        log.warn("[opencode-claude] stream iterator failed", {
+          conversationKey: bridge.conversationKey,
+          kind: classifyClaudeFailure(message),
+          message: message.slice(0, 300),
+        });
         sendError(message);
         finishReason = "stop";
       }

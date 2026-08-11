@@ -18,6 +18,8 @@ import {
 import {
   completeClaudeBrowserLogin,
   getPendingClaudeLogin,
+  isCliOwnedRefreshToken,
+  readStoredClaudeOAuth,
   resetPendingClaudeLogin,
   startClaudeBrowserLogin,
   syncClaudeCliCredentialsToOpenCode,
@@ -238,45 +240,119 @@ function ensureClaudeProviderConfig(
   };
 }
 
+/**
+ * Refresh the access token a little BEFORE it dies so turns never start with
+ * a token that expires mid-flight. The 8h access-token TTL itself is fixed
+ * Anthropic-side; what keeps the session alive indefinitely is a refresh
+ * chain that never breaks.
+ */
+const REFRESH_MARGIN_MS = 120_000;
+
+/**
+ * In-flight refresh dedupe, keyed by refresh token. OpenCode fires the main
+ * turn and the title meta request in parallel — without single-flight both
+ * refresh with the SAME token, Anthropic rotates on the first, and the
+ * second dies with invalid_grant, killing the whole chain (this exact race
+ * burned quota on 2026-08-11).
+ */
+const refreshInFlight = new Map<string, Promise<string | null>>();
+
 async function resolveAccessToken(
   input: PluginInput,
   getAuth: () => Promise<unknown>,
 ): Promise<string | null> {
-  const auth = await getAuth();
+  let auth = await getAuth();
+  // The host's in-memory auth store can lag auth.json (tokens written by a
+  // sibling process, a headless login, or a race at server start). When the
+  // host hands us nothing usable, trust the fresher on-disk entry instead of
+  // falling into the logged-out placeholder path.
+  if (
+    !isClaudeOAuthAuth(auth) ||
+    !(auth.access && auth.expires > Date.now() + REFRESH_MARGIN_MS)
+  ) {
+    const stored = readStoredClaudeOAuth();
+    if (
+      stored &&
+      (!isClaudeOAuthAuth(auth) || stored.expires > (auth.expires ?? 0))
+    ) {
+      auth = { type: "oauth", ...stored };
+    }
+  }
   if (isClaudeOAuthAuth(auth)) {
-    if (auth.access && auth.expires > Date.now() + 30_000) {
+    if (auth.access && auth.expires > Date.now() + REFRESH_MARGIN_MS) {
       return auth.access;
     }
-    // CLI-synced placeholder refresh tokens cannot hit the token endpoint.
-    if (auth.refresh.startsWith("cli-sync-")) {
+    // CLI-owned chains are never rotated through the token endpoint by us
+    // (rotation belongs to the CLI — see isCliOwnedRefreshToken); re-sync
+    // from the CLI file instead.
+    if (isCliOwnedRefreshToken(auth.refresh)) {
       const synced = syncClaudeCliCredentialsToOpenCode();
-      return synced?.access ?? auth.access ?? null;
+      if (synced) return synced.access;
+      // Only hand out the stored access token while it is genuinely valid —
+      // an expired token spawns a doomed turn (401) and blocks CLI self-heal.
+      return auth.access && auth.expires > Date.now() ? auth.access : null;
     }
-    try {
-      const refreshed = await refreshClaudeToken(auth.refresh);
-      await input.client.auth.set({
-        path: { id: PROVIDER_ID },
-        body: {
-          type: "oauth",
-          refresh: refreshed.refresh,
-          access: refreshed.access,
-          expires: refreshed.expires,
-        },
-      });
-      return refreshed.access;
-    } catch (err) {
-      const permanent = err instanceof RefreshTokenInvalidError;
-      log.error(
-        `[opencode-claude] token refresh ${permanent ? "rejected" : "failed"}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      if (permanent) {
-        const synced = syncClaudeCliCredentialsToOpenCode();
-        return synced?.access ?? null;
-      }
-      return auth.access ?? null;
+
+    const key = auth.refresh;
+    let pending = refreshInFlight.get(key);
+    if (!pending) {
+      pending = (async () => {
+        try {
+          const refreshed = await refreshClaudeToken(key);
+          await input.client.auth.set({
+            path: { id: PROVIDER_ID },
+            body: {
+              type: "oauth",
+              refresh: refreshed.refresh,
+              access: refreshed.access,
+              expires: refreshed.expires,
+            },
+          });
+          return refreshed.access;
+        } catch (err) {
+          const permanent = err instanceof RefreshTokenInvalidError;
+          log.error(
+            `[opencode-claude] token refresh ${permanent ? "rejected" : "failed"}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          if (permanent) {
+            // invalid_grant usually means another actor (claude CLI, a
+            // parallel refresh) rotated the token first. Re-read the store:
+            // fresher credentials may already be there.
+            try {
+              const latest = await getAuth();
+              if (
+                isClaudeOAuthAuth(latest) &&
+                latest.refresh !== key &&
+                latest.access &&
+                latest.expires > Date.now() + REFRESH_MARGIN_MS
+              ) {
+                log.info(
+                  "[opencode-claude] recovered newer OAuth credentials after refresh rejection",
+                );
+                return latest.access;
+              }
+            } catch {
+              // fall through to CLI sync
+            }
+            const synced = syncClaudeCliCredentialsToOpenCode();
+            return synced?.access ?? null;
+          }
+          // Transient refresh failure: the old access token is only useful
+          // while actually valid; otherwise null lets the CLI self-heal.
+          return auth.access && auth.expires > Date.now()
+            ? auth.access
+            : null;
+        }
+      })();
+      refreshInFlight.set(key, pending);
+      const cleanup = () => {
+        refreshInFlight.delete(key);
+      };
+      pending.then(cleanup, cleanup);
     }
+    return pending;
   }
 
   const synced = syncClaudeCliCredentialsToOpenCode();
@@ -308,7 +384,7 @@ async function loadClaudeRuntime(
   const accessToken = await resolveAccessToken(input, getAuth);
 
   const models =
-    accessToken || detection.loggedIn
+    accessToken || detection.loggedIn || readStoredClaudeOAuth()
       ? getClaudeModels()
       : LOGIN_PLACEHOLDER_MODELS;
 
@@ -349,8 +425,13 @@ export const ClaudeCodePlugin: Plugin = async (
   return {
     async config(config) {
       const detection = await detectClaudeCode();
+      // Model visibility must not depend on the CLI's login state alone: a
+      // valid plugin-owned OAuth entry in auth.json is just as logged-in.
+      // (After a CLI logout the catalog collapsed to login+sonnet and the
+      // provider looked broken despite a fresh plugin OAuth token.)
+      const hasStoredAuth = Boolean(readStoredClaudeOAuth());
       const models =
-        detection.loggedIn || detection.status === "ready"
+        detection.loggedIn || detection.status === "ready" || hasStoredAuth
           ? getClaudeModels()
           : LOGIN_PLACEHOLDER_MODELS;
 
