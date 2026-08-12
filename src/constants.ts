@@ -28,6 +28,8 @@ export const OPENAI_COMPATIBLE_NPM = "@ai-sdk/openai-compatible";
 
 export const EFFORT_HEADER = "x-opencode-claude-effort";
 export const SESSION_HEADER = "x-opencode-claude-session";
+/** Active OpenCode project directory forwarded to the local Agent SDK proxy. */
+export const DIRECTORY_HEADER = "x-opencode-claude-directory";
 
 export const EFFORT_LEVELS = [
   "low",

@@ -30,7 +30,11 @@ import {
   EFFORT_HEADER,
 } from "./model-selection.js";
 import { resolveClaudeModelId } from "./models.js";
-import { SESSION_HEADER, type ClaudeEffort } from "./constants.js";
+import {
+  DIRECTORY_HEADER,
+  SESSION_HEADER,
+  type ClaudeEffort,
+} from "./constants.js";
 import { startClaudeQuery, type ClaudeQueryHandle } from "./query.js";
 import {
   clearForeignSessionId,
@@ -537,7 +541,9 @@ async function handleChatCompletions(
   }
 
   const openCodeTools = Array.isArray(body.tools) ? body.tools : [];
-  const cwd = process.env.OPENCODE_CLAUDE_CWD || process.cwd();
+  const requestDirectory = req.headers.get(DIRECTORY_HEADER)?.trim();
+  const cwd =
+    process.env.OPENCODE_CLAUDE_CWD || requestDirectory || process.cwd();
   const bridgeId = randomUUID();
   const pendingTools = new Map<string, ParkedToolCall>();
   let handle: ClaudeQueryHandle | null = null;

@@ -39,7 +39,9 @@ async function main() {
   const { isClaudeEffort, PROVIDER_ID, EFFORT_LEVELS } = await import(
     "../src/constants.ts"
   );
-  const { ClaudeCodePlugin } = await import("../src/index.ts");
+  const { applyClaudeRequestContextHeaders, ClaudeCodePlugin } = await import(
+    "../src/index.ts"
+  );
   const {
     startProxy,
     stopProxy,
@@ -497,6 +499,17 @@ async function main() {
 
   // Plugin export
   assert.equal(typeof ClaudeCodePlugin, "function");
+  const requestHeaders: Record<string, string> = {};
+  applyClaudeRequestContextHeaders(
+    requestHeaders,
+    "/data/projects/infra",
+    "ses_test",
+  );
+  assert.equal(
+    requestHeaders["x-opencode-claude-directory"],
+    "/data/projects/infra",
+  );
+  assert.equal(requestHeaders["x-opencode-claude-session"], "ses_test");
   assert.equal(PROVIDER_ID, "claude-code");
   assert.ok(RefreshTokenInvalidError);
 
@@ -755,6 +768,7 @@ async function main() {
         headers: {
           "content-type": "application/json",
           "x-opencode-claude-session": "smoke-mock-ok",
+          "x-opencode-claude-directory": "/data/projects/infra",
         },
         body: JSON.stringify({
           model: "sonnet",
@@ -789,6 +803,7 @@ async function main() {
 
       // Query starter received the todo alias + plan-persistence append
       assert.ok(seenParams, "query starter params captured");
+      assert.equal(seenParams.cwd, "/data/projects/infra");
       const aliases = (seenParams as { toolAliases?: Record<string, string> })
         .toolAliases;
       assert.equal(aliases?.TodoWrite, "mcp__opencode__todowrite");

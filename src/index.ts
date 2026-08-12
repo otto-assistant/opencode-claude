@@ -26,6 +26,7 @@ import {
 } from "./auth-login.js";
 import {
   DEFAULT_MODEL_ID,
+  DIRECTORY_HEADER,
   EFFORT_HEADER,
   OPENAI_COMPATIBLE_NPM,
   PROVIDER_ID,
@@ -72,6 +73,15 @@ function zeroCost() {
     output: 0,
     cache: { read: 0, write: 0 },
   };
+}
+
+export function applyClaudeRequestContextHeaders(
+  headers: Record<string, string>,
+  directory: string,
+  sessionID?: string,
+): void {
+  headers[DIRECTORY_HEADER] = directory;
+  if (sessionID) headers["x-opencode-claude-session"] = sessionID;
 }
 
 function buildProviderModel(
@@ -454,8 +464,13 @@ export const ClaudeCodePlugin: Plugin = async (
           } catch {
             // ignore
           }
-          const synced = syncClaudeCliCredentialsToOpenCode();
-          return synced?.access ?? null;
+          // Browser OAuth belongs to this plugin and is persisted in
+          // auth.json. The host's auth client may not yet reflect that file
+          // (notably during OpenChamber's provider-page reauthentication),
+          // so use the normal resolver with an empty host response. It
+          // falls back to the on-disk `claude-code` entry before considering
+          // the optional Claude CLI credentials.
+          return resolveAccessToken(input, async () => null);
         });
       } catch (err) {
         log.error(
@@ -478,9 +493,16 @@ export const ClaudeCodePlugin: Plugin = async (
           : undefined;
       const selected = resolveClaudeModelSelection(hookInput.model.id, variant);
       output.headers[EFFORT_HEADER] = encodeClaudeModelSelection(selected);
-      if (hookInput.sessionID) {
-        output.headers["x-opencode-claude-session"] = hookInput.sessionID;
-      }
+      // The proxy runs in the long-lived OpenCode server process, whose cwd is
+      // commonly the service account home (for example /home/ubuntu), not the
+      // project attached to this plugin instance. Carry the authoritative
+      // PluginInput directory on every request so Claude Code loads the right
+      // project files, settings, and AGENTS.md.
+      applyClaudeRequestContextHeaders(
+        output.headers,
+        input.directory,
+        hookInput.sessionID,
+      );
     },
 
     "chat.params": async (hookInput, output) => {
