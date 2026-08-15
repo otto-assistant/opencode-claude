@@ -115,6 +115,22 @@ function writeState(state: ClaudeRateLimitState, accountId?: string): void {
   }
 }
 
+/** Move an account's limit state to a new id (see renameAccount). */
+export function renameAccountRateLimit(oldId: string, newId: string): void {
+  const store = readStore();
+  const entry = store.accounts[normalizeAccountKey(oldId)];
+  if (!entry) return;
+  delete store.accounts[normalizeAccountKey(oldId)];
+  store.accounts[normalizeAccountKey(newId)] = entry;
+  try {
+    const path = storePath();
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify(store, null, 2) + "\n", "utf8");
+  } catch {
+    // never let the tracker break the proxy
+  }
+}
+
 /** Snapshot for every account that has state — backs the accounts view. */
 export function getAllRateLimitSnapshots(
   now: number = Date.now(),

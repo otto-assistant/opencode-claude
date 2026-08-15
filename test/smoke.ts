@@ -5,10 +5,11 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 
 async function main() {
-  // Isolate the data dir for the run. Without this the suite reads whatever
-  // accounts the operator has configured (so "nothing configured" is not true),
-  // writes fixture sessions into their real store, and the credential-sync
-  // guards target their real $XDG_DATA_HOME/opencode/auth.json.
+  // Isolate the whole data dir for the run. Without this the suite reads the
+  // operator's real accounts.json (so "nothing configured" is not true),
+  // writes fixture sessions into their real session store, and — worst —
+  // the credential-sync guards below target the real
+  // $XDG_DATA_HOME/opencode/auth.json.
   const { mkdtempSync: mkTmp, rmSync: rmTmp } = await import("node:fs");
   const { tmpdir: osTmpdir } = await import("node:os");
   const { join: joinTmp } = await import("node:path");
@@ -616,6 +617,17 @@ async function main() {
     const storeFile = joinPath(tmpDir, "rate-limit.json");
     const prevStoreEnv = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
     process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = storeFile;
+    // Isolate the whole data dir, not just the rate-limit store. Otherwise the
+    // suite reads the operator's real accounts.json (so the default account is
+    // whatever they configured, and per-account state lands under a different
+    // key than the test wrote) and writes its fixture sessions into their real
+    // session store.
+    const prevXdgRl = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = tmpDir;
+    const { resetAccounts: resetRlAccounts, configureAccounts: configureRlAccounts } =
+      await import("../src/accounts.ts");
+    resetRlAccounts();
+    configureRlAccounts(undefined);
 
     try {
       // Unit: text detection + normalization
@@ -997,6 +1009,9 @@ async function main() {
       } else {
         process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = prevStoreEnv;
       }
+      if (prevXdgRl === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevXdgRl;
+      resetRlAccounts();
       rmSync(tmpDir, { recursive: true, force: true });
     }
   }
@@ -1319,6 +1334,11 @@ async function main() {
 
     const prevAccountsEnv = process.env.OPENCODE_CLAUDE_ACCOUNTS;
     delete process.env.OPENCODE_CLAUDE_ACCOUNTS;
+    // Isolate the registry: "nothing configured" must mean nothing, not
+    // whatever accounts the operator running the suite happens to have.
+    const accountsDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-reg-"));
+    const prevXdgAccounts = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = accountsDir;
 
     // No accounts configured → single implicit account, catalog unchanged.
     resetAccounts();
@@ -1436,9 +1456,26 @@ async function main() {
       assert.equal(getBoundAccountId("ses_a"), "personal",
         "clearing a dead session keeps the account binding");
 
+      // The account is session state: a bare model id carries no account, so
+      // the binding decides — that is what makes "switch account" independent
+      // of "switch model".
+      bindConversationAccount("ses_switch", "work", "Work");
+      assert.equal(getBoundAccountId("ses_switch"), "work");
+      bindConversationAccount("ses_switch", "personal", "Personal");
+      assert.equal(
+        getBoundAccountId("ses_switch"),
+        "personal",
+        "switching account does not require changing the model",
+      );
+      assert.equal(
+        getForeignSessionId("ses_switch"),
+        undefined,
+        "and the resume target does not follow across accounts",
+      );
+
       bindConversationAccount("ses_b", "work", "Work");
       const bindings = listSessionBindings();
-      assert.equal(bindings.length, 2);
+      assert.equal(bindings.length, 3);
       assert.ok(bindings.every((b) => typeof b.accountId === "string"));
     } finally {
       if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
@@ -1489,6 +1526,716 @@ async function main() {
       );
     }
 
+    // ---- Quota: Anthropic's unified rate-limit headers ----
+    {
+      const quotaDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-quota-"));
+      const prevQuotaStore = process.env.OPENCODE_CLAUDE_QUOTA_STORE;
+      process.env.OPENCODE_CLAUDE_QUOTA_STORE = joinPath(quotaDir, "quota.json");
+      try {
+        const {
+          parseQuotaHeaders,
+          recordQuotaFromHeaders,
+          getAccountQuota,
+          __resetQuotaStore,
+        } = await import("../src/quota.ts");
+        __resetQuotaStore();
+
+        // Header shape captured from a live Messages response.
+        const reset5h = Math.floor((Date.now() + 4_000_000) / 1000);
+        const reset7d = Math.floor((Date.now() + 240_000_000) / 1000);
+        const headers = new Headers({
+          "anthropic-ratelimit-unified-5h-utilization": "0.56",
+          "anthropic-ratelimit-unified-5h-status": "allowed",
+          "anthropic-ratelimit-unified-5h-reset": String(reset5h),
+          "anthropic-ratelimit-unified-7d-utilization": "0.93",
+          "anthropic-ratelimit-unified-7d-status": "allowed_warning",
+          "anthropic-ratelimit-unified-7d-surpassed-threshold": "0.75",
+          "anthropic-ratelimit-unified-7d-reset": String(reset7d),
+          "anthropic-ratelimit-unified-representative-claim": "seven_day",
+          "anthropic-ratelimit-unified-status": "allowed_warning",
+          "anthropic-ratelimit-unified-overage-status": "rejected",
+          "anthropic-ratelimit-unified-overage-disabled-reason":
+            "group_zero_credit_limit",
+          "anthropic-ratelimit-unified-fallback": "available",
+          "anthropic-ratelimit-unified-fallback-percentage": "0.5",
+        });
+
+        const parsed = parseQuotaHeaders(headers, "probe")!;
+        assert.ok(parsed, "unified headers are recognised");
+        // Both windows at once — the whole point over the SDK event, which
+        // reports one and would show a healthy 5h while 7d is nearly spent.
+        assert.equal(parsed.windows.fiveHour?.utilization, 0.56);
+        assert.equal(
+          Math.round((parsed.windows.fiveHour?.remaining ?? 0) * 100),
+          44,
+          "remaining is what the operator reads",
+        );
+        assert.equal(parsed.windows.sevenDay?.utilization, 0.93);
+        assert.equal(
+          Math.round((parsed.windows.sevenDay?.remaining ?? 0) * 100),
+          7,
+        );
+        assert.equal(parsed.representative, "seven_day");
+        assert.equal(parsed.windows.sevenDay?.status, "allowed_warning");
+        assert.equal(parsed.windows.sevenDay?.surpassedThreshold, 0.75);
+        assert.equal(parsed.overage?.status, "rejected");
+        assert.equal(parsed.fallback?.percentage, 0.5);
+        // Anthropic sends epoch seconds; the rest of the plugin uses ms.
+        assert.equal(parsed.windows.fiveHour?.resetsAt, reset5h * 1000);
+        assert.ok(
+          (parsed.windows.sevenDay?.resetsAt ?? 0) > Date.now(),
+          "reset times land in the future, not 1970",
+        );
+
+        // Already-ms reset values must not be multiplied again.
+        const msHeaders = new Headers({
+          "anthropic-ratelimit-unified-5h-utilization": "0.1",
+          "anthropic-ratelimit-unified-5h-reset": String(reset5h * 1000),
+        });
+        assert.equal(
+          parseQuotaHeaders(msHeaders)?.windows.fiveHour?.resetsAt,
+          reset5h * 1000,
+        );
+
+        // A response with no unified headers is not quota data.
+        assert.equal(
+          parseQuotaHeaders(new Headers({ "content-type": "application/json" })),
+          null,
+          "count_tokens-style responses carry none and must not be stored",
+        );
+
+        recordQuotaFromHeaders("acct-a", headers);
+        assert.equal(getAccountQuota("acct-a")?.representative, "seven_day");
+        assert.equal(getAccountQuota("acct-a")?.source, "headers");
+        assert.equal(
+          getAccountQuota("acct-b"),
+          null,
+          "quota is per account, not global",
+        );
+
+        // ---- SDK events keep quota fresh during ordinary turns ----
+        const { mergeSdkRateLimitEvent, formatQuotaSummary } = await import(
+          "../src/quota.ts"
+        );
+        __resetQuotaStore();
+
+        mergeSdkRateLimitEvent("acct-c", {
+          status: "allowed",
+          rateLimitType: "five_hour",
+          utilization: 0.57,
+          resetsAt: reset5h,
+        });
+        assert.equal(
+          Math.round(
+            (getAccountQuota("acct-c")?.windows.fiveHour?.remaining ?? 0) * 100,
+          ),
+          43,
+        );
+
+        // The event carries ONE window. Merging a second must not erase the
+        // first — that would hide "5h fine, 7d nearly spent", the case the
+        // whole feature exists for.
+        mergeSdkRateLimitEvent("acct-c", {
+          status: "allowed_warning",
+          rateLimitType: "seven_day",
+          utilization: 0.93,
+          resetsAt: reset7d,
+        });
+        const merged = getAccountQuota("acct-c")!;
+        assert.ok(merged.windows.fiveHour, "the five-hour window survived");
+        assert.ok(merged.windows.sevenDay, "the seven-day window was added");
+        assert.equal(merged.representative, "seven_day");
+
+        // An event with no utilization is not data — it must not wipe state.
+        mergeSdkRateLimitEvent("acct-c", {
+          status: "allowed",
+          rateLimitType: "five_hour",
+        });
+        assert.equal(
+          Math.round(
+            (getAccountQuota("acct-c")?.windows.fiveHour?.remaining ?? 0) * 100,
+          ),
+          43,
+          "a utilization-less event leaves the stored window alone",
+        );
+
+        // The in-session line: what is left, both windows, which one binds.
+        const summary = formatQuotaSummary(getAccountQuota("acct-c"))!;
+        assert.match(summary, /5h 43% left/);
+        assert.match(summary, /7d 7% left \(binding/);
+        assert.equal(formatQuotaSummary(null), null);
+
+        // ---- Two keys to one subscription is not two subscriptions ----
+        {
+          const { accountsSharingSubscription } = await import("../src/quota.ts");
+          __resetQuotaStore();
+          const orgA = new Headers({
+            "anthropic-ratelimit-unified-5h-utilization": "0.6",
+            "anthropic-organization-id": "org-same",
+          });
+          const orgB = new Headers({
+            "anthropic-ratelimit-unified-5h-utilization": "0.1",
+            "anthropic-organization-id": "org-other",
+          });
+          assert.equal(
+            parseQuotaHeaders(orgA)?.organizationId,
+            "org-same",
+            "the org id is captured from the response",
+          );
+
+          recordQuotaFromHeaders("dup-1", orgA);
+          assert.deepEqual(
+            accountsSharingSubscription("dup-1"),
+            [],
+            "one account shares with nobody",
+          );
+
+          recordQuotaFromHeaders("dup-2", orgA);
+          assert.deepEqual(accountsSharingSubscription("dup-1"), ["dup-2"]);
+          assert.deepEqual(accountsSharingSubscription("dup-2"), ["dup-1"]);
+
+          recordQuotaFromHeaders("separate", orgB);
+          assert.deepEqual(
+            accountsSharingSubscription("separate"),
+            [],
+            "a genuinely different subscription is not flagged",
+          );
+
+          // An SDK merge must not drop a known org id, or the warning would
+          // blink off after the next ordinary turn.
+          mergeSdkRateLimitEvent("dup-1", {
+            rateLimitType: "seven_day",
+            utilization: 0.5,
+          });
+          assert.deepEqual(accountsSharingSubscription("dup-1"), ["dup-2"]);
+
+          assert.deepEqual(
+            accountsSharingSubscription("never-probed"),
+            [],
+            "an account with no quota yet claims nothing",
+          );
+        }
+
+        // ---- Identity: which Claude login is this, really ----
+        {
+          const identityDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-id-"));
+          const prevIdStore = process.env.OPENCODE_CLAUDE_IDENTITY_STORE;
+          process.env.OPENCODE_CLAUDE_IDENTITY_STORE = joinPath(
+            identityDir,
+            "identity.json",
+          );
+          try {
+            const { parseProfile, accountsSharingLogin, clearAccountIdentity } =
+              await import("../src/identity.ts");
+            const { writeFileSync: writeJson } = await import("node:fs");
+
+            // Shape returned by GET /api/oauth/profile.
+            const profile = {
+              account: {
+                uuid: "acct-uuid-1",
+                email: "someone@example.com",
+                full_name: "Some One",
+                display_name: "Some",
+              },
+              organization: {
+                uuid: "org-uuid-1",
+                name: "Example Org",
+                organization_type: "claude_team",
+                rate_limit_tier: "default_claude_max_5x",
+              },
+            };
+            const parsed = parseProfile({
+              ...profile,
+              account: { ...profile.account, has_claude_max: true },
+              organization: { ...profile.organization, subscription_status: "active" },
+            })!;
+            assert.equal(parsed.plan, "max", "the plan is read off the account");
+            assert.equal(parsed.subscriptionStatus, "active");
+            assert.equal(parsed.email, "someone@example.com");
+            assert.equal(parsed.accountUuid, "acct-uuid-1");
+            assert.equal(parsed.organizationName, "Example Org");
+            assert.equal(parsed.organizationType, "claude_team");
+            assert.equal(parseProfile({}), null, "an empty profile is not identity");
+            assert.equal(parseProfile(null), null);
+
+            // The duplicate check is the ACCOUNT, not the org: a consent screen
+            // approved by an existing claude.ai session re-authorizes the same
+            // login, which is the trap this exists to catch.
+            writeJson(
+              process.env.OPENCODE_CLAUDE_IDENTITY_STORE!,
+              JSON.stringify({
+                version: 1,
+                accounts: {
+                  work: { accountUuid: "acct-1", organizationUuid: "org-1", fetchedAt: 1 },
+                  personal: { accountUuid: "acct-1", organizationUuid: "org-1", fetchedAt: 1 },
+                  colleague: { accountUuid: "acct-2", organizationUuid: "org-1", fetchedAt: 1 },
+                  outsider: { accountUuid: "acct-3", organizationUuid: "org-9", fetchedAt: 1 },
+                },
+              }),
+              "utf8",
+            );
+            assert.deepEqual(accountsSharingLogin("work"), ["personal"]);
+            assert.deepEqual(accountsSharingLogin("personal"), ["work"]);
+            // Two seats in one Team org are genuinely separate logins.
+            assert.deepEqual(
+              accountsSharingLogin("colleague"),
+              [],
+              "same organization is not the same login",
+            );
+            assert.deepEqual(accountsSharingLogin("outsider"), []);
+            assert.deepEqual(
+              accountsSharingLogin("unknown"),
+              [],
+              "an unidentified account claims nothing",
+            );
+
+            clearAccountIdentity("personal");
+            assert.deepEqual(
+              accountsSharingLogin("work"),
+              [],
+              "disconnecting forgets the identity",
+            );
+
+            // accountsWithLogin is the pre-write check: "is this login already
+            // connected somewhere else?", asked before credentials land.
+            const { accountsWithLogin, storeAccountIdentity } = await import(
+              "../src/identity.ts"
+            );
+            assert.deepEqual(
+              accountsWithLogin("acct-1", "fresh"),
+              ["work"],
+              "a login already connected elsewhere is reported",
+            );
+            assert.deepEqual(
+              accountsWithLogin("acct-1", "work"),
+              [],
+              "reconnecting the SAME account is not a duplicate of itself",
+            );
+            assert.deepEqual(accountsWithLogin("acct-unknown", "fresh"), []);
+
+            // Regression: the duplicate guard once compared against a CACHED
+            // identity. A Claude home re-logged behind our back left the cache
+            // naming the previous owner, the uuids differed, and a duplicate
+            // was accepted. The guard must re-resolve before comparing.
+            storeAccountIdentity("stale-acct", {
+              accountUuid: "old-owner",
+              email: "old@example.com",
+              fetchedAt: 1,
+            });
+            assert.deepEqual(
+              accountsWithLogin("new-owner", "incoming"),
+              [],
+              "a stale cache hides the duplicate — hence the live refresh",
+            );
+            storeAccountIdentity("stale-acct", {
+              accountUuid: "new-owner",
+              email: "new@example.com",
+              fetchedAt: 2,
+            });
+            assert.deepEqual(
+              accountsWithLogin("new-owner", "incoming"),
+              ["stale-acct"],
+              "once refreshed, the same login is caught",
+            );
+          } finally {
+            if (prevIdStore === undefined) {
+              delete process.env.OPENCODE_CLAUDE_IDENTITY_STORE;
+            } else {
+              process.env.OPENCODE_CLAUDE_IDENTITY_STORE = prevIdStore;
+            }
+            rmSync(identityDir, { recursive: true, force: true });
+          }
+        }
+
+        // ---- A refused duplicate writes nothing, and stays decidable ----
+        {
+          const dupDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-dup-"));
+          const prevIdStore = process.env.OPENCODE_CLAUDE_IDENTITY_STORE;
+          process.env.OPENCODE_CLAUDE_IDENTITY_STORE = joinPath(
+            dupDir,
+            "identity.json",
+          );
+          try {
+            const {
+              DuplicateLoginError,
+              getHeldLogin,
+              discardHeldLogin,
+              confirmHeldLogin,
+              writeAccountCredentials,
+            } = await import("../src/account-login.ts");
+            const { storeAccountIdentity } = await import("../src/identity.ts");
+            const { hasClaudeCliOAuthCredentials } = await import(
+              "../src/credentials.ts"
+            );
+            const { existsSync: exists } = await import("node:fs");
+
+            const err = new DuplicateLoginError(["work"], "dup@example.com");
+            assert.equal(err.status, 409);
+            assert.equal(err.code, "duplicate_login");
+            assert.deepEqual(err.duplicateOf, ["work"]);
+            assert.match(err.message, /same Claude login as work/);
+            // The message must carry the fix, not just the diagnosis.
+            assert.match(err.message, /private window/);
+
+            const target = {
+              id: "held-acct",
+              label: "Held",
+              configDir: joinPath(dupDir, "claude-held"),
+              isDefault: false,
+            };
+            assert.equal(
+              getHeldLogin("held-acct"),
+              undefined,
+              "nothing is held before a login",
+            );
+            assert.equal(
+              hasClaudeCliOAuthCredentials({ configDir: target.configDir }),
+              false,
+              "a refused duplicate must leave no credentials behind",
+            );
+
+            // Discarding a held login is a no-op when nothing is held, and
+            // confirming without one is an error rather than a silent write.
+            discardHeldLogin("held-acct");
+            assert.throws(() => confirmHeldLogin(target), /Nothing held/);
+            assert.equal(
+              exists(joinPath(target.configDir, ".credentials.json")),
+              false,
+            );
+
+            // And the happy path still writes.
+            storeAccountIdentity("other", { accountUuid: "u-1", fetchedAt: 1 });
+            writeAccountCredentials(target, {
+              access: "a",
+              refresh: "r",
+              expires: Date.now() + 3_600_000,
+            });
+            assert.equal(
+              hasClaudeCliOAuthCredentials({ configDir: target.configDir }),
+              true,
+            );
+          } finally {
+            if (prevIdStore === undefined) {
+              delete process.env.OPENCODE_CLAUDE_IDENTITY_STORE;
+            } else {
+              process.env.OPENCODE_CLAUDE_IDENTITY_STORE = prevIdStore;
+            }
+            rmSync(dupDir, { recursive: true, force: true });
+          }
+        }
+
+        const { formatShortDuration } = await import("../src/quota.ts");
+        assert.equal(formatShortDuration(45 * 60_000), "45m");
+        assert.equal(formatShortDuration(3 * 3_600_000), "3h");
+        // A weekly reset must not be reported as "108h".
+        assert.equal(formatShortDuration(66 * 3_600_000), "2d 18h");
+      } finally {
+        if (prevQuotaStore === undefined) {
+          delete process.env.OPENCODE_CLAUDE_QUOTA_STORE;
+        } else {
+          process.env.OPENCODE_CLAUDE_QUOTA_STORE = prevQuotaStore;
+        }
+        rmSync(quotaDir, { recursive: true, force: true });
+      }
+    }
+
+    // ---- Panel: account CRUD, OAuth handoff, usage, CSRF ----
+    {
+      const panelDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-panel-"));
+      const prevXdg2 = process.env.XDG_DATA_HOME;
+      const prevPort = process.env.OPENCODE_CLAUDE_PROXY_PORT;
+      process.env.XDG_DATA_HOME = panelDir;
+      process.env.OPENCODE_CLAUDE_PROXY_PORT = "0";
+      try {
+        const { addAccount, removeAccount, setDefaultAccount, findAccount } =
+          await import("../src/accounts.ts");
+        const { writeAccountCredentials, clearAccountCredentials } = await import(
+          "../src/account-login.ts"
+        );
+        const { renderPanel } = await import("../src/panel.ts");
+        const { recordTurnUsage, getAccountUsage, __resetUsageStore } =
+          await import("../src/usage-store.ts");
+        const { hasClaudeCliOAuthCredentials } = await import(
+          "../src/credentials.ts"
+        );
+        const { startProxy: startPanelProxy, stopProxy: stopPanelProxy } =
+          await import("../src/proxy.ts");
+
+        resetAccounts();
+        configureAccounts(undefined);
+        __resetUsageStore();
+
+        // The page must be self-contained: it is served by a process holding
+        // subscription tokens and must not fetch anything from the network.
+        const page = renderPanel();
+        assert.ok(!/(src|href)=["']https?:/i.test(page), "no external resources");
+        assert.match(page, /<script>/, "behaviour is inline");
+
+        // Add → connect → disconnect, through the same functions the routes use.
+        // The host caches its model catalog, so an account change has to nudge
+        // it or the picker keeps the old name. Failure must never break the
+        // change itself — a stale picker is the pre-existing behaviour.
+        {
+          const { setHostCatalogRefresher, refreshHostCatalog } = await import(
+            "../src/host-refresh.ts"
+          );
+          let calls = 0;
+          setHostCatalogRefresher(async () => { calls++; });
+          await refreshHostCatalog();
+          assert.equal(calls, 1);
+
+          setHostCatalogRefresher(async () => {
+            throw new Error("host is not listening");
+          });
+          await refreshHostCatalog(); // must not throw
+          setHostCatalogRefresher(null);
+          await refreshHostCatalog(); // no refresher registered: also fine
+        }
+
+        // The id follows the name: an operator names the account, the computer
+        // does the character rules.
+        const { slugifyAccountId } = await import("../src/accounts.ts");
+        assert.equal(slugifyAccountId("Work Shared"), "work-shared");
+        assert.equal(slugifyAccountId("Cuenta Diseño"), "cuenta-diseno");
+        assert.equal(slugifyAccountId("  ¡Hola!  "), "hola");
+        assert.equal(slugifyAccountId("2nd account"), "2nd-account");
+
+        const derived = addAccount({ label: "Derived Name" });
+        assert.equal(derived.id, "derived-name");
+        assert.match(
+          derived.configDir!,
+          /\.claude-derived-name$/,
+          "the Claude home follows the derived id",
+        );
+        // A second account named the same gets the next free id, not an error.
+        const derived2 = addAccount({ label: "Derived Name" });
+        assert.equal(derived2.id, "derived-name-2");
+        removeAccount("derived-name");
+        removeAccount("derived-name-2");
+        assert.throws(() => addAccount({}), /give the account a name/);
+
+        const added = addAccount({
+          id: "panel-test",
+          label: "Panel Test",
+          configDir: joinPath(panelDir, "claude-panel-test"),
+        });
+        assert.equal(added.id, "panel-test");
+        assert.equal(findAccount("panel-test")?.label, "Panel Test");
+        assert.throws(
+          () => addAccount({ id: "panel-test" }),
+          /already exists/,
+          "duplicate ids are refused",
+        );
+        assert.throws(
+          () => addAccount({ id: "Bad Id!" }),
+          /id must be/,
+          "invalid ids are refused",
+        );
+
+        assert.equal(
+          hasClaudeCliOAuthCredentials({ configDir: added.configDir }),
+          false,
+          "a fresh account starts disconnected",
+        );
+        const credPath = writeAccountCredentials(added, {
+          access: "sk-panel-access",
+          refresh: "sk-panel-refresh",
+          expires: Date.now() + 3_600_000,
+        });
+        assert.equal(
+          hasClaudeCliOAuthCredentials({ configDir: added.configDir }),
+          true,
+          "credentials land in the account's own Claude home",
+        );
+        const { statSync: stat } = await import("node:fs");
+        assert.equal(
+          (stat(credPath).mode & 0o777).toString(8),
+          "600",
+          "a live subscription token is not world-readable",
+        );
+        // Written in CLI format so the spawned CLI takes over rotation.
+        const raw = JSON.parse(
+          (await import("node:fs")).readFileSync(credPath, "utf8"),
+        );
+        assert.equal(raw.claudeAiOauth.accessToken, "sk-panel-access");
+
+        clearAccountCredentials(added);
+        assert.equal(
+          hasClaudeCliOAuthCredentials({ configDir: added.configDir }),
+          false,
+          "disconnect removes the OAuth block",
+        );
+
+        // Usage accounting.
+        recordTurnUsage("panel-test", {
+          prompt_tokens: 1000,
+          completion_tokens: 200,
+          prompt_tokens_details: { cached_tokens: 700, cache_write_tokens: 50 },
+        });
+        recordTurnUsage("panel-test", { prompt_tokens: 500, completion_tokens: 100 });
+        const usage = getAccountUsage("panel-test");
+        assert.equal(usage.turns, 2);
+        assert.equal(usage.inputTokens, 1500);
+        assert.equal(usage.outputTokens, 300);
+        assert.equal(usage.cacheReadTokens, 700);
+        assert.equal(usage.today.turns, 2);
+        assert.equal(usage.last7Days.turns, 2);
+        assert.equal(usage.series.length, 1);
+        assert.equal(
+          getAccountUsage("never-used").turns,
+          0,
+          "an unused account reports zeroes, not undefined",
+        );
+
+        // Routes, against a live listener.
+        const panelPort = await startPanelProxy(async () => null);
+        const panelBase = `http://127.0.0.1:${panelPort}`;
+        try {
+          const html = await fetch(`${panelBase}/`);
+          assert.equal(html.status, 200);
+          assert.match(html.headers.get("content-type") ?? "", /text\/html/);
+          assert.ok(
+            html.headers.get("content-security-policy"),
+            "the panel ships a CSP",
+          );
+
+          const accountsRes = await fetch(`${panelBase}/v1/accounts`);
+          const accountsBody = (await accountsRes.json()) as {
+            data: Array<{ id: string; usage?: { turns: number } }>;
+          };
+          assert.ok(accountsBody.data.some((a) => a.id === "panel-test"));
+          assert.equal(
+            accountsBody.data.find((a) => a.id === "panel-test")?.usage?.turns,
+            2,
+            "the panel payload carries usage",
+          );
+
+          // A page on another origin must not be able to drive the panel.
+          const csrf = await fetch(`${panelBase}/v1/accounts`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Origin: "https://evil.example",
+            },
+            body: JSON.stringify({ id: "attacker" }),
+          });
+          assert.equal(csrf.status, 403, "cross-origin mutation refused");
+          assert.equal(
+            findAccount("attacker"),
+            null,
+            "and nothing was created",
+          );
+
+          // Regression: the guard tested for loopback, so once the panel was
+          // served through a reverse proxy its OWN fetches (carrying the proxy
+          // origin) were refused. Same-origin must pass whatever the host is.
+          const sameOrigin = await fetch(`${panelBase}/v1/accounts`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Origin: panelBase,
+              Host: `127.0.0.1:${panelPort}`,
+            },
+            body: JSON.stringify({ id: "same-origin-ok" }),
+          });
+          assert.notEqual(
+            sameOrigin.status,
+            403,
+            "the panel's own origin must not be refused",
+          );
+          if (sameOrigin.ok) removeAccount("same-origin-ok");
+
+          // Reads are not gated — only mutations.
+          const crossRead = await fetch(`${panelBase}/v1/accounts`, {
+            headers: { Origin: "https://evil.example" },
+          });
+          assert.equal(crossRead.status, 200);
+
+          const unknown = await fetch(`${panelBase}/v1/accounts/nope/disconnect`, {
+            method: "POST",
+          });
+          assert.equal(unknown.status, 404);
+
+          const moved = await fetch(`${panelBase}/v1/sessions/ghost/account`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ account: "panel-test" }),
+          });
+          assert.equal(moved.status, 404, "cannot bind a session that does not exist");
+
+          // The live URL must be findable without reading logs.
+          const endpoint = JSON.parse(
+            (await import("node:fs")).readFileSync(
+              joinPath(panelDir, "opencode-claude", "endpoint.json"),
+              "utf8",
+            ),
+          );
+          assert.equal(endpoint.port, panelPort);
+          assert.equal(endpoint.panel, `http://127.0.0.1:${panelPort}/`);
+        } finally {
+          await stopPanelProxy();
+        }
+
+        // Rename: the label rides into model names and the panel, so a stale
+        // one actively misleads.
+        const { renameAccount } = await import("../src/accounts.ts");
+        assert.equal(renameAccount("panel-test", "  Renamed  ").label, "Renamed");
+        assert.equal(findAccount("panel-test")?.label, "Renamed");
+        assert.throws(() => renameAccount("panel-test", "   "), /cannot be empty/);
+        assert.throws(() => renameAccount("panel-test", "x".repeat(65)), /too long/);
+        assert.throws(() => renameAccount("nope", "X"), /unknown account/);
+        assert.notEqual(
+          findAccount("panel-test")?.configDir,
+          undefined,
+          "a rename must not lose the account's Claude home",
+        );
+
+        // Renaming the ID too: it appears in model ids as opus@<id>, so a slot
+        // named after the account it used to hold misleads at the composer.
+        const moved: string[] = [];
+        const renamedId = renameAccount("panel-test", "Moved", {
+          newId: "panel-moved",
+          migrate: (from, to) => moved.push(`${from}->${to}`),
+        });
+        assert.equal(renamedId.id, "panel-moved");
+        assert.equal(renamedId.label, "Moved");
+        assert.equal(findAccount("panel-test"), null, "the old id is gone");
+        assert.equal(findAccount("panel-moved")?.configDir, added.configDir,
+          "the Claude home follows the rename");
+        assert.deepEqual(moved, ["panel-test->panel-moved"],
+          "every per-account store is migrated, or the account loses its state");
+        assert.throws(
+          () => renameAccount("panel-moved", "x", { newId: "Bad Id" }),
+          /id must be/,
+        );
+        assert.throws(
+          () => renameAccount("panel-moved", "x", { newId: getDefaultAccount().id }),
+          /already exists/,
+        );
+        // Id-only rename: omitting the label keeps the current one.
+        assert.equal(
+          renameAccount("panel-moved", undefined, { newId: "panel-test" }).label,
+          "Moved",
+        );
+
+        setDefaultAccount("panel-test");
+        assert.equal(findAccount("panel-test")?.isDefault, true);
+        removeAccount("panel-test");
+        assert.equal(findAccount("panel-test"), null);
+        assert.throws(
+          () => removeAccount(getDefaultAccount().id),
+          /only account/,
+          "the last account cannot be removed",
+        );
+      } finally {
+        if (prevXdg2 === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdg2;
+        if (prevPort === undefined) delete process.env.OPENCODE_CLAUDE_PROXY_PORT;
+        else process.env.OPENCODE_CLAUDE_PROXY_PORT = prevPort;
+        rmSync(panelDir, { recursive: true, force: true });
+      }
+    }
+
     // Back to single-account for the rest of the suite.
     resetAccounts();
     configureAccounts(undefined);
@@ -1497,6 +2244,10 @@ async function main() {
     } else {
       process.env.OPENCODE_CLAUDE_ACCOUNTS = prevAccountsEnv;
     }
+    if (prevXdgAccounts === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = prevXdgAccounts;
+    resetAccounts();
+    rmSync(accountsDir, { recursive: true, force: true });
   }
 
   // ---- CLI credential sync poisoning guards ----

@@ -2,6 +2,98 @@
 
 ## Unreleased
 
+- **Control panel at the proxy root.** A self-contained page (no external CSS,
+  fonts or scripts) showing how many accounts are connected, per-account usage
+  and rate-limit state, and which account every session runs on. It adds and
+  removes accounts, runs Claude's browser OAuth to connect one, sets the
+  default, and moves a session between accounts. The live URL is published to
+  `~/.local/share/opencode-claude/endpoint.json` because the proxy binds an
+  ephemeral port. Accounts added here are picked up without restarting
+  OpenCode.
+  - Mutating routes refuse a non-loopback `Origin`: the listener is local, but
+    a page in the operator's browser could otherwise POST to it.
+  - Connecting an account writes CLI-format credentials into that account's
+    Claude home; from the first turn the spawned CLI owns and rotates that
+    chain. The handoff is one-directional, so there is never a second owner.
+- **Account changes reach the model picker without a restart.** OpenCode builds
+  its provider catalog once and caches it, and the account label lives inside
+  the model name — so a rename or a new account stayed invisible until the
+  server restarted. There is no reload endpoint, but an empty `PATCH /config`
+  makes the host re-run the plugin's config hook and rebuild the catalog;
+  add, rename, remove and set-default now do that. Best effort: a host that
+  will not re-read its config leaves a stale picker, which is where things
+  were before, and never fails the change itself.
+- **Adding an account asks for a name, nothing else.** The id is derived from
+  it ("Work Shared" → `work-shared`, accents folded) and the Claude home
+  follows (`~/.claude-work-shared`); a repeated name takes the next free id
+  rather than erroring. Making the operator invent an id and satisfy its
+  character rules was asking them to do the computer's job. An explicit id is
+  still accepted, since scripts and `opencode.json` rely on it.
+- **The account is session state, not a model variant.**
+  `claude_account_manage {action:"use"}` switches the current session to
+  another subscription without touching the model — picking `opus@personal`
+  still works, but conflating "which model" with "which account" meant changing
+  one forced re-picking the other. Switching to a disconnected account is
+  refused rather than producing a session whose every turn 401s.
+  `claude_accounts` now marks which account is current for this session, which
+  is default for new ones, and which shares the ambient `~/.claude` the CLI
+  itself reads.
+- **Panel behind a reverse proxy.** `OPENCODE_CLAUDE_PANEL_HOST` chooses the
+  bind interface (loopback still the default) and the page honours
+  `X-Forwarded-Prefix`, emitting a matching `<base href>` so it works under a
+  path. The automatic loopback callback is offered only to browsers that
+  arrived on 127.0.0.1; through a proxy the redirect would land on the
+  operator's own machine, so those logins use the paste flow.
+- **Rename an account's id, not just its label.** The id appears in model ids
+  (`opus@<id>`), so a slot named after the subscription it used to hold is
+  misleading at the composer. Renaming migrates every per-account store —
+  quota, usage, identity, rate-limit state and session bindings — since all of
+  them are keyed by id.
+- **Account management from inside a session.** Two tools — `claude_accounts`
+  (read) and `claude_account_manage` (add / connect / rename / remove /
+  disconnect / set-default / refresh-quota) — so accounts can be managed
+  without reaching the panel's loopback port from whatever machine the operator
+  is on. `OPENCODE_CLAUDE_TOOLS=0` removes them.
+- **Panel: one-step add, and rename.** Adding an account goes straight into
+  the OAuth flow instead of leaving a disconnected card behind (cancelling the
+  dialog still leaves it registered). Accounts can be renamed from the card —
+  the label rides into the model name, so a stale one is actively misleading
+  once a Claude home is re-logged to a different subscription. The session
+  list resolves labels live rather than showing the name captured at bind time.
+- **Remaining quota, from Anthropic** (`GET /v1/quota`). Messages responses
+  carry `anthropic-ratelimit-unified-*` headers describing both limit windows
+  and naming which one is binding — a five-hour window at 56% looks fine while
+  the weekly window at 93% is what actually stops the next turn, and the Agent
+  SDK's `rate_limit_event` reports only one window at a time. Harvested for
+  free from requests the plugin already makes (429s included), or refreshed on
+  demand with a minimal Messages call; `count_tokens` is free but returns no
+  such headers, so it cannot be the probe. Never polled on a timer.
+  - Agent SDK `rate_limit_event`s are merged into the same store, so quota
+    stays current during ordinary turns — including on hosts whose small model
+    is not `claude-code`, where the meta path never runs. Merged rather than
+    replaced: an event carries one window, and overwriting would erase the
+    other and hide "five-hour fine, weekly nearly spent".
+  - Remaining quota is surfaced *in the session*, not only in the panel: the
+    in-stream rate-limit note, the 429 body when the gate blocks a turn, and
+    `GET /health` all carry a `5h X% left · 7d Y% left (binding, resets in …)`
+    summary.
+- **Account identity, and duplicate-login detection.** Connecting an account
+  resolves it against `GET /api/oauth/profile`; the panel shows the email and
+  organization on the card. A browser already signed in to claude.ai approves
+  the consent screen with that session and never offers an account picker, so
+  connecting a "second account" can silently re-authorize the first — separate
+  grants and refresh chains, one login, one quota pool. Accounts sharing an
+  account uuid are flagged **same login as …**; different logins in one Team
+  organization get the milder **same org as …**, since those are real separate
+  seats.
+  - The check runs between the token exchange and the disk write, so a
+    duplicate is refused with `409 duplicate_login` and **nothing is written**.
+    The exchanged tokens are held for ten minutes — an authorization code is
+    single-use — so the panel can offer *Connect anyway*
+    (`POST …/login/confirm`) or *Discard* without another browser round trip.
+- **Per-account usage counters** (`GET /v1/usage`): turns and tokens, totals
+  plus today, last 7 days and a 30-day daily series. No cost figure — these are
+  subscription turns, not metered API calls.
 - **Multiple Claude accounts, bound per session.** Declare several
   subscriptions (`accounts` plugin option, `OPENCODE_CLAUDE_ACCOUNTS`, or
   `accounts.json`), each backed by its own `CLAUDE_CONFIG_DIR`. The catalog

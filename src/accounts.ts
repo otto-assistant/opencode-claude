@@ -20,9 +20,9 @@
  * 4. Nothing configured → a single implicit account using the ambient Claude
  *    home. This is the pre-multi-account behaviour, byte for byte.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { log } from "./log.js";
 
 export type ClaudeAccount = {
@@ -46,6 +46,18 @@ export const AMBIENT_ACCOUNT_ID = "default";
 const ACCOUNT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,31}$/;
 
 let accounts: ClaudeAccount[] | null = null;
+/** Accounts declared in opencode.json — the baseline the panel writes on top of. */
+let seededAccounts: ClaudeAccount[] = [];
+/** mtime of accounts.json the cache was built from, so panel edits land live. */
+let accountsFileStamp = 0;
+
+function accountsFileMtime(): number {
+  try {
+    return statSync(accountsFilePath()).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
 
 function ambientAccount(): ClaudeAccount {
   return { id: AMBIENT_ACCOUNT_ID, label: "Claude Code", isDefault: true };
@@ -203,11 +215,35 @@ function fromFile(): ClaudeAccount[] | null {
  * Seed the registry from plugin options. Called once from the plugin factory;
  * passing nothing leaves env/file/ambient resolution in charge.
  */
+/**
+ * Merge the declarative baseline with the panel-managed file. Accounts added
+ * from the UI live in accounts.json and win on id conflicts, so an operator can
+ * both declare accounts in opencode.json and add more at runtime without the
+ * two layers fighting.
+ */
+function resolveRegistry(): ClaudeAccount[] {
+  const fromDisk = fromEnv() ?? fromFile() ?? [];
+  const merged = [...seededAccounts];
+  for (const entry of fromDisk) {
+    const at = merged.findIndex((a) => a.id === entry.id);
+    if (at >= 0) merged[at] = entry;
+    else merged.push(entry);
+  }
+  // A default declared in the mutable layer overrides the seeded one.
+  if (fromDisk.some((a) => a.isDefault)) {
+    for (const account of merged) {
+      account.isDefault = fromDisk.some((a) => a.id === account.id && a.isDefault);
+    }
+  }
+  accountsFileStamp = accountsFileMtime();
+  return normalize(merged);
+}
+
 export function configureAccounts(raw: unknown): ClaudeAccount[] {
-  const list = Array.isArray(raw)
+  seededAccounts = Array.isArray(raw)
     ? raw.map(parseAccountEntry).filter((a): a is ClaudeAccount => a !== null)
     : [];
-  accounts = list.length > 0 ? normalize(list) : normalize(fromEnv() ?? fromFile() ?? []);
+  accounts = resolveRegistry();
   if (accounts.length > 1) {
     log.info("[opencode-claude] multi-account mode", {
       accounts: accounts.map((a) => `${a.id}${a.isDefault ? "*" : ""}`),
@@ -219,11 +255,260 @@ export function configureAccounts(raw: unknown): ClaudeAccount[] {
 /** Test helper: forget the resolved registry so the next read re-resolves. */
 export function resetAccounts(): void {
   accounts = null;
+  seededAccounts = [];
+  accountsFileStamp = 0;
 }
 
 export function getAccounts(): ClaudeAccount[] {
-  if (!accounts) accounts = normalize(fromEnv() ?? fromFile() ?? []);
+  // Re-resolve when the panel rewrote accounts.json, so a newly connected
+  // account is usable without restarting the OpenCode server.
+  if (!accounts || accountsFileMtime() !== accountsFileStamp) {
+    accounts = resolveRegistry();
+  }
   return accounts;
+}
+
+/** Path of the panel-managed registry — surfaced in the UI for transparency. */
+export function getAccountsFilePath(): string {
+  return accountsFilePath();
+}
+
+function persistAccounts(list: ClaudeAccount[]): void {
+  const path = accountsFilePath();
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(
+    path,
+    JSON.stringify(
+      {
+        accounts: list.map((a) => ({
+          id: a.id,
+          label: a.label,
+          ...(a.configDir ? { configDir: a.configDir } : {}),
+          default: a.isDefault,
+        })),
+      },
+      null,
+      2,
+    ) + "\n",
+    "utf8",
+  );
+  accounts = null; // force a re-resolve on next read
+}
+
+/**
+ * Turn a human label into an account id: "Work Shared" → "work-shared".
+ *
+ * The id is machinery — it keys every store and appears in model ids as
+ * opus@<id> — but making an operator invent one, and get the character rules
+ * right, is asking them to do the computer's job. Accents are folded rather
+ * than dropped so "Cuenta Diseño" stays legible as "cuenta-diseno".
+ */
+export function slugifyAccountId(label: string): string {
+  const base = label
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32)
+    .replace(/-+$/, "");
+  return /^[a-z0-9]/.test(base) ? base : `account-${base}`.slice(0, 32);
+}
+
+/** First free id in the `base`, `base-2`, `base-3`… series. */
+function uniqueAccountId(base: string, taken: Set<string>): string {
+  if (!taken.has(base)) return base;
+  for (let n = 2; n < 1000; n++) {
+    const candidate = `${base.slice(0, 29)}-${n}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  throw new AccountError("could not derive a free account id");
+}
+
+export class AccountError extends Error {
+  status: number;
+  constructor(message: string, status = 400) {
+    super(message);
+    this.name = "AccountError";
+    this.status = status;
+  }
+}
+
+/**
+ * Register an account from the panel. The config dir is created on demand so
+ * the OAuth flow that follows has somewhere to write credentials.
+ */
+export function addAccount(input: {
+  id?: unknown;
+  label?: unknown;
+  configDir?: unknown;
+  makeDefault?: boolean;
+}): ClaudeAccount {
+  const existing = getAccounts();
+  const taken = new Set(existing.map((a) => a.id));
+  const givenId = typeof input.id === "string" ? input.id.trim().toLowerCase() : "";
+  const givenLabel =
+    typeof input.label === "string" && input.label.trim() ? input.label.trim() : "";
+
+  // An explicit id still wins — scripts and opencode.json rely on it — but the
+  // normal path is to name the account and let the id follow.
+  let id: string;
+  if (givenId) {
+    if (!ACCOUNT_ID_PATTERN.test(givenId)) {
+      throw new AccountError(
+        "id must be lowercase letters, digits, dot, dash or underscore (max 32 chars)",
+      );
+    }
+    if (taken.has(givenId)) {
+      throw new AccountError(`account "${givenId}" already exists`, 409);
+    }
+    id = givenId;
+  } else {
+    if (!givenLabel) throw new AccountError("give the account a name");
+    const slug = slugifyAccountId(givenLabel);
+    if (!ACCOUNT_ID_PATTERN.test(slug)) {
+      throw new AccountError(
+        `could not derive an id from "${givenLabel}" — give one explicitly`,
+      );
+    }
+    id = uniqueAccountId(slug, taken);
+  }
+  const label = givenLabel || id;
+  const rawDir =
+    typeof input.configDir === "string" && input.configDir.trim()
+      ? input.configDir
+      : `~/.claude-${id}`;
+  const configDir = expandHome(rawDir);
+  if (!isAbsolute(configDir)) {
+    throw new AccountError("configDir must be an absolute path (or start with ~)");
+  }
+  if (existing.some((a) => accountConfigDir(a) === configDir)) {
+    throw new AccountError(
+      `another account already uses ${configDir} — one Claude home per account`,
+      409,
+    );
+  }
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+
+  // The pre-existing single account is implicit; persisting it alongside the
+  // new one keeps the ambient Claude home addressable instead of vanishing
+  // behind the first account somebody adds from the UI.
+  const baseline = existing.map((account) =>
+    account.id === AMBIENT_ACCOUNT_ID && !account.configDir
+      ? { ...account, configDir: accountConfigDir(account) }
+      : account,
+  );
+  const created: ClaudeAccount = { id, label, configDir, isDefault: false };
+  const next = [...baseline, created];
+  if (input.makeDefault) {
+    for (const account of next) account.isDefault = account.id === id;
+  }
+  persistAccounts(normalize(next));
+  log.info("[opencode-claude] account added", { id, configDir });
+  return created;
+}
+
+/** Forget an account. Its Claude home is left on disk — credentials are the operator's. */
+export function removeAccount(id: string): void {
+  const wanted = id.trim().toLowerCase();
+  const existing = getAccounts();
+  const target = existing.find((a) => a.id === wanted);
+  if (!target) throw new AccountError(`unknown account "${wanted}"`, 404);
+  if (existing.length === 1) {
+    throw new AccountError("cannot remove the only account", 409);
+  }
+  const next = existing.filter((a) => a.id !== wanted);
+  if (target.isDefault) next[0].isDefault = true;
+  persistAccounts(normalize(next));
+  log.info("[opencode-claude] account removed", { id: wanted });
+}
+
+/**
+ * Change an account's display label. The label rides into the model name and
+ * the panel, so a stale one (an account re-logged to a different subscription,
+ * say) is actively misleading — worth being editable without hand-editing JSON.
+ */
+export function renameAccount(
+  id: string,
+  label: unknown,
+  options?: { newId?: unknown; migrate?: (oldId: string, newId: string, label: string) => void },
+): ClaudeAccount {
+  const wanted = id.trim().toLowerCase();
+  const existing = getAccounts();
+  const current = existing.find((a) => a.id === wanted);
+  if (!current) throw new AccountError(`unknown account "${wanted}"`, 404);
+
+  // A blank label is a mistake, not "keep the old one" — unless the caller is
+  // only changing the id, in which case omitting the label is the normal case.
+  const labelGiven = typeof label === "string";
+  const trimmedLabel = labelGiven ? (label as string).trim() : "";
+  const changingId =
+    typeof options?.newId === "string" &&
+    options.newId.trim().toLowerCase() !== "" &&
+    options.newId.trim().toLowerCase() !== wanted;
+  if (labelGiven && !trimmedLabel && !changingId) {
+    throw new AccountError("label cannot be empty");
+  }
+  const clean = trimmedLabel || current.label;
+  if (!clean) throw new AccountError("label cannot be empty");
+  if (clean.length > 64) throw new AccountError("label is too long (max 64 chars)");
+
+  // The id is not cosmetic: it appears in model ids as opus@<id>, and a slot
+  // named for the account it used to hold is exactly how an operator ends up
+  // believing they are spending a different subscription.
+  const rawNewId =
+    typeof options?.newId === "string" ? options.newId.trim().toLowerCase() : "";
+  const newId = rawNewId && rawNewId !== wanted ? rawNewId : null;
+  if (newId) {
+    if (!ACCOUNT_ID_PATTERN.test(newId)) {
+      throw new AccountError(
+        "id must be lowercase letters, digits, dot, dash or underscore (max 32 chars)",
+      );
+    }
+    if (existing.some((a) => a.id === newId)) {
+      throw new AccountError(`account "${newId}" already exists`, 409);
+    }
+  }
+
+  const next = existing.map((account) => ({
+    ...account,
+    // Persisting an implicit ambient account needs a concrete dir, as in add.
+    ...(account.id === AMBIENT_ACCOUNT_ID && !account.configDir
+      ? { configDir: accountConfigDir(account) }
+      : {}),
+    ...(account.id === wanted
+      ? { label: clean, ...(newId ? { id: newId } : {}) }
+      : {}),
+  }));
+  persistAccounts(normalize(next));
+  // Every per-account store is keyed by id, so they all have to follow it or
+  // the account silently loses its quota, usage, identity and session bindings.
+  if (newId) options?.migrate?.(wanted, newId, clean);
+  log.info("[opencode-claude] account renamed", {
+    id: wanted,
+    ...(newId ? { newId } : {}),
+    label: clean,
+  });
+  return next.find((a) => a.id === (newId ?? wanted))!;
+}
+
+/** Which account new sessions land on when nothing else says otherwise. */
+export function setDefaultAccount(id: string): ClaudeAccount {
+  const wanted = id.trim().toLowerCase();
+  const existing = getAccounts();
+  if (!existing.some((a) => a.id === wanted)) {
+    throw new AccountError(`unknown account "${wanted}"`, 404);
+  }
+  const next = existing.map((account) => ({
+    ...account,
+    // Persisting an implicit ambient account needs a concrete dir, same as add.
+    ...(account.id === AMBIENT_ACCOUNT_ID && !account.configDir
+      ? { configDir: accountConfigDir(account) }
+      : {}),
+    isDefault: account.id === wanted,
+  }));
+  persistAccounts(normalize(next));
+  return next.find((a) => a.id === wanted)!;
 }
 
 export function getDefaultAccount(): ClaudeAccount {

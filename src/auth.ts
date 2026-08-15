@@ -16,6 +16,8 @@ export type ClaudeOAuthTokens = {
 export type AuthorizationResult = {
   url: string;
   redirectUri: string;
+  /** True when the operator must copy the code back by hand. */
+  manual: boolean;
   state: string;
   verifier: string;
 };
@@ -37,15 +39,21 @@ function generateState(): string {
   return crypto.randomUUID().replace(/-/g, "");
 }
 
-export async function authorizeClaudeMax(): Promise<AuthorizationResult> {
+export async function authorizeClaudeMax(
+  options?: { redirectUri?: string },
+): Promise<AuthorizationResult> {
   const pkce = await generatePKCE();
   const state = generateState();
+  const redirectUri = options?.redirectUri?.trim() || MANUAL_REDIRECT_URL;
+  const manual = redirectUri === MANUAL_REDIRECT_URL;
 
   const url = new URL(AUTHORIZE_URL);
-  url.searchParams.set("code", "true");
+  // `code=true` renders the code on screen for copy-pasting. With a loopback
+  // redirect we want an actual redirect back to the listener instead.
+  if (manual) url.searchParams.set("code", "true");
   url.searchParams.set("client_id", CLIENT_ID);
   url.searchParams.set("response_type", "code");
-  url.searchParams.set("redirect_uri", MANUAL_REDIRECT_URL);
+  url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("scope", OAUTH_SCOPES);
   url.searchParams.set("code_challenge", pkce.challenge);
   url.searchParams.set("code_challenge_method", "S256");
@@ -53,7 +61,8 @@ export async function authorizeClaudeMax(): Promise<AuthorizationResult> {
 
   return {
     url: url.toString(),
-    redirectUri: MANUAL_REDIRECT_URL,
+    redirectUri,
+    manual,
     state,
     verifier: pkce.verifier,
   };

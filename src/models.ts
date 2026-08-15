@@ -12,6 +12,7 @@ import {
   isMultiAccount,
   type ClaudeAccount,
 } from "./accounts.js";
+import { getAccountQuota } from "./quota.js";
 
 export type ClaudeModel = {
   id: string;
@@ -134,17 +135,52 @@ export function composeAccountModelId(
  * label is what OpenChamber prints in the model picker and in the session
  * header, so the account a session runs on is readable at a glance.
  */
+/**
+ * Remaining quota as a model-name suffix, e.g. `5h 96% · 7d 4%`.
+ *
+ * The model name is the one string this plugin controls that the host renders
+ * next to the composer, so it is where "how much is left on the account I am
+ * about to use" can actually be read at the moment of choosing. Refreshes
+ * whenever the host rebuilds the catalog.
+ */
+export function quotaNameSuffix(accountId: string): string {
+  if (nameQuotaDisabled()) return "";
+  const quota = getAccountQuota(accountId);
+  if (!quota) return "";
+  const parts: string[] = [];
+  const five = quota.windows.fiveHour;
+  const seven = quota.windows.sevenDay;
+  if (five) parts.push(`5h ${Math.round(five.remaining * 100)}%`);
+  if (seven) parts.push(`7d ${Math.round(seven.remaining * 100)}%`);
+  return parts.length ? ` · ${parts.join(" · ")}` : "";
+}
+
+function nameQuotaDisabled(): boolean {
+  const flag = (process.env.OPENCODE_CLAUDE_MODEL_QUOTA ?? "").toLowerCase();
+  return flag === "0" || flag === "false" || flag === "off";
+}
+
 export function getClaudeModels(): ClaudeModel[] {
-  if (!isMultiAccount()) return CLAUDE_CODE_MODELS;
-  return getAccounts().flatMap((account) =>
-    CLAUDE_CODE_MODELS.map((model) => ({
+  if (!isMultiAccount()) {
+    // Single account: no label to add, but the remaining quota is just as
+    // useful — it is the same question, asked of the only subscription there is.
+    const suffix = quotaNameSuffix(getDefaultAccount().id);
+    if (!suffix) return CLAUDE_CODE_MODELS;
+    return CLAUDE_CODE_MODELS.map((model) => ({
+      ...model,
+      name: `${model.name}${suffix}`,
+    }));
+  }
+  return getAccounts().flatMap((account) => {
+    const suffix = quotaNameSuffix(account.id);
+    return CLAUDE_CODE_MODELS.map((model) => ({
       ...model,
       id: composeAccountModelId(model.id, account),
-      name: `${model.name} · ${account.label}`,
+      name: `${model.name} · ${account.label}${suffix}`,
       // resolvedId stays the real Claude model — the account rides the id.
       ...(model.resolvedId ? { resolvedId: model.resolvedId } : {}),
-    })),
-  );
+    }));
+  });
 }
 
 /** Catalog for one account, with bare ids (used to build per-account menus). */

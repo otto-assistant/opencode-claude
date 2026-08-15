@@ -5,6 +5,16 @@ export const CLIENT_ID =
 export const AUTHORIZE_URL =
   process.env.ANTHROPIC_AUTHORIZE_URL || "https://claude.ai/oauth/authorize";
 
+/**
+ * Loopback callback path. The Claude Code OAuth client publishes exactly two
+ * redirect_uris — http://localhost/callback and http://127.0.0.1/callback — so
+ * a loopback listener is the only way to close the loop automatically. No
+ * public URL can be used: the client belongs to Anthropic and nothing else is
+ * registered. It is also unnecessary — the redirect happens in the operator's
+ * browser, never from Anthropic's servers.
+ */
+export const LOOPBACK_CALLBACK_PATH = "/callback";
+
 export const MANUAL_REDIRECT_URL =
   process.env.ANTHROPIC_MANUAL_REDIRECT_URL ||
   "https://platform.claude.com/oauth/code/callback";

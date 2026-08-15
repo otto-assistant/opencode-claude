@@ -58,6 +58,8 @@ import {
   getProxyPort,
   startProxy,
 } from "./proxy.js";
+import { buildAccountTools } from "./tools.js";
+import { setHostCatalogRefresher } from "./host-refresh.js";
 
 type ClaudeOAuthAuth = {
   type: "oauth";
@@ -481,6 +483,17 @@ export const ClaudeCodePlugin: Plugin = async (
   // the proxy and the credential probes all key off it.
   configureAccounts(options?.accounts);
 
+  // The model picker caches the catalog, and the account label lives inside the
+  // model name. An empty config patch makes the host re-run the config hook, so
+  // a rename or a new account shows up without restarting OpenCode.
+  setHostCatalogRefresher(async () => {
+    const config = input.client.config as {
+      update?: (args: { body: Record<string, unknown> }) => Promise<unknown>;
+    };
+    if (typeof config?.update !== "function") return;
+    await config.update({ body: {} });
+  });
+
   // Best-effort CLI sync on load so OpenChamber / headless hosts work without
   // an explicit auth.methods click when `claude` is already logged in.
   try {
@@ -493,6 +506,11 @@ export const ClaudeCodePlugin: Plugin = async (
   }
 
   return {
+    // Account management from inside a session, so adding or dropping a
+    // subscription does not require reaching a loopback page from whatever
+    // machine the operator happens to be on.
+    tool: buildAccountTools(),
+
     async config(config) {
       const detection = await detectClaudeCode();
       // Model visibility must not depend on the CLI's login state alone: a

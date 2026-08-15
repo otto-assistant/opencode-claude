@@ -9,6 +9,9 @@
  * tool_calls; the follow-up request with tool results resumes the turn.
  */
 import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname as dirnamePath, join as joinPath } from "node:path";
 import {
   deleteBridge,
   findBridgeByConversation,
@@ -21,13 +24,55 @@ import { withClaudeOAuthToken } from "./auth-env.js";
 import { hasClaudeCliOAuthCredentials } from "./credentials.js";
 import {
   accountConfigDir,
+  AccountError,
+  addAccount,
   applyAccountEnv,
+  findAccount,
   getAccounts,
+  getAccountsFilePath,
   getDefaultAccount,
   isMultiAccount,
+  removeAccount,
+  renameAccount,
   resolveAccount,
+  setDefaultAccount,
   type ClaudeAccount,
 } from "./accounts.js";
+import {
+  clearAccountCredentials,
+  completeAccountLogin,
+  findPendingLoginByState,
+  confirmHeldLogin,
+  discardHeldLogin,
+  DuplicateLoginError,
+  getHeldLogin,
+  startAccountLogin,
+} from "./account-login.js";
+import { renderPanel } from "./panel.js";
+import { refreshHostCatalog } from "./host-refresh.js";
+import {
+  accountsSharingLogin,
+  clearAccountIdentity,
+  renameAccountIdentity,
+  fetchAccountIdentity,
+  getAccountIdentity,
+} from "./identity.js";
+import {
+  getAccountUsage,
+  getAllAccountUsage,
+  recordTurnUsage,
+  renameAccountUsage,
+} from "./usage-store.js";
+import {
+  accountsSharingSubscription,
+  clearAccountQuota,
+  formatQuotaSummary,
+  getAccountQuota,
+  getAllAccountQuota,
+  mergeSdkRateLimitEvent,
+  probeAccountQuota,
+  renameAccountQuota,
+} from "./quota.js";
 import {
   classifyClaudeFailure,
   failureHintFor,
@@ -42,18 +87,21 @@ import { parseAccountModelId, resolveClaudeModelId } from "./models.js";
 import {
   ACCOUNT_HEADER,
   DIRECTORY_HEADER,
+  LOOPBACK_CALLBACK_PATH,
   SESSION_HEADER,
   type ClaudeEffort,
 } from "./constants.js";
 import { startClaudeQuery, type ClaudeQueryHandle } from "./query.js";
 import {
   bindConversationAccount,
+  getSessionBinding,
   clearForeignSessionId,
   conversationKeyFromMessages,
   findClaudeSessionFile,
   getBoundAccountId,
   getForeignSessionId,
   listSessionBindings,
+  renameBoundAccount,
   setForeignSessionId,
 } from "./session-store.js";
 import { log } from "./log.js";
@@ -65,6 +113,7 @@ import {
   rateLimitGate,
   recordRateLimitErrorText,
   recordRateLimitInfo,
+  renameAccountRateLimit,
   formatResetCountdown,
 } from "./rate-limit.js";
 import {
@@ -107,6 +156,17 @@ const REQUESTED_PROXY_PORT: number = (() => {
   return Number.isInteger(parsed) && parsed >= 0 && parsed < 65536
     ? parsed
     : 0;
+})();
+
+/**
+ * Interface the proxy binds to. Loopback by default — it holds subscription
+ * tokens. Set OPENCODE_CLAUDE_PANEL_HOST=0.0.0.0 to put the panel behind a
+ * reverse proxy you already trust; the panel is then only as protected as that
+ * proxy makes it.
+ */
+const BIND_HOST = (() => {
+  const raw = process.env.OPENCODE_CLAUDE_PANEL_HOST?.trim();
+  return raw || "127.0.0.1";
 })();
 
 const SSE_HEADERS = {
@@ -234,21 +294,59 @@ async function isProxyHealthyAt(baseUrl: string): Promise<boolean> {
   }
 }
 
+/**
+ * Write the live panel URL where a human can find it. The proxy binds an
+ * ephemeral port by default, so without this the address only exists inside
+ * a log line the host may not surface.
+ */
+function publishEndpoint(port: number): void {
+  try {
+    const xdg = process.env.XDG_DATA_HOME;
+    const base = xdg ? xdg : joinPath(homedir(), ".local", "share");
+    const path = joinPath(base, "opencode-claude", "endpoint.json");
+    mkdirSync(dirnamePath(path), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify(
+        {
+          port,
+          panel: `http://127.0.0.1:${port}/`,
+          baseURL: `http://127.0.0.1:${port}/v1`,
+          pid: process.pid,
+          updatedAt: Date.now(),
+        },
+        null,
+        2,
+      ) + "\n",
+      "utf8",
+    );
+  } catch {
+    // discoverability is a convenience — never fail startup over it
+  }
+}
+
 export async function startProxy(tokenProvider: TokenProvider): Promise<number> {
   getAccessToken = tokenProvider;
-  if (server && proxyPort) return proxyPort;
+  // Republish on every call, not just the first bind: the file is how a human
+  // finds the panel, and it must survive a deleted file or a host that calls
+  // startProxy again after the listener already exists.
+  if (server && proxyPort) {
+    publishEndpoint(proxyPort);
+    return proxyPort;
+  }
 
   // Only reuse a sibling listener when the operator pinned a port.
   if (REQUESTED_PROXY_PORT > 0) {
     const pinnedUrl = `http://127.0.0.1:${REQUESTED_PROXY_PORT}/v1`;
     if (await isProxyHealthyAt(pinnedUrl)) {
       proxyPort = REQUESTED_PROXY_PORT;
+      publishEndpoint(proxyPort);
       log.info(`[opencode-claude] reusing healthy proxy on ${pinnedUrl}`);
       return proxyPort;
     }
   }
 
-  const hostname = "127.0.0.1";
+  const hostname = BIND_HOST;
   const bindPort = REQUESTED_PROXY_PORT; // 0 → ephemeral
 
   try {
@@ -263,7 +361,12 @@ export async function startProxy(tokenProvider: TokenProvider): Promise<number> 
     if (!proxyPort) {
       throw new Error("Failed to bind Claude proxy to a port");
     }
-    log.info(`[opencode-claude] proxy listening on ${getClaudeProxyBaseUrl()}`);
+    publishEndpoint(proxyPort);
+    // warn, not info: the panel URL is the one thing an operator has to be able
+    // to find, and info is debug-gated.
+    log.warn(
+      `[opencode-claude] proxy listening on ${getClaudeProxyBaseUrl()} · panel at http://127.0.0.1:${proxyPort}/`,
+    );
     return proxyPort;
   } catch (err) {
     if (
@@ -272,6 +375,7 @@ export async function startProxy(tokenProvider: TokenProvider): Promise<number> 
       (await isProxyHealthyAt(`http://127.0.0.1:${REQUESTED_PROXY_PORT}/v1`))
     ) {
       proxyPort = REQUESTED_PROXY_PORT;
+      publishEndpoint(proxyPort);
       log.info(
         `[opencode-claude] port ${REQUESTED_PROXY_PORT} in use; reusing existing proxy`,
       );
@@ -289,8 +393,433 @@ export async function stopProxy(): Promise<void> {
   }
 }
 
+/**
+ * The panel can add accounts and start OAuth, so mutating routes must not be
+ * driven by some other site the operator happens to have open. The check is
+ * same-origin: the browser's Origin must match the host this request arrived
+ * on — whatever that host is.
+ *
+ * It used to test for loopback instead, which was fine while the panel was
+ * loopback-only and became a self-inflicted 403 the moment it was served
+ * through a reverse proxy: the page's own fetches carry the proxy's origin.
+ * Loopback stays allowed on top, so a tunnelled browser still works.
+ */
+function isLocalOrigin(req: Request): boolean {
+  const origin = req.headers.get("origin");
+  if (!origin) return true; // curl, xh, the plugin's own tooling
+  const forwardedHost = req.headers.get("x-forwarded-host")?.split(",")[0]?.trim();
+  const host = (forwardedHost || req.headers.get("host") || "").trim();
+  try {
+    const url = new URL(origin);
+    if (host && url.host.toLowerCase() === host.toLowerCase()) return true;
+    const hostname = url.hostname;
+    return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+  } catch {
+    return false;
+  }
+}
+
+/** Minimal page the browser lands on after the OAuth redirect. */
+function callbackPage(ok: boolean, message: string): Response {
+  const colour = ok ? "#2f7d4f" : "#b3372c";
+  return new Response(
+    `<!doctype html><html><head><meta charset="utf-8">
+<title>${ok ? "Connected" : "Not connected"}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center;
+    font: 15px/1.6 ui-sans-serif, system-ui, sans-serif; padding: 2rem; }
+  .box { max-width: 34rem; text-align:center; }
+  h1 { font-size: 1.1rem; margin: 0 0 .5rem; color: ${colour}; }
+  p { margin: 0; opacity: .85; }
+</style></head>
+<body><div class="box"><h1>${ok ? "Connected" : "Not connected"}</h1>
+<p>${message.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]!)}</p>
+</div></body></html>`,
+    {
+      status: ok ? 200 : 400,
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+      },
+    },
+  );
+}
+
+/**
+ * Carry every per-account store to a new id. Missed one and the account keeps
+ * its name but loses its quota, usage, identity and session bindings.
+ */
+export function migrateAccountStores(
+  oldId: string,
+  newId: string,
+  newLabel: string,
+): void {
+  renameAccountQuota(oldId, newId);
+  renameAccountIdentity(oldId, newId);
+  renameAccountUsage(oldId, newId);
+  renameAccountRateLimit(oldId, newId);
+  renameBoundAccount(oldId, newId, newLabel);
+}
+
+function jsonError(message: string, status: number): Response {
+  return Response.json(
+    { error: { message, type: status === 404 ? "not_found" : "invalid_request_error" } },
+    { status },
+  );
+}
+
+async function readJsonBody(req: Request): Promise<Record<string, unknown>> {
+  try {
+    const parsed = await req.json();
+    return parsed && typeof parsed === "object"
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Account payload for the panel: identity, auth state, limits and usage. */
+function describeAccount(
+  account: ClaudeAccount,
+  sessionCounts: Map<string, number>,
+): Record<string, unknown> {
+  return {
+    id: account.id,
+    label: account.label,
+    default: account.isDefault,
+    configDir: accountConfigDir(account),
+    authenticated: credentialProbe(account),
+    sessions: sessionCounts.get(account.id) ?? 0,
+    rateLimit: getRateLimitSnapshot(Date.now(), account.id),
+    usage: getAccountUsage(account.id),
+    quota: getAccountQuota(account.id),
+    // Who this actually is. A consent screen approved by an existing claude.ai
+    // session re-authorizes the SAME login without ever offering a picker, so
+    // the email is the only honest answer to "is this a second subscription".
+    identity: getAccountIdentity(account.id),
+    sharesLoginWith: accountsSharingLogin(account.id),
+    // A login exchanged but deliberately not written, awaiting a decision.
+    heldDuplicateLogin: Boolean(getHeldLogin(account.id)),
+    // Same organization but a different login (two seats on one Team) is not
+    // the same thing as the same login twice — kept separate on purpose.
+    sharesOrganizationWith: accountsSharingSubscription(account.id),
+  };
+}
+
+function sessionCountsByAccount(): Map<string, number> {
+  const defaultId = getDefaultAccount().id;
+  const counts = new Map<string, number>();
+  for (const binding of listSessionBindings()) {
+    const id = binding.accountId ?? defaultId;
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/**
+ * Panel routes. Returns null when the path is not one of them, so the main
+ * handler can fall through to the OpenAI-compatible surface.
+ */
+async function handlePanelRoutes(
+  req: Request,
+  url: URL,
+): Promise<Response | null> {
+  const path = url.pathname.replace(/^\/v1(?=\/|$)/, "") || "/";
+
+  if (req.method === "GET" && (path === "/" || path === "/panel" || path === "/ui")) {
+    // Traefik's StripPrefix tells us where the page really lives, so relative
+    // fetches resolve under /claude/ as readily as under /.
+    const prefix = req.headers.get("x-forwarded-prefix")?.trim() ?? "";
+    const basePath = `${prefix.replace(/\/+$/, "")}/`;
+    return new Response(renderPanel(basePath), {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+        // The page is entirely inline; nothing may be fetched from anywhere.
+        "Content-Security-Policy":
+          "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'none'",
+      },
+    });
+  }
+
+  // Loopback OAuth callback. The browser lands here after approving; the
+  // account is recovered from `state`, since one shared listener serves every
+  // account and the path carries no id.
+  if (req.method === "GET" && path === LOOPBACK_CALLBACK_PATH) {
+    const code = url.searchParams.get("code");
+    const state = url.searchParams.get("state");
+    const oauthError = url.searchParams.get("error");
+    if (oauthError) {
+      return callbackPage(
+        false,
+        `Claude returned "${oauthError}". Nothing was saved.`,
+      );
+    }
+    if (!code || !state) {
+      return callbackPage(false, "The callback carried no code — nothing was saved.");
+    }
+    const loginEntry = findPendingLoginByState(state);
+    if (!loginEntry) {
+      return callbackPage(
+        false,
+        "No login is waiting for this callback (they expire after 15 minutes). Start again from the panel.",
+      );
+    }
+    const account = findAccount(loginEntry.accountId);
+    if (!account) {
+      return callbackPage(false, `Account "${loginEntry.accountId}" no longer exists.`);
+    }
+    try {
+      const result = await completeAccountLogin(account, `${code}#${state}`);
+      return callbackPage(
+        true,
+        `Connected ${account.label}${
+          result.identity?.email ? ` as ${result.identity.email}` : ""
+        }. You can close this tab.`,
+      );
+    } catch (err) {
+      if (err instanceof DuplicateLoginError) {
+        // Held, not written. The panel shows the decision.
+        return callbackPage(
+          false,
+          `${err.message} Nothing was saved — return to the panel to connect it anyway or discard it.`,
+        );
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      log.error("[opencode-claude] loopback callback failed", message);
+      return callbackPage(false, message);
+    }
+  }
+
+  if (req.method === "GET" && path === "/accounts") {
+    const counts = sessionCountsByAccount();
+    return Response.json({
+      object: "list",
+      multiAccount: isMultiAccount(),
+      registryPath: getAccountsFilePath(),
+      data: getAccounts().map((account) => describeAccount(account, counts)),
+    });
+  }
+
+  if (req.method === "GET" && path === "/usage") {
+    return Response.json({
+      object: "usage",
+      accounts: getAllAccountUsage(),
+    });
+  }
+
+  // Last known quota per account. Read-only and free: refreshing costs a real
+  // (tiny) request, so it is a separate explicit POST.
+  if (req.method === "GET" && path === "/quota") {
+    return Response.json({
+      object: "quota",
+      accounts: getAllAccountQuota(),
+    });
+  }
+
+  if (req.method === "GET" && path === "/sessions") {
+    const defaultId = getDefaultAccount().id;
+    const wanted = url.searchParams.get("account")?.trim().toLowerCase();
+    const data = listSessionBindings()
+      .map((binding) => {
+        const accountId = binding.accountId ?? defaultId;
+        return {
+          conversationKey: binding.conversationKey,
+          account: accountId,
+          // Current label, not the one captured at bind time — a rename must
+          // not leave old names scattered across the session list.
+          accountLabel: resolveAccount(accountId).label,
+          modelId: binding.modelId,
+          cwd: binding.cwd,
+          claudeSessionId: binding.foreignSessionId || null,
+          updatedAt: binding.updatedAt,
+        };
+      })
+      .filter((entry) => !wanted || entry.account === wanted);
+    return Response.json({ object: "list", data });
+  }
+
+  // ---- mutations ----
+  const accountMatch = /^\/accounts\/([^/]+)(?:\/(login\/start|login\/complete|login\/confirm|login\/discard|disconnect|default|rename|quota\/refresh))?$/
+    .exec(path);
+  const sessionMatch = /^\/sessions\/([^/]+)\/account$/.exec(path);
+  const isMutation =
+    req.method !== "GET" &&
+    (path === "/accounts" || accountMatch !== null || sessionMatch !== null);
+
+  if (isMutation && !isLocalOrigin(req)) {
+    return jsonError("cross-origin requests are not accepted by the panel", 403);
+  }
+
+  try {
+    if (req.method === "POST" && path === "/accounts") {
+      const body = await readJsonBody(req);
+      const account = addAccount({
+        id: body.id,
+        label: body.label,
+        configDir: body.configDir,
+        makeDefault: body.makeDefault === true,
+      });
+      await refreshHostCatalog();
+      return Response.json(
+        describeAccount(account, sessionCountsByAccount()),
+        { status: 201 },
+      );
+    }
+
+    if (accountMatch) {
+      const id = decodeURIComponent(accountMatch[1]);
+      const action = accountMatch[2];
+      const account = findAccount(id);
+      if (!account) return jsonError(`unknown account "${id}"`, 404);
+
+      if (req.method === "DELETE" && !action) {
+        removeAccount(id);
+        clearAccountIdentity(id);
+        clearAccountQuota(id);
+        await refreshHostCatalog();
+        return Response.json({ removed: id });
+      }
+      if (req.method === "POST" && action === "default") {
+        const chosen = setDefaultAccount(id).id;
+        await refreshHostCatalog();
+        return Response.json({ default: chosen });
+      }
+      if (req.method === "POST" && action === "rename") {
+        const body = await readJsonBody(req);
+        const renamed = renameAccount(id, body.label, {
+          newId: body.newId,
+          migrate: migrateAccountStores,
+        });
+        await refreshHostCatalog();
+        return Response.json({ account: renamed.id, label: renamed.label });
+      }
+      if (req.method === "POST" && action === "disconnect") {
+        clearAccountCredentials(account);
+        clearAccountIdentity(id);
+        // Stale quota belongs to the login that just left; showing it on a
+        // disconnected card invents capacity that is not addressable.
+        clearAccountQuota(id);
+        return Response.json({ disconnected: id });
+      }
+      if (req.method === "POST" && action === "quota/refresh") {
+        // Costs one minimal Messages call against the window it measures —
+        // operator-initiated only, never on a timer.
+        const quota = await probeAccountQuota(account);
+        // The profile call is free, so refresh identity while we are here.
+        await fetchAccountIdentity(account).catch(() => null);
+        return Response.json(quota);
+      }
+      if (req.method === "POST" && action === "login/start") {
+        // Close the loop automatically when we know our own address: the
+        // Claude Code client registers only loopback redirects, and the
+        // redirect is performed by the operator's browser, so it must be able
+        // to reach this listener (same machine, or an SSH tunnel).
+        // Only offer the automatic loopback callback when the browser that
+        // will follow the redirect can actually reach loopback — i.e. it came
+        // in on 127.0.0.1. Through a reverse proxy the redirect would land on
+        // the operator's OWN machine, so those logins use the paste flow.
+        const port = getProxyPort();
+        const viaLoopback = /^(127\.0\.0\.1|localhost|\[::1\])(:|$)/.test(
+          req.headers.get("host") ?? "",
+        );
+        const pending = await startAccountLogin(
+          account,
+          port && viaLoopback
+            ? { redirectUri: `http://127.0.0.1:${port}${LOOPBACK_CALLBACK_PATH}` }
+            : undefined,
+        );
+        return Response.json({
+          account: id,
+          url: pending.url,
+          manual: pending.manual,
+          redirectUri: pending.redirectUri,
+        });
+      }
+      if (req.method === "POST" && action === "login/complete") {
+        const body = await readJsonBody(req);
+        const code = typeof body.code === "string" ? body.code : "";
+        if (!code.trim()) return jsonError("code is required", 400);
+        try {
+          const result = await completeAccountLogin(account, code);
+          return Response.json({
+            account: id,
+            connected: true,
+            expiresAt: result.expiresAt,
+            identity: result.identity,
+          });
+        } catch (err) {
+          // Nothing was written: the tokens are held so the operator can still
+          // say "yes, I meant it" without another browser round trip.
+          if (err instanceof DuplicateLoginError) {
+            return Response.json(
+              {
+                error: {
+                  message: err.message,
+                  type: "invalid_request_error",
+                  code: err.code,
+                },
+                duplicateOf: err.duplicateOf,
+                email: err.email,
+                canConfirm: true,
+              },
+              { status: err.status },
+            );
+          }
+          throw err;
+        }
+      }
+
+      // Commit a login that was held back as a duplicate.
+      if (req.method === "POST" && action === "login/confirm") {
+        const result = confirmHeldLogin(account);
+        return Response.json({
+          account: id,
+          connected: true,
+          expiresAt: result.expiresAt,
+          identity: result.identity,
+          duplicateOf: accountsSharingLogin(id),
+        });
+      }
+
+      if (req.method === "POST" && action === "login/discard") {
+        discardHeldLogin(id);
+        return Response.json({ discarded: id });
+      }
+    }
+
+    if (sessionMatch && req.method === "POST") {
+      const conversationKey = decodeURIComponent(sessionMatch[1]);
+      const body = await readJsonBody(req);
+      const target = findAccount(
+        typeof body.account === "string" ? body.account : "",
+      );
+      if (!target) return jsonError("unknown account", 404);
+      if (!getSessionBinding(conversationKey)) {
+        return jsonError(`unknown session "${conversationKey}"`, 404);
+      }
+      // Same rule as an in-band switch: the resume target belongs to the old
+      // account's Claude home and must not follow the session across.
+      bindConversationAccount(conversationKey, target.id, target.label);
+      return Response.json({ conversationKey, account: target.id });
+    }
+  } catch (err) {
+    if (err instanceof AccountError) return jsonError(err.message, err.status);
+    const message = err instanceof Error ? err.message : String(err);
+    log.warn("[opencode-claude] panel request failed", { path, message });
+    return jsonError(message, 400);
+  }
+
+  return null;
+}
+
 async function handleRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
+
+  const panelResponse = await handlePanelRoutes(req, url);
+  if (panelResponse) return panelResponse;
 
   if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) {
     const account = resolveAccount(url.searchParams.get("account"));
@@ -301,6 +830,7 @@ async function handleRequest(req: Request): Promise<Response> {
       account: account.id,
       accountLabel: account.label,
       accounts: getAccounts().map((a) => a.id),
+      quota: formatQuotaSummary(getAccountQuota(account.id)),
       rateLimit: {
         limited: rateLimit.limited,
         ...(rateLimit.resetsAtISO ? { resetsAt: rateLimit.resetsAtISO } : {}),
@@ -332,53 +862,6 @@ async function handleRequest(req: Request): Promise<Response> {
       ...snapshot,
       accounts: getAllRateLimitSnapshots(),
     });
-  }
-
-  // Which account is each session running on? Read-only, no secrets — this is
-  // the answer to "who is this session billed to" without opening a store.
-  if (
-    req.method === "GET" &&
-    (url.pathname === "/accounts" || url.pathname === "/v1/accounts")
-  ) {
-    const bindings = listSessionBindings();
-    const defaultId = getDefaultAccount().id;
-    return Response.json({
-      object: "list",
-      multiAccount: isMultiAccount(),
-      data: getAccounts().map((account) => ({
-        id: account.id,
-        label: account.label,
-        default: account.id === defaultId,
-        configDir: accountConfigDir(account),
-        authenticated: credentialProbe(account),
-        sessions: bindings.filter((b) => (b.accountId ?? defaultId) === account.id)
-          .length,
-        rateLimit: getRateLimitSnapshot(Date.now(), account.id),
-      })),
-    });
-  }
-
-  if (
-    req.method === "GET" &&
-    (url.pathname === "/sessions" || url.pathname === "/v1/sessions")
-  ) {
-    const defaultId = getDefaultAccount().id;
-    const wanted = url.searchParams.get("account")?.trim().toLowerCase();
-    const data = listSessionBindings()
-      .map((binding) => {
-        const accountId = binding.accountId ?? defaultId;
-        return {
-          conversationKey: binding.conversationKey,
-          account: accountId,
-          accountLabel: binding.accountLabel ?? resolveAccount(accountId).label,
-          modelId: binding.modelId,
-          cwd: binding.cwd,
-          claudeSessionId: binding.foreignSessionId || null,
-          updatedAt: binding.updatedAt,
-        };
-      })
-      .filter((entry) => !wanted || entry.account === wanted);
-    return Response.json({ object: "list", data });
   }
 
   if (req.method === "GET" && url.pathname === "/v1/models") {
@@ -645,6 +1128,7 @@ async function handleChatCompletions(
           kind: metaKind,
           accessToken,
           model: "claude-haiku-4-5",
+          accountId: account.id,
         });
         content = result.text;
         usage = result.usage;
@@ -786,10 +1270,11 @@ async function handleChatCompletions(
       account: account.id,
       retryAfterSeconds: gate.retryAfterSeconds,
     });
+    const gateSummary = formatQuotaSummary(getAccountQuota(account.id));
     return Response.json(
       {
         error: {
-          message: gate.message,
+          message: gateSummary ? `${gate.message} · ${gateSummary}` : gate.message,
           type: "rate_limit_error",
           code: "claude_session_limit",
           ...(gate.resetsAt !== undefined
@@ -1194,6 +1679,10 @@ async function collectTurnResponse(
     return failureResponse(errorText, bridge.conversationKey, bridge.accountId);
   }
 
+  // Usage arrives once per completed Claude turn (the SDK result event), so
+  // parked tool segments of the same turn do not inflate the counters.
+  if (usage) recordTurnUsage(bridge.accountId, usage);
+
   return Response.json({
     id: completionId,
     object: "chat.completion",
@@ -1561,12 +2050,20 @@ function streamOpenAIResponse(
         choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
         ...(usage ? { usage } : {}),
       });
+      // Same rule as the buffered path: only a turn that reported usage is a
+      // completed turn, so parked tool segments are not counted twice.
+      if (usage) recordTurnUsage(bridge.accountId, usage);
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       controller.close();
     },
   });
 
-  return new Response(readable, { headers: SSE_HEADERS });
+  return new Response(readable, {
+    headers: {
+      ...SSE_HEADERS,
+      ...(bridge.accountId ? { [ACCOUNT_HEADER]: bridge.accountId } : {}),
+    },
+  });
 }
 
 type MappedEvent =
@@ -1618,8 +2115,18 @@ function mapSdkEvent(event: unknown, accountId?: string): MappedEvent {
         ? (e.rate_limit_info as Record<string, unknown>)
         : undefined;
     const state = recordRateLimitInfo(rawInfo, accountId);
+    // Keep the "how much is left" view fresh for free during ordinary turns.
+    // The event carries one window, so this merges rather than replaces.
+    mergeSdkRateLimitEvent(accountId, rawInfo);
     const note = maybeRateLimitNote(state, rawInfo, accountId);
-    return note ? { kind: "reasoning", text: note } : { kind: "ignore" };
+    if (!note) return { kind: "ignore" };
+    // Say what is LEFT, in the session itself, across both windows — the
+    // number the operator acts on, without opening the panel.
+    const summary = formatQuotaSummary(getAccountQuota(accountId));
+    return {
+      kind: "reasoning",
+      text: summary ? `${note.replace(/\n$/, "")} · ${summary}\n` : note,
+    };
   }
 
   // Auto-compact boundary — surface as a short reasoning note for the UI.

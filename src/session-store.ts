@@ -60,6 +60,18 @@ export function getSessionBinding(
   return readStore()[conversationKey] ?? null;
 }
 
+/** Repoint every session bound to an old account id (see renameAccount). */
+export function renameBoundAccount(oldId: string, newId: string, newLabel: string): void {
+  const store = readStore();
+  let touched = false;
+  for (const [key, binding] of Object.entries(store)) {
+    if (binding.accountId !== oldId) continue;
+    store[key] = { ...binding, accountId: newId, accountLabel: newLabel };
+    touched = true;
+  }
+  if (touched) writeStore(store);
+}
+
 /** Every stored binding, newest first. Backs the read-only `/v1/sessions` view. */
 export function listSessionBindings(): ClaudeSessionBinding[] {
   return Object.values(readStore()).sort(
