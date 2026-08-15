@@ -114,6 +114,76 @@ Model catalog: aliases `fable` / `opus` / `sonnet` / `haiku` plus pinned ids.
 Effort selection is encoded in `x-opencode-claude-effort` so the proxy passes the
 exact `effort` (+ adaptive thinking) into the Agent SDK.
 
+### Multiple Claude accounts
+
+One OpenCode server can drive several Claude subscriptions at once, with each
+session pinned to one of them: this chat runs on `work`, that one on
+`personal`. Each account is a `CLAUDE_CONFIG_DIR` — a self-contained Claude CLI
+home with its own credentials, transcripts and settings.
+
+Sign each account in once:
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-work     claude auth login
+CLAUDE_CONFIG_DIR=~/.claude-personal claude auth login
+```
+
+Declare them in `opencode.json`:
+
+```json
+{
+  "plugin": [
+    ["@otto-assistant/opencode-claude", {
+      "accounts": [
+        { "id": "work", "label": "Work", "configDir": "~/.claude-work", "default": true },
+        { "id": "personal", "label": "Personal", "configDir": "~/.claude-personal" }
+      ]
+    }]
+  ]
+}
+```
+
+`OPENCODE_CLAUDE_ACCOUNTS` (JSON, or `work:Work:~/.claude-work,personal:…`) and
+`~/.local/share/opencode-claude/accounts.json` work too. Declare nothing and the
+plugin behaves exactly as it always has — single subscription, no renames.
+
+**Picking an account.** The model catalog gains one entry per account. The
+default account keeps the bare ids (`opus`), the others are suffixed
+(`opus@personal`), and every name carries its label — `Opus 5 · Personal` — so
+the picker and the session header say which subscription is in play.
+
+**Staying on it.** The first turn binds the session to that account and the
+binding sticks: later turns keep the same subscription even when the request
+carries no account of its own. Choosing a model from another account moves the
+session and drops the resume target — the Claude transcript lives in the other
+account's home and must not be resumed across accounts. Generated session
+titles are prefixed with the account (`[work] Fix the proxy`), which is what
+makes the binding visible in a session list; `OPENCODE_CLAUDE_ACCOUNT_TITLE_TAG=0`
+turns that off.
+
+**Seeing it.**
+
+- `GET /v1/accounts` → every account with `authenticated`, `configDir`, its own
+  rate-limit snapshot and how many sessions are bound to it.
+- `GET /v1/sessions` → each conversation with the account it runs on (filter
+  with `?account=work`).
+- `GET /v1/rate-limit?account=work` → one account's counter; without the
+  parameter you also get an `accounts` map with all of them.
+- Every response carries `x-opencode-claude-account`.
+
+**Why config dirs and not N token sets held by the plugin.** Anthropic rotates
+the refresh token on every use, and a chain with two owners gets the whole grant
+revoked for replay. Giving each account its own CLI home keeps exactly one owner
+per chain — the CLI — so accounts cannot race each other's rotation. The plugin
+reads those credentials, never rotates them; when an account's token is stale it
+spawns the CLI without `CLAUDE_CODE_OAUTH_TOKEN` and lets the CLI refresh itself.
+
+Rate limits are tracked per account, so an exhausted subscription no longer
+gates turns running on another one.
+
+> `CLAUDE_CONFIG_DIR` also relocates settings, skills and the user-level
+> `CLAUDE.md`. Symlink whatever you want shared into each account's home.
+
 ### Rate-limit counter
 
 The proxy records Agent SDK `rate_limit_event` telemetry and hard session-limit

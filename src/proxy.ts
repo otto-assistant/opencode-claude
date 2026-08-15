@@ -20,6 +20,15 @@ import {
 import { withClaudeOAuthToken } from "./auth-env.js";
 import { hasClaudeCliOAuthCredentials } from "./credentials.js";
 import {
+  accountConfigDir,
+  applyAccountEnv,
+  getAccounts,
+  getDefaultAccount,
+  isMultiAccount,
+  resolveAccount,
+  type ClaudeAccount,
+} from "./accounts.js";
+import {
   classifyClaudeFailure,
   failureHintFor,
   failureStatusFor,
@@ -29,22 +38,27 @@ import {
   decodeClaudeModelSelection,
   EFFORT_HEADER,
 } from "./model-selection.js";
-import { resolveClaudeModelId } from "./models.js";
+import { parseAccountModelId, resolveClaudeModelId } from "./models.js";
 import {
+  ACCOUNT_HEADER,
   DIRECTORY_HEADER,
   SESSION_HEADER,
   type ClaudeEffort,
 } from "./constants.js";
 import { startClaudeQuery, type ClaudeQueryHandle } from "./query.js";
 import {
+  bindConversationAccount,
   clearForeignSessionId,
   conversationKeyFromMessages,
   findClaudeSessionFile,
+  getBoundAccountId,
   getForeignSessionId,
+  listSessionBindings,
   setForeignSessionId,
 } from "./session-store.js";
 import { log } from "./log.js";
 import {
+  getAllRateLimitSnapshots,
   getRateLimitSnapshot,
   maybeRateLimitNote,
   normalizeClaudeErrorText,
@@ -101,7 +115,11 @@ const SSE_HEADERS = {
   Connection: "keep-alive",
 } as const;
 
-type TokenProvider = () => Promise<string | null>;
+/**
+ * Resolves the access token for ONE account. Multi-account setups call this
+ * once per turn with the account the session is bound to.
+ */
+type TokenProvider = (account: ClaudeAccount) => Promise<string | null>;
 
 type OpenAITool = {
   type?: string;
@@ -149,12 +167,20 @@ export function setClaudeQueryStarter(
  * Pre-flight credential probe (file reads only, no caching). Injectable for
  * smoke tests so they can simulate a host with no Claude credentials at all.
  */
-let credentialProbe: () => boolean = () => hasClaudeCliOAuthCredentials();
+let credentialProbe: (account: ClaudeAccount) => boolean = (account) =>
+  hasClaudeCliOAuthCredentials(
+    account.configDir ? { configDir: account.configDir } : undefined,
+  );
 
 export function setClaudeCredentialProbe(
-  probe: (() => boolean) | null,
+  probe: ((account: ClaudeAccount) => boolean) | null,
 ): void {
-  credentialProbe = probe ?? (() => hasClaudeCliOAuthCredentials());
+  credentialProbe =
+    probe ??
+    ((account: ClaudeAccount) =>
+      hasClaudeCliOAuthCredentials(
+        account.configDir ? { configDir: account.configDir } : undefined,
+      ));
 }
 
 export function getClaudeProxyBaseUrl(): string {
@@ -267,10 +293,14 @@ async function handleRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
 
   if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) {
-    const rateLimit = getRateLimitSnapshot();
+    const account = resolveAccount(url.searchParams.get("account"));
+    const rateLimit = getRateLimitSnapshot(Date.now(), account.id);
     return Response.json({
       ok: true,
       provider: "claude-code",
+      account: account.id,
+      accountLabel: account.label,
+      accounts: getAccounts().map((a) => a.id),
       rateLimit: {
         limited: rateLimit.limited,
         ...(rateLimit.resetsAtISO ? { resetsAt: rateLimit.resetsAtISO } : {}),
@@ -285,11 +315,70 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   // Live "when are limits back" counter for OpenChamber / OpenCode UIs.
+  // `?account=<id>` scopes it; without it, the default account's counter plus
+  // a per-account map so a UI can show every subscription at once.
   if (
     req.method === "GET" &&
     (url.pathname === "/rate-limit" || url.pathname === "/v1/rate-limit")
   ) {
-    return Response.json(getRateLimitSnapshot());
+    const requested = url.searchParams.get("account");
+    const account = resolveAccount(requested);
+    const snapshot = getRateLimitSnapshot(Date.now(), account.id);
+    if (requested || !isMultiAccount()) {
+      return Response.json({ account: account.id, ...snapshot });
+    }
+    return Response.json({
+      account: account.id,
+      ...snapshot,
+      accounts: getAllRateLimitSnapshots(),
+    });
+  }
+
+  // Which account is each session running on? Read-only, no secrets — this is
+  // the answer to "who is this session billed to" without opening a store.
+  if (
+    req.method === "GET" &&
+    (url.pathname === "/accounts" || url.pathname === "/v1/accounts")
+  ) {
+    const bindings = listSessionBindings();
+    const defaultId = getDefaultAccount().id;
+    return Response.json({
+      object: "list",
+      multiAccount: isMultiAccount(),
+      data: getAccounts().map((account) => ({
+        id: account.id,
+        label: account.label,
+        default: account.id === defaultId,
+        configDir: accountConfigDir(account),
+        authenticated: credentialProbe(account),
+        sessions: bindings.filter((b) => (b.accountId ?? defaultId) === account.id)
+          .length,
+        rateLimit: getRateLimitSnapshot(Date.now(), account.id),
+      })),
+    });
+  }
+
+  if (
+    req.method === "GET" &&
+    (url.pathname === "/sessions" || url.pathname === "/v1/sessions")
+  ) {
+    const defaultId = getDefaultAccount().id;
+    const wanted = url.searchParams.get("account")?.trim().toLowerCase();
+    const data = listSessionBindings()
+      .map((binding) => {
+        const accountId = binding.accountId ?? defaultId;
+        return {
+          conversationKey: binding.conversationKey,
+          account: accountId,
+          accountLabel: binding.accountLabel ?? resolveAccount(accountId).label,
+          modelId: binding.modelId,
+          cwd: binding.cwd,
+          claudeSessionId: binding.foreignSessionId || null,
+          updatedAt: binding.updatedAt,
+        };
+      })
+      .filter((entry) => !wanted || entry.account === wanted);
+    return Response.json({ object: "list", data });
   }
 
   if (req.method === "GET" && url.pathname === "/v1/models") {
@@ -335,14 +424,76 @@ function collectToolResults(
 function selectionFromRequest(
   req: Request,
   body: ChatCompletionRequest,
-): { modelId: string; effort?: ClaudeEffort } {
+): { modelId: string; effort?: ClaudeEffort; account?: string } {
   const header = req.headers.get(EFFORT_HEADER);
   const decoded = decodeClaudeModelSelection(header);
-  const modelId =
+  const rawModel =
     decoded?.modelId ||
     (typeof body.model === "string" ? body.model.replace(/^claude-code\//, "") : "sonnet");
+  // The account can arrive three ways: the encoded selection (OpenCode host),
+  // an explicit header (direct callers), or baked into the model id itself
+  // (`opus@work`) when the request bypassed the chat.headers hook.
+  const { baseModelId, accountId } = parseAccountModelId(rawModel);
+  const account =
+    decoded?.account ||
+    req.headers.get(ACCOUNT_HEADER)?.trim() ||
+    accountId ||
+    undefined;
   const effort = decoded?.effort;
-  return { modelId, ...(effort ? { effort } : {}) };
+  return {
+    modelId: baseModelId || rawModel,
+    ...(effort ? { effort } : {}),
+    ...(account ? { account } : {}),
+  };
+}
+
+/**
+ * Which subscription runs this turn.
+ *
+ * Explicit beats sticky: picking `opus@work` moves the session to `work`.
+ * Otherwise the session stays on whatever it was bound to, so a conversation
+ * never silently hops subscriptions mid-way (which would also strand its
+ * Claude transcript in another account's home).
+ */
+function resolveTurnAccount(
+  conversationKey: string,
+  requested?: string,
+): { account: ClaudeAccount; switched: boolean } {
+  const bound = getBoundAccountId(conversationKey);
+  if (requested) {
+    const account = resolveAccount(requested);
+    return { account, switched: Boolean(bound) && bound !== account.id };
+  }
+  if (bound) return { account: resolveAccount(bound), switched: false };
+  return { account: getDefaultAccount(), switched: false };
+}
+
+/** Env flag to turn the `[account]` title prefix off. */
+function titleTagDisabled(): boolean {
+  const flag = (process.env.OPENCODE_CLAUDE_ACCOUNT_TITLE_TAG ?? "").toLowerCase();
+  return flag === "0" || flag === "false" || flag === "off";
+}
+
+/**
+ * Prefix a generated session title with its account: "[work] Fix the proxy".
+ * No-op for single-account setups, and idempotent so a re-titled session does
+ * not accumulate tags.
+ */
+export function withAccountTitleTag(
+  title: string,
+  account: ClaudeAccount,
+): string {
+  if (!isMultiAccount() || titleTagDisabled()) return title;
+  const clean = title.trim();
+  const tag = `[${account.id}]`;
+  if (clean.toLowerCase().startsWith(`${tag.toLowerCase()} `)) return clean;
+  // Strip a tag from another account before applying this one (session moved).
+  const foreign = /^\[([a-z0-9._-]{1,32})\]\s+/i.exec(clean);
+  const bare =
+    foreign && getAccounts().some((a) => a.id === foreign[1].toLowerCase())
+      ? clean.slice(foreign[0].length)
+      : clean;
+  return `${tag} ${bare}`;
 }
 
 async function handleChatCompletions(
@@ -352,12 +503,29 @@ async function handleChatCompletions(
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const metaKind = detectMetaRequestKind(messages);
   const sessionHeader = req.headers.get(SESSION_HEADER);
-  const conversationKey =
-    requestKeyNamespace(metaKind) +
-    (sessionHeader || conversationKeyFromMessages(messages));
+  /** Identity of the chat itself, shared by the turn and its meta requests. */
+  const sessionKey = sessionHeader || conversationKeyFromMessages(messages);
+  const conversationKey = requestKeyNamespace(metaKind) + sessionKey;
   const selection = selectionFromRequest(req, body);
   const model = resolveClaudeModelId(selection.modelId);
   const stream = body.stream !== false;
+
+  // Bind this conversation to a Claude subscription before anything else: the
+  // account decides which credentials, which transcripts and which rate-limit
+  // window the rest of this turn touches.
+  // Keyed on the chat, not on the namespaced request key, so a title/summary
+  // request bills the same subscription as the turn that triggered it.
+  const { account, switched } = resolveTurnAccount(sessionKey, selection.account);
+  if (switched) {
+    log.info("[opencode-claude] session moved to another Claude account", {
+      conversationKey: sessionKey,
+      account: account.id,
+    });
+  }
+  if (!metaKind && isMultiAccount()) {
+    bindConversationAccount(sessionKey, account.id, account.label);
+  }
+  const accountConfig = account.configDir ? accountConfigDir(account) : undefined;
 
   // Resume a parked bridge if OpenCode returned tool results.
   const toolResults = collectToolResults(messages);
@@ -420,6 +588,7 @@ async function handleChatCompletions(
   log.info("[opencode-claude] chat completions", {
     conversationKey,
     sessionHeader,
+    account: account.id,
     metaKind,
     toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
     messageCount: messages.length,
@@ -427,7 +596,7 @@ async function handleChatCompletions(
     bridgePending: existing?.pendingTools.size ?? 0,
   });
 
-  const accessToken = getAccessToken ? await getAccessToken() : null;
+  const accessToken = getAccessToken ? await getAccessToken(account) : null;
 
   // Title / summary: fast Anthropic Messages API path (not Agent SDK).
   // OpenCode fires these in parallel with the main turn and disposes the
@@ -500,6 +669,14 @@ async function handleChatCompletions(
       }
     }
 
+    // Tag generated titles with the account. OpenChamber renders the title in
+    // the session list, so this is what makes "this session runs on work, that
+    // one on personal" readable without opening anything. Only in
+    // multi-account mode, and only for titles — summaries stay clean.
+    if (metaKind === "title") {
+      content = withAccountTitleTag(content, account);
+    }
+
     return metaChatCompletionResponse({
       stream,
       id: completionId,
@@ -515,20 +692,24 @@ async function handleChatCompletions(
   // 401 — nothing is sent to Anthropic. When CLI credentials exist we still
   // proceed WITHOUT injecting an env token so the CLI can auto-refresh its
   // own credentials file.
-  if (!accessToken && !credentialProbe()) {
+  if (!accessToken && !credentialProbe(account)) {
     log.warn("[opencode-claude] no Claude credentials; failing fast", {
       conversationKey,
+      account: account.id,
     });
     return Response.json(
       {
         error: {
-          message:
-            "Claude Code is not authenticated. Sign in via the plugin OAuth flow or `claude auth login` — no request was sent to Anthropic.",
+          message: isMultiAccount()
+            ? `Claude account "${account.label}" is not authenticated. Run \`CLAUDE_CONFIG_DIR=${accountConfigDir(
+                account,
+              )} claude auth login\` — no request was sent to Anthropic.`
+            : "Claude Code is not authenticated. Sign in via the plugin OAuth flow or `claude auth login` — no request was sent to Anthropic.",
           type: "authentication_error",
           code: "claude_auth_required",
         },
       },
-      { status: 401 },
+      { status: 401, headers: { [ACCOUNT_HEADER]: account.id } },
     );
   }
 
@@ -539,6 +720,11 @@ async function handleChatCompletions(
   if (!accessToken) {
     delete env.CLAUDE_CODE_OAUTH_TOKEN;
   }
+
+  // Point the spawned CLI at this account's Claude home. Its own credentials
+  // file lives there, so the CLI keeps ownership of its refresh chain — the
+  // one thing that must never be shared between accounts.
+  const childEnv = applyAccountEnv(account, env);
 
   const openCodeTools = Array.isArray(body.tools) ? body.tools : [];
   const requestDirectory = req.headers.get(DIRECTORY_HEADER)?.trim();
@@ -591,10 +777,13 @@ async function handleChatCompletions(
   // Retry-After instead of spawning a doomed Agent SDK turn (which would
   // surface as a fake "completed" assistant message and burn time).
   // Placed after input validation so malformed requests still get 400.
-  const gate = rateLimitGate();
+  // Scoped to this account: limits are per subscription, so an exhausted
+  // account must not gate turns running on a different one.
+  const gate = rateLimitGate(Date.now(), account.id);
   if (gate.blocked) {
     log.warn("[opencode-claude] rate-limit gate blocked a turn", {
       conversationKey,
+      account: account.id,
       retryAfterSeconds: gate.retryAfterSeconds,
     });
     return Response.json(
@@ -613,6 +802,7 @@ async function handleChatCompletions(
         status: 429,
         headers: {
           "Retry-After": String(gate.retryAfterSeconds),
+          [ACCOUNT_HEADER]: account.id,
           ...(gate.resetsAt !== undefined
             ? { "x-claude-rate-limit-reset": new Date(gate.resetsAt).toISOString() }
             : {}),
@@ -622,7 +812,7 @@ async function handleChatCompletions(
   }
 
   let resume = getForeignSessionId(conversationKey);
-  if (resume && !findClaudeSessionFile(resume)) {
+  if (resume && !findClaudeSessionFile(resume, accountConfig)) {
     // The claude CLI resumes by looking the session up on disk. A missing
     // transcript (cleanup, different machine, pruned projects dir) would
     // silently start a context-free session — drop the stale binding and
@@ -693,7 +883,7 @@ async function handleChatCompletions(
     model,
     resume,
     effort: selection.effort,
-    env,
+    env: childEnv,
     mcpServers,
     autoCompactEnabled: true,
     tools: bridgeOpenCodeTools ? [] : undefined,
@@ -735,6 +925,7 @@ async function handleChatCompletions(
   const bridge: ParkedBridge = {
     id: bridgeId,
     conversationKey,
+    accountId: account.id,
     handle,
     pendingTools,
     createdAt: Date.now(),
@@ -781,6 +972,12 @@ async function handleChatCompletions(
           setForeignSessionId(conversationKey, sessionId, {
             modelId: model,
             cwd,
+            // Only stamp the account when there is a choice to record. Doing it
+            // unconditionally would keep a stub entry alive for every
+            // single-account conversation, and stubs resurface as `resume: ""`.
+            ...(isMultiAccount()
+              ? { accountId: account.id, accountLabel: account.label }
+              : {}),
           });
         }
         yield event;
@@ -807,7 +1004,7 @@ async function handleChatCompletions(
   if (stream) {
     const probe = await probeTurnEvents(consumeStream());
     if (probe.status === "failed") {
-      return failureResponse(probe.errorText, conversationKey);
+      return failureResponse(probe.errorText, conversationKey, account.id);
     }
     return streamOpenAIResponse(probe.replay, body.model || model, bridge);
   }
@@ -967,7 +1164,7 @@ async function collectTurnResponse(
 
   try {
     for await (const event of events) {
-      const mapped = mapSdkEvent(event);
+      const mapped = mapSdkEvent(event, bridge.accountId);
       if (mapped.kind === "park") {
         toolCalls.push(...mapped.tools);
         sawContent = true;
@@ -988,13 +1185,13 @@ async function collectTurnResponse(
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    recordRateLimitErrorText(message);
+    recordRateLimitErrorText(message, bridge.accountId);
     forgetDeadSession(bridge.conversationKey, message);
     noteError(message);
   }
 
   if (!sawContent && errorText) {
-    return failureResponse(errorText, bridge.conversationKey);
+    return failureResponse(errorText, bridge.conversationKey, bridge.accountId);
   }
 
   return Response.json({
@@ -1141,18 +1338,20 @@ async function probeTurnEvents(
 function failureResponse(
   errorText: string,
   conversationKey: string,
+  accountId?: string,
 ): Response {
-  recordRateLimitErrorText(errorText);
+  recordRateLimitErrorText(errorText, accountId);
   forgetDeadSession(conversationKey, errorText);
   const kind = classifyClaudeFailure(errorText);
   log.warn("[opencode-claude] turn failed fast", {
     kind,
     conversationKey,
+    ...(accountId ? { account: accountId } : {}),
     message: errorText.slice(0, 300),
   });
 
   if (kind === "rate_limit") {
-    const snap = getRateLimitSnapshot();
+    const snap = getRateLimitSnapshot(Date.now(), accountId);
     const until = snap.limitedUntil ?? snap.resetsAt;
     const retryAfterSeconds =
       until !== undefined
@@ -1256,7 +1455,7 @@ function streamOpenAIResponse(
 
       try {
         for await (const event of events) {
-          const mapped = mapSdkEvent(event);
+          const mapped = mapSdkEvent(event, bridge.accountId);
           if (mapped.kind === "park") {
             finishReason = "tool_calls";
             for (let i = 0; i < mapped.tools.length; i++) {
@@ -1343,7 +1542,7 @@ function streamOpenAIResponse(
         const message = err instanceof Error ? err.message : String(err);
         // A limit/result failure typically arrives here right after the SDK
         // emitted the same text as a result event — dedupe via sendError.
-        recordRateLimitErrorText(message);
+        recordRateLimitErrorText(message, bridge.accountId);
         forgetDeadSession(bridge.conversationKey, message);
         log.warn("[opencode-claude] stream iterator failed", {
           conversationKey: bridge.conversationKey,
@@ -1401,7 +1600,7 @@ function forgetDeadSession(conversationKey: string, errorText: string): void {
  * `assistant` message payloads repeat the same content after partials and
  * would double-print if both were forwarded.
  */
-function mapSdkEvent(event: unknown): MappedEvent {
+function mapSdkEvent(event: unknown, accountId?: string): MappedEvent {
   if (!event || typeof event !== "object") return { kind: "ignore" };
   const e = event as Record<string, unknown>;
 
@@ -1418,8 +1617,8 @@ function mapSdkEvent(event: unknown): MappedEvent {
       e.rate_limit_info && typeof e.rate_limit_info === "object"
         ? (e.rate_limit_info as Record<string, unknown>)
         : undefined;
-    const state = recordRateLimitInfo(rawInfo);
-    const note = maybeRateLimitNote(state, rawInfo);
+    const state = recordRateLimitInfo(rawInfo, accountId);
+    const note = maybeRateLimitNote(state, rawInfo, accountId);
     return note ? { kind: "reasoning", text: note } : { kind: "ignore" };
   }
 
@@ -1472,7 +1671,7 @@ function mapSdkEvent(event: unknown): MappedEvent {
             ? e.error
             : "Claude turn failed";
       // Hard subscription limit? Record it so the gate + counter activate.
-      const limited = recordRateLimitErrorText(text);
+      const limited = recordRateLimitErrorText(text, accountId);
       let note = text;
       if (limited?.limited) {
         const until = limited.limitedUntil ?? limited.resetsAt;

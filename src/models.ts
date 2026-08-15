@@ -1,7 +1,17 @@
 /**
  * Claude Code model catalog (from OpenChamber harness registry).
  */
-import { EFFORT_LEVELS, type ClaudeEffort } from "./constants.js";
+import {
+  ACCOUNT_MODEL_SEPARATOR,
+  EFFORT_LEVELS,
+  type ClaudeEffort,
+} from "./constants.js";
+import {
+  getAccounts,
+  getDefaultAccount,
+  isMultiAccount,
+  type ClaudeAccount,
+} from "./accounts.js";
 
 export type ClaudeModel = {
   id: string;
@@ -82,17 +92,84 @@ export const LOGIN_PLACEHOLDER_MODELS: ClaudeModel[] = [
 ];
 
 export function isLoginPlaceholderModel(id: string): boolean {
-  return id === "login";
+  return id === "login" || id.startsWith(`login${ACCOUNT_MODEL_SEPARATOR}`);
 }
 
+/**
+ * Split `opus@work` into its parts. A bare id carries no account, which means
+ * "whatever the session is already bound to, else the default account".
+ */
+export function parseAccountModelId(modelId: string): {
+  baseModelId: string;
+  accountId: string | null;
+} {
+  const raw = (modelId || "").trim();
+  const at = raw.lastIndexOf(ACCOUNT_MODEL_SEPARATOR);
+  if (at <= 0 || at === raw.length - 1) {
+    return { baseModelId: raw, accountId: null };
+  }
+  return {
+    baseModelId: raw.slice(0, at),
+    accountId: raw.slice(at + 1).toLowerCase(),
+  };
+}
+
+/**
+ * Model id for an account. The default account keeps bare ids so existing
+ * sessions, pinned configs and single-account setups never see a rename.
+ */
+export function composeAccountModelId(
+  baseModelId: string,
+  account: ClaudeAccount,
+): string {
+  if (!isMultiAccount() || account.isDefault) return baseModelId;
+  return `${baseModelId}${ACCOUNT_MODEL_SEPARATOR}${account.id}`;
+}
+
+/**
+ * Catalog as OpenCode should show it.
+ *
+ * Single account: the plain catalog, unchanged. Several accounts: every model
+ * appears once per account, and each NAME carries the account label — that
+ * label is what OpenChamber prints in the model picker and in the session
+ * header, so the account a session runs on is readable at a glance.
+ */
 export function getClaudeModels(): ClaudeModel[] {
-  return CLAUDE_CODE_MODELS;
+  if (!isMultiAccount()) return CLAUDE_CODE_MODELS;
+  return getAccounts().flatMap((account) =>
+    CLAUDE_CODE_MODELS.map((model) => ({
+      ...model,
+      id: composeAccountModelId(model.id, account),
+      name: `${model.name} · ${account.label}`,
+      // resolvedId stays the real Claude model — the account rides the id.
+      ...(model.resolvedId ? { resolvedId: model.resolvedId } : {}),
+    })),
+  );
+}
+
+/** Catalog for one account, with bare ids (used to build per-account menus). */
+export function getClaudeModelsForAccount(account: ClaudeAccount): ClaudeModel[] {
+  return CLAUDE_CODE_MODELS.map((model) => ({
+    ...model,
+    id: composeAccountModelId(model.id, account),
+    name: isMultiAccount() ? `${model.name} · ${account.label}` : model.name,
+  }));
 }
 
 export function resolveClaudeModelId(modelId: string): string {
-  const match = CLAUDE_CODE_MODELS.find((m) => m.id === modelId);
-  if (!match) return modelId;
+  const { baseModelId } = parseAccountModelId(modelId);
+  const match = CLAUDE_CODE_MODELS.find((m) => m.id === baseModelId);
+  if (!match) return baseModelId || modelId;
   return match.resolvedId || match.id;
+}
+
+/**
+ * Account a model id points at. Bare ids resolve to the default account, so a
+ * config pinned before multi-account existed keeps working.
+ */
+export function accountIdFromModelId(modelId: string): string {
+  const { accountId } = parseAccountModelId(modelId);
+  return accountId ?? getDefaultAccount().id;
 }
 
 /**

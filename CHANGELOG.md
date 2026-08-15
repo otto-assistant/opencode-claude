@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- **Multiple Claude accounts, bound per session.** Declare several
+  subscriptions (`accounts` plugin option, `OPENCODE_CLAUDE_ACCOUNTS`, or
+  `accounts.json`), each backed by its own `CLAUDE_CONFIG_DIR`. The catalog
+  gains one model entry per account (`opus@personal`, named `Opus 5 · Personal`),
+  the first turn binds the session to the chosen account, and later turns stay
+  on it. Session titles are tagged `[account]` so the binding is visible in a
+  session list, and `GET /v1/accounts` / `GET /v1/sessions` expose it for
+  tooling. With no accounts declared, behaviour is unchanged.
+  - Credentials are read from each account's Claude home and never rotated by
+    the plugin: one refresh chain, one owner (the CLI), which is the only shape
+    that cannot trigger Anthropic's replay revocation.
+  - A scoped account never falls back to the ambient `~/.claude`,
+    `CLAUDE_CODE_OAUTH_TOKEN` or the macOS keychain — that would silently run
+    the turn on the wrong subscription.
+  - Rate-limit state, its 429 fast-fail gate and the stream warning dedupe are
+    now per account: an exhausted subscription no longer blocks the others.
+    Existing single-account stores are migrated on read.
+  - Resume is account-aware: transcripts are looked up in the owning account's
+    home, and moving a session to another account drops the stale resume target
+    instead of resuming a foreign conversation.
+- **Proxy idle timeout**: `Bun.serve` kept its 10-second default, which cut long
+  Agent SDK turns (notably on a cold start). Now 255s.
+
 ## 0.9.1
 
 - **Fail-fast on dead turns**: a Claude turn that dies before producing any
