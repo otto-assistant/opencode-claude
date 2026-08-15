@@ -26,6 +26,9 @@ import {
 } from "./auth-login.js";
 import {
   ACCOUNT_HEADER,
+  accountIdFromProviderId,
+  isClaudeProviderId,
+  providerIdForAccount,
   DEFAULT_MODEL_ID,
   DIRECTORY_HEADER,
   EFFORT_HEADER,
@@ -50,6 +53,7 @@ import {
   buildConfigVariants,
   buildEffortVariants,
   getClaudeModels,
+  getClaudeModelsForAccount,
   LOGIN_PLACEHOLDER_MODELS,
   type ClaudeModel,
 } from "./models.js";
@@ -208,6 +212,64 @@ function buildClaudeProviderModels(
   return providerModels;
 }
 
+/**
+ * Declare one provider per account.
+ *
+ * The host groups the model picker by provider, so a single provider carrying
+ * every account's models produces one flat list — 24 rows for four accounts,
+ * each row repeating the account label. One provider per account turns that
+ * into four labelled groups of six, which is how an operator actually reads it.
+ *
+ * The default account keeps the bare `claude-code` id, so nothing renames for
+ * single-account installs or for sessions already pinned to it.
+ */
+function ensureAccountProviderConfigs(config: Record<string, any>): void {
+  if (!config.provider || typeof config.provider !== "object") {
+    config.provider = {};
+  }
+  for (const account of getAccounts()) {
+    if (account.isDefault) continue; // handled by ensureClaudeProviderConfig
+    const id = providerIdForAccount(account.id, false);
+    const existing = config.provider[id] ?? {};
+    const port = getProxyPort();
+    const baseURL = port ? `http://127.0.0.1:${port}/v1` : undefined;
+    config.provider[id] = {
+      ...existing,
+      name: `Claude Code · ${account.label}`,
+      npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
+      options: {
+        apiKey: "claude-code-proxy",
+        includeUsage: true,
+        ...(existing.options && typeof existing.options === "object"
+          ? existing.options
+          : {}),
+        ...(baseURL ? { baseURL } : {}),
+      },
+      models: {
+        ...Object.fromEntries(
+          getClaudeModelsForAccount(account).map((model) => [
+            model.id,
+            buildConfigModelEntry(model),
+          ]),
+        ),
+        ...(existing.models && typeof existing.models === "object"
+          ? existing.models
+          : {}),
+      },
+    };
+    // `enabled_providers` is an allowlist: a provider missing from it is
+    // filtered out of the picker entirely, however well it is configured.
+    if (Array.isArray(config.enabled_providers)) {
+      if (
+        config.enabled_providers.includes(PROVIDER_ID) &&
+        !config.enabled_providers.includes(id)
+      ) {
+        config.enabled_providers.push(id);
+      }
+    }
+  }
+}
+
 function ensureClaudeProviderConfig(
   config: Record<string, any>,
   models: ClaudeModel[],
@@ -239,12 +301,22 @@ function ensureClaudeProviderConfig(
     };
   }
 
+  // In multi-account mode every provider names its account, this one included:
+  // a group headed by a bare "Claude Code" beside three labelled ones reads as
+  // the odd one out rather than as the default account. A name the operator
+  // genuinely customised is still respected.
+  const defaultAccountLabel = getDefaultAccount().label;
+  const customName =
+    typeof existing.name === "string" &&
+    existing.name.trim() &&
+    existing.name.trim() !== "Claude Code"
+      ? existing.name.trim()
+      : "";
   config.provider[PROVIDER_ID] = {
     ...existing,
     name:
-      typeof existing.name === "string" && existing.name.trim()
-        ? existing.name
-        : "Claude Code",
+      customName ||
+      (isMultiAccount() ? `Claude Code · ${defaultAccountLabel}` : "Claude Code"),
     npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
     options: {
       apiKey: "claude-code-proxy",
@@ -441,7 +513,11 @@ async function loadClaudeRuntime(
       (a) => a.configDir && resolveScopedAccountToken(a) !== null,
     );
 
-  const models = anyAccountReady ? getClaudeModels() : LOGIN_PLACEHOLDER_MODELS;
+  const models = !anyAccountReady
+    ? LOGIN_PLACEHOLDER_MODELS
+    : isMultiAccount()
+      ? getClaudeModelsForAccount(getDefaultAccount())
+      : getClaudeModels();
 
   if (!anyAccountReady) {
     // Still seed placeholder models + a proxy so the provider stays visible.
@@ -521,13 +597,18 @@ export const ClaudeCodePlugin: Plugin = async (
       const hasScopedAccount = getAccounts().some(
         (a) => a.configDir && resolveScopedAccountToken(a) !== null,
       );
-      const models =
+      const ready =
         detection.loggedIn ||
         detection.status === "ready" ||
         hasStoredAuth ||
-        hasScopedAccount
-          ? getClaudeModels()
-          : LOGIN_PLACEHOLDER_MODELS;
+        hasScopedAccount;
+      // With one provider per account, `claude-code` carries only the default
+      // account's models — the others live in their own providers.
+      const models = !ready
+        ? LOGIN_PLACEHOLDER_MODELS
+        : isMultiAccount()
+          ? getClaudeModelsForAccount(getDefaultAccount())
+          : getClaudeModels();
 
       // Bind first (ephemeral port by default), then seed provider baseURL so
       // OpenCode's static config matches the live listener for this process.
@@ -568,10 +649,13 @@ export const ClaudeCodePlugin: Plugin = async (
       }
 
       ensureClaudeProviderConfig(config as Record<string, any>, models);
+      if (isMultiAccount()) {
+        ensureAccountProviderConfigs(config as Record<string, any>);
+      }
     },
 
     "chat.headers": async (hookInput, output) => {
-      if (hookInput.model.providerID !== PROVIDER_ID) return;
+      if (!isClaudeProviderId(hookInput.model.providerID)) return;
       const messageModel = hookInput.message.model as {
         variant?: unknown;
       };
@@ -583,10 +667,15 @@ export const ClaudeCodePlugin: Plugin = async (
       // splits it so the proxy gets both without a second switch to keep in
       // sync with the picker.
       const selected = resolveClaudeModelSelection(hookInput.model.id, variant);
-      output.headers[EFFORT_HEADER] = encodeClaudeModelSelection(selected);
-      if (selected.account) {
-        output.headers[ACCOUNT_HEADER] = selected.account;
+      // With one provider per account the provider IS the account; the
+      // `model@account` form still works for anything pinned to it earlier.
+      const account =
+        accountIdFromProviderId(hookInput.model.providerID) ?? selected.account;
+      if (account) {
+        selected.account = account;
+        output.headers[ACCOUNT_HEADER] = account;
       }
+      output.headers[EFFORT_HEADER] = encodeClaudeModelSelection(selected);
       // The proxy runs in the long-lived OpenCode server process, whose cwd is
       // commonly the service account home (for example /home/ubuntu), not the
       // project attached to this plugin instance. Carry the authoritative
@@ -600,7 +689,7 @@ export const ClaudeCodePlugin: Plugin = async (
     },
 
     "chat.params": async (hookInput, output) => {
-      if (hookInput.model.providerID !== PROVIDER_ID) return;
+      if (!isClaudeProviderId(hookInput.model.providerID)) return;
       delete output.options.reasoningEffort;
     },
 

@@ -33,6 +33,32 @@ export const OAUTH_SCOPES = [
 ].join(" ");
 
 export const PROVIDER_ID = "claude-code";
+
+/**
+ * Provider id for an account. The default account keeps the bare
+ * `claude-code`, so existing sessions, pinned configs and single-account
+ * installs never see a rename.
+ *
+ * One provider per account rather than one provider with N×models: the host
+ * groups the picker by provider, so this turns a flat list of 24 entries into
+ * four groups of six, each headed by the account it spends.
+ */
+export function providerIdForAccount(accountId: string, isDefault: boolean): string {
+  return isDefault ? PROVIDER_ID : `${PROVIDER_ID}-${accountId}`;
+}
+
+/** Account an account-scoped provider id belongs to, or null if not ours. */
+export function accountIdFromProviderId(providerId: string): string | null {
+  if (providerId === PROVIDER_ID) return null;
+  return providerId.startsWith(`${PROVIDER_ID}-`)
+    ? providerId.slice(PROVIDER_ID.length + 1)
+    : null;
+}
+
+/** True for `claude-code` and every `claude-code-<account>`. */
+export function isClaudeProviderId(providerId: string): boolean {
+  return providerId === PROVIDER_ID || providerId.startsWith(`${PROVIDER_ID}-`);
+}
 export const DEFAULT_MODEL_ID = "sonnet";
 export const OPENAI_COMPATIBLE_NPM = "@ai-sdk/openai-compatible";
 

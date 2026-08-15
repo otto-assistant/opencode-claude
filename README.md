@@ -213,8 +213,16 @@ works too. Declared accounts and panel-added ones merge, the file winning on id
 conflicts. Declare nothing and the plugin behaves exactly as it always has —
 single subscription, no renames, no panel-driven changes to your setup.
 
-**Picking an account.** The model catalog gains one entry per account. The
-default account keeps the bare ids (`opus`), the others are suffixed
+**Picking an account.** Each account gets **its own provider** —
+`Claude Code · Work`, `Claude Code · Personal` — because the host groups the
+model picker by provider. Four accounts become four labelled groups of six
+rather than one flat list of twenty-four rows each repeating the account name.
+The default account keeps the bare `claude-code` provider id, so nothing
+renames for single-account installs.
+
+The `model@account` form still resolves, for anything pinned before this. The
+old flat catalog described below applies when a single provider is in play:
+the default account keeps the bare ids (`opus`), the others are suffixed
 (`opus@personal`), and every name carries its label — `Opus 5 · Personal` — so
 the picker and the session header say which subscription is in play.
 

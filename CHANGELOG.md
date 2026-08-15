@@ -15,6 +15,15 @@
   - Connecting an account writes CLI-format credentials into that account's
     Claude home; from the first turn the spawned CLI owns and rotates that
     chain. The handoff is one-directional, so there is never a second owner.
+- **One provider per account.** The host groups the model picker by provider, so
+  a single provider carrying every account's models produced one flat list —
+  twenty-four rows for four accounts, each repeating the account label. Each
+  account now declares its own provider (`Claude Code · Personal`), giving
+  labelled groups of six. The account is taken from the provider the model was
+  picked from; `model@account` still resolves for anything pinned earlier, and
+  the default account keeps the bare `claude-code` id so single-account installs
+  see no rename. Account providers are also added to `enabled_providers`, which
+  is an allowlist that would otherwise filter them out.
 - **Account changes reach the model picker without a restart.** OpenCode builds
   its provider catalog once and caches it, and the account label lives inside
   the model name — so a rename or a new account stayed invisible until the

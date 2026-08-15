@@ -1319,6 +1319,7 @@ async function main() {
     } = await import("../src/accounts.ts");
     const {
       getClaudeModels: accountModels,
+      getClaudeModelsForAccount,
       parseAccountModelId,
       composeAccountModelId,
       resolveClaudeModelId: resolveWithAccount,
@@ -1383,6 +1384,29 @@ async function main() {
         .find((m) => m.id === "opus@personal")
         ?.name.includes("Personal"),
       "the account label rides the model name into the picker",
+    );
+
+    // One provider per account: the host groups the picker by provider, so the
+    // account is the group rather than a suffix repeated on every row.
+    const {
+      providerIdForAccount,
+      accountIdFromProviderId,
+      isClaudeProviderId,
+    } = await import("../src/constants.ts");
+    assert.equal(providerIdForAccount("work", true), "claude-code",
+      "the default account keeps the bare provider id");
+    assert.equal(providerIdForAccount("personal", false), "claude-code-personal");
+    assert.equal(accountIdFromProviderId("claude-code-personal"), "personal");
+    assert.equal(accountIdFromProviderId("claude-code"), null,
+      "the bare provider means the default account");
+    assert.equal(accountIdFromProviderId("litellm-auto"), null);
+    assert.equal(isClaudeProviderId("claude-code"), true);
+    assert.equal(isClaudeProviderId("claude-code-personal"), true);
+    assert.equal(isClaudeProviderId("litellm-auto"), false);
+    // A per-account provider carries plain model ids: no suffix needed.
+    assert.deepEqual(
+      getClaudeModelsForAccount(resolveAccount("personal")).map((m) => m.id),
+      CLAUDE_CODE_MODELS.map((m) => m.id),
     );
 
     assert.deepEqual(parseAccountModelId("opus@personal"), {

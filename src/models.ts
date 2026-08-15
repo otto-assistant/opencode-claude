@@ -183,12 +183,16 @@ export function getClaudeModels(): ClaudeModel[] {
   });
 }
 
-/** Catalog for one account, with bare ids (used to build per-account menus). */
+/**
+ * Catalog for ONE account's provider: plain model ids, and names carrying only
+ * the quota — the provider group already says which account it is, so
+ * repeating the label in every row is noise.
+ */
 export function getClaudeModelsForAccount(account: ClaudeAccount): ClaudeModel[] {
+  const suffix = quotaNameSuffix(account.id);
   return CLAUDE_CODE_MODELS.map((model) => ({
     ...model,
-    id: composeAccountModelId(model.id, account),
-    name: isMultiAccount() ? `${model.name} · ${account.label}` : model.name,
+    name: `${model.name}${suffix}`,
   }));
 }
 
