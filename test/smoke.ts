@@ -5,6 +5,22 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 
 async function main() {
+  // Isolate the data dir for the run. Without this the suite reads whatever
+  // accounts the operator has configured (so "nothing configured" is not true),
+  // writes fixture sessions into their real store, and the credential-sync
+  // guards target their real $XDG_DATA_HOME/opencode/auth.json.
+  const { mkdtempSync: mkTmp, rmSync: rmTmp } = await import("node:fs");
+  const { tmpdir: osTmpdir } = await import("node:os");
+  const { join: joinTmp } = await import("node:path");
+  const suiteDataDir = mkTmp(joinTmp(osTmpdir(), "oc-claude-suite-"));
+  const prevSuiteXdg = process.env.XDG_DATA_HOME;
+  process.env.XDG_DATA_HOME = suiteDataDir;
+  const restoreSuiteEnv = () => {
+    if (prevSuiteXdg === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = prevSuiteXdg;
+    rmTmp(suiteDataDir, { recursive: true, force: true });
+  };
+
   const {
     authorizeClaudeMax,
     RefreshTokenInvalidError,
@@ -457,7 +473,13 @@ async function main() {
     const { readFileSync, unlinkSync, existsSync } = await import("node:fs");
     const { join } = await import("node:path");
     const { homedir } = await import("node:os");
-    const logPath = join(homedir(), ".local", "share", "opencode-claude", "debug.log");
+    // Mirror log.ts's own resolution — hardcoding ~/.local/share made this
+    // test read (and unlink) the operator's real debug.log.
+    const logPath = join(
+      process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"),
+      "opencode-claude",
+      "debug.log",
+    );
     if (existsSync(logPath)) unlinkSync(logPath);
 
     const off = spawnSync(
@@ -1268,6 +1290,215 @@ async function main() {
     }
   }
 
+  // ---- Multi-account: registry, model namespacing, session binding ----
+  {
+    const {
+      configureAccounts,
+      resetAccounts,
+      getAccounts,
+      getDefaultAccount,
+      isMultiAccount,
+      resolveAccount,
+      accountConfigDir,
+      applyAccountEnv,
+    } = await import("../src/accounts.ts");
+    const {
+      getClaudeModels: accountModels,
+      parseAccountModelId,
+      composeAccountModelId,
+      resolveClaudeModelId: resolveWithAccount,
+      accountIdFromModelId,
+    } = await import("../src/models.ts");
+    const { resolveClaudeModelSelection: selectWithAccount } = await import(
+      "../src/model-selection.ts"
+    );
+    const { withAccountTitleTag } = await import("../src/proxy.ts");
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join: joinPath } = await import("node:path");
+
+    const prevAccountsEnv = process.env.OPENCODE_CLAUDE_ACCOUNTS;
+    delete process.env.OPENCODE_CLAUDE_ACCOUNTS;
+
+    // No accounts configured → single implicit account, catalog unchanged.
+    resetAccounts();
+    configureAccounts(undefined);
+    assert.equal(isMultiAccount(), false);
+    assert.equal(getAccounts().length, 1);
+    assert.deepEqual(
+      accountModels().map((m) => m.id),
+      CLAUDE_CODE_MODELS.map((m) => m.id),
+      "single-account catalog is byte-identical to the plain one",
+    );
+    assert.equal(withAccountTitleTag("Fix the proxy", getDefaultAccount()),
+      "Fix the proxy", "no title tag without multiple accounts");
+
+    // Two accounts.
+    configureAccounts([
+      { id: "work", label: "Work", configDir: "/tmp/oc-claude-work", default: true },
+      { id: "personal", label: "Personal", configDir: "/tmp/oc-claude-personal" },
+    ]);
+    assert.equal(isMultiAccount(), true);
+    assert.equal(getDefaultAccount().id, "work");
+    assert.equal(resolveAccount("personal").label, "Personal");
+    assert.equal(resolveAccount("nope").id, "work", "unknown id falls back to default");
+    assert.equal(accountConfigDir(resolveAccount("personal")), "/tmp/oc-claude-personal");
+    assert.equal(
+      applyAccountEnv(resolveAccount("personal"), { PATH: "/usr/bin" })
+        .CLAUDE_CONFIG_DIR,
+      "/tmp/oc-claude-personal",
+    );
+
+    // Default account keeps bare ids; others are suffixed. Both carry the label.
+    assert.equal(composeAccountModelId("opus", resolveAccount("work")), "opus");
+    assert.equal(
+      composeAccountModelId("opus", resolveAccount("personal")),
+      "opus@personal",
+    );
+    const ids = accountModels().map((m) => m.id);
+    assert.ok(ids.includes("opus"), "default account keeps the bare id");
+    assert.ok(ids.includes("opus@personal"));
+    assert.ok(
+      accountModels()
+        .find((m) => m.id === "opus@personal")
+        ?.name.includes("Personal"),
+      "the account label rides the model name into the picker",
+    );
+
+    assert.deepEqual(parseAccountModelId("opus@personal"), {
+      baseModelId: "opus",
+      accountId: "personal",
+    });
+    assert.deepEqual(parseAccountModelId("opus"), {
+      baseModelId: "opus",
+      accountId: null,
+    });
+    assert.equal(resolveWithAccount("haiku@personal"), "claude-haiku-4-5",
+      "the account suffix never reaches Anthropic");
+    assert.equal(accountIdFromModelId("opus"), "work", "bare ids mean the default");
+    assert.equal(accountIdFromModelId("opus@personal"), "personal");
+
+    const picked = selectWithAccount("opus@personal", "high");
+    assert.equal(picked.modelId, "opus");
+    assert.equal(picked.account, "personal");
+    assert.equal(picked.effort, "high");
+
+    // Titles carry the account, idempotently, and follow a session that moves.
+    assert.equal(
+      withAccountTitleTag("Fix the proxy", resolveAccount("personal")),
+      "[personal] Fix the proxy",
+    );
+    assert.equal(
+      withAccountTitleTag("[personal] Fix the proxy", resolveAccount("personal")),
+      "[personal] Fix the proxy",
+      "re-titling does not stack tags",
+    );
+    assert.equal(
+      withAccountTitleTag("[personal] Fix the proxy", resolveAccount("work")),
+      "[work] Fix the proxy",
+      "a moved session is re-tagged, not double-tagged",
+    );
+
+    // Session bindings survive a dead transcript and block cross-account resume.
+    const sessDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-sess-"));
+    const prevXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = sessDir;
+    try {
+      const {
+        bindConversationAccount,
+        getBoundAccountId,
+        setForeignSessionId,
+        getForeignSessionId,
+        clearForeignSessionId,
+        getSessionBinding,
+        listSessionBindings,
+      } = await import("../src/session-store.ts");
+
+      bindConversationAccount("ses_a", "work", "Work");
+      assert.equal(getBoundAccountId("ses_a"), "work");
+      setForeignSessionId("ses_a", "uuid-work-1", { modelId: "opus" });
+      assert.equal(getSessionBinding("ses_a")?.accountId, "work",
+        "the account survives a later foreign-session write");
+
+      // Moving the session to another account drops the resume target: that
+      // transcript lives in the other account's Claude home.
+      bindConversationAccount("ses_a", "personal", "Personal");
+      assert.equal(
+        getForeignSessionId("ses_a"),
+        undefined,
+        "moving account drops the other home's resume target",
+      );
+      assert.equal(getBoundAccountId("ses_a"), "personal");
+
+      // A dead transcript must not erase which subscription owns the session.
+      setForeignSessionId("ses_a", "uuid-personal-1");
+      clearForeignSessionId("ses_a");
+      assert.equal(getBoundAccountId("ses_a"), "personal",
+        "clearing a dead session keeps the account binding");
+
+      bindConversationAccount("ses_b", "work", "Work");
+      const bindings = listSessionBindings();
+      assert.equal(bindings.length, 2);
+      assert.ok(bindings.every((b) => typeof b.accountId === "string"));
+    } finally {
+      if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevXdg;
+      rmSync(sessDir, { recursive: true, force: true });
+    }
+
+    // Rate limits are per subscription: one exhausted account must not gate
+    // turns running on another.
+    const rlDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-rl-acct-"));
+    const prevRlStore = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+    process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = joinPath(rlDir, "rl.json");
+    try {
+      const { recordRateLimitErrorText, rateLimitGate, getRateLimitSnapshot } =
+        await import("../src/rate-limit.ts");
+      recordRateLimitErrorText(
+        "You've hit your session limit · resets 1:10am (Europe/Kyiv)",
+        "work",
+      );
+      assert.equal(rateLimitGate(Date.now(), "work").blocked, true);
+      assert.equal(
+        rateLimitGate(Date.now(), "personal").blocked,
+        false,
+        "an exhausted account does not block the other one",
+      );
+      assert.equal(getRateLimitSnapshot(Date.now(), "personal").limited, false);
+    } finally {
+      if (prevRlStore === undefined) {
+        delete process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+      } else {
+        process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = prevRlStore;
+      }
+      rmSync(rlDir, { recursive: true, force: true });
+    }
+
+    // A scoped account reads ONLY its own Claude home — never the ambient one.
+    {
+      const scoped = listClaudeCredentialsCandidates("/home/tester", {}, {
+        scopedConfigDir: "/home/tester/.claude-work",
+      });
+      assert.deepEqual(scoped, [
+        "/home/tester/.claude-work/.credentials.json",
+        "/home/tester/.claude-work/credentials.json",
+      ]);
+      assert.ok(
+        !scoped.some((p) => p === "/home/tester/.claude/.credentials.json"),
+        "no fallback to the default account's credentials",
+      );
+    }
+
+    // Back to single-account for the rest of the suite.
+    resetAccounts();
+    configureAccounts(undefined);
+    if (prevAccountsEnv === undefined) {
+      delete process.env.OPENCODE_CLAUDE_ACCOUNTS;
+    } else {
+      process.env.OPENCODE_CLAUDE_ACCOUNTS = prevAccountsEnv;
+    }
+  }
+
   // ---- CLI credential sync poisoning guards ----
   {
     const { syncClaudeCliCredentialsToOpenCode } = await import(
@@ -1436,6 +1667,7 @@ async function main() {
     throw new Error("build failed");
   }
 
+  restoreSuiteEnv();
   console.log("ok — opencode-claude smoke tests passed");
 }
 

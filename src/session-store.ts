@@ -11,6 +11,10 @@ export type ClaudeSessionBinding = {
   foreignSessionId: string;
   modelId?: string;
   cwd?: string;
+  /** Claude account this conversation is bound to (multi-account setups). */
+  accountId?: string;
+  /** Label of that account at bind time — for read-only displays. */
+  accountLabel?: string;
   updatedAt: number;
 };
 
@@ -44,29 +48,107 @@ export function getForeignSessionId(
   conversationKey: string,
 ): string | undefined {
   const entry = readStore()[conversationKey];
-  return entry?.foreignSessionId;
+  // An account-only stub (bound, but no Claude session yet) carries an empty
+  // id. Returning it would hand `resume: ""` to the Agent SDK.
+  return entry?.foreignSessionId || undefined;
 }
 
-export function setForeignSessionId(
+/** Full binding for a conversation — account included. */
+export function getSessionBinding(
   conversationKey: string,
-  foreignSessionId: string,
-  meta?: { modelId?: string; cwd?: string },
+): ClaudeSessionBinding | null {
+  return readStore()[conversationKey] ?? null;
+}
+
+/** Every stored binding, newest first. Backs the read-only `/v1/sessions` view. */
+export function listSessionBindings(): ClaudeSessionBinding[] {
+  return Object.values(readStore()).sort(
+    (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0),
+  );
+}
+
+/**
+ * Account a conversation is already running on, if any. The proxy uses this to
+ * keep a session on its account across turns even when the request carries no
+ * account of its own.
+ */
+export function getBoundAccountId(
+  conversationKey: string,
+): string | undefined {
+  return readStore()[conversationKey]?.accountId;
+}
+
+/**
+ * Record which account owns a conversation, before any Claude session exists.
+ * Called on the first turn so the binding is visible even if that turn dies.
+ */
+export function bindConversationAccount(
+  conversationKey: string,
+  accountId: string,
+  accountLabel: string,
 ): void {
   const store = readStore();
+  const existing = store[conversationKey];
+  if (existing?.accountId === accountId) return;
   store[conversationKey] = {
+    ...(existing ?? { conversationKey, foreignSessionId: "" }),
     conversationKey,
-    foreignSessionId,
-    modelId: meta?.modelId,
-    cwd: meta?.cwd,
+    // Switching account invalidates the resume target: the transcript lives in
+    // the other account's Claude home and resuming it there would either fail
+    // or, worse, silently continue someone else's conversation.
+    foreignSessionId:
+      existing && existing.accountId && existing.accountId !== accountId
+        ? ""
+        : (existing?.foreignSessionId ?? ""),
+    accountId,
+    accountLabel,
     updatedAt: Date.now(),
   };
   writeStore(store);
 }
 
+export function setForeignSessionId(
+  conversationKey: string,
+  foreignSessionId: string,
+  meta?: {
+    modelId?: string;
+    cwd?: string;
+    accountId?: string;
+    accountLabel?: string;
+  },
+): void {
+  const store = readStore();
+  const existing = store[conversationKey];
+  store[conversationKey] = {
+    conversationKey,
+    foreignSessionId,
+    modelId: meta?.modelId,
+    cwd: meta?.cwd,
+    accountId: meta?.accountId ?? existing?.accountId,
+    accountLabel: meta?.accountLabel ?? existing?.accountLabel,
+    updatedAt: Date.now(),
+  };
+  writeStore(store);
+}
+
+/**
+ * Drop the resume target. The account binding survives: a dead transcript says
+ * nothing about which subscription the conversation belongs to, and losing it
+ * would silently move the session to the default account on the next turn.
+ */
 export function clearForeignSessionId(conversationKey: string): void {
   const store = readStore();
-  if (!(conversationKey in store)) return;
-  delete store[conversationKey];
+  const existing = store[conversationKey];
+  if (!existing) return;
+  if (!existing.accountId) {
+    delete store[conversationKey];
+  } else {
+    store[conversationKey] = {
+      ...existing,
+      foreignSessionId: "",
+      updatedAt: Date.now(),
+    };
+  }
   writeStore(store);
 }
 
@@ -100,10 +182,17 @@ export function conversationKeyFromMessages(
  */
 export function findClaudeSessionFile(
   foreignSessionId: string,
+  claudeConfigDir?: string,
 ): string | null {
   const id = foreignSessionId.trim();
   if (!id) return null;
-  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  // The account's Claude home wins: each account keeps its own transcripts, and
+  // probing the proxy's ambient dir would declare every non-default account's
+  // session dead and re-inject history on every single turn.
+  const configDir =
+    claudeConfigDir?.trim() ||
+    process.env.CLAUDE_CONFIG_DIR ||
+    join(homedir(), ".claude");
   const projectsDir = join(configDir, "projects");
   let projectDirs: string[];
   try {

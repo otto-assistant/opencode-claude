@@ -25,12 +25,21 @@ import {
   syncClaudeCliCredentialsToOpenCode,
 } from "./auth-login.js";
 import {
+  ACCOUNT_HEADER,
   DEFAULT_MODEL_ID,
   DIRECTORY_HEADER,
   EFFORT_HEADER,
   OPENAI_COMPATIBLE_NPM,
   PROVIDER_ID,
 } from "./constants.js";
+import {
+  configureAccounts,
+  getAccounts,
+  getDefaultAccount,
+  isMultiAccount,
+  type ClaudeAccount,
+} from "./accounts.js";
+import { readClaudeCliOAuthCredentials } from "./credentials.js";
 import { detectClaudeCode } from "./detect.js";
 import { log } from "./log.js";
 import {
@@ -267,10 +276,36 @@ const REFRESH_MARGIN_MS = 120_000;
  */
 const refreshInFlight = new Map<string, Promise<string | null>>();
 
+/**
+ * Access token for an account that owns its own Claude home.
+ *
+ * Deliberately read-only: the CLI living in that config dir is the sole owner
+ * of its refresh chain, and rotating it from here is exactly the two-owner
+ * replay that gets the whole grant revoked (see auth-login.ts). An expired
+ * token yields null, which makes the proxy spawn the CLI WITHOUT
+ * CLAUDE_CODE_OAUTH_TOKEN so the CLI refreshes its own credentials file.
+ */
+function resolveScopedAccountToken(account: ClaudeAccount): string | null {
+  const creds = readClaudeCliOAuthCredentials({ configDir: account.configDir });
+  if (!creds?.accessToken) return null;
+  if (creds.expiresAt && creds.expiresAt <= Date.now() + 30_000) {
+    log.info("[opencode-claude] account token expired; letting the CLI refresh", {
+      account: account.id,
+    });
+    return null;
+  }
+  return creds.accessToken;
+}
+
 async function resolveAccessToken(
   input: PluginInput,
   getAuth: () => Promise<unknown>,
+  account?: ClaudeAccount,
 ): Promise<string | null> {
+  // Accounts pinned to their own Claude home never touch auth.json: that file
+  // has exactly one `claude-code` slot, and sharing it across subscriptions
+  // would hand one account's token to another.
+  if (account?.configDir) return resolveScopedAccountToken(account);
   let auth = await getAuth();
   // The host's in-memory auth store can lag auth.json (tokens written by a
   // sibling process, a headless login, or a race at server start). When the
@@ -393,12 +428,20 @@ async function loadClaudeRuntime(
   const detection = await detectClaudeCode();
   const accessToken = await resolveAccessToken(input, getAuth);
 
-  const models =
-    accessToken || detection.loggedIn || readStoredClaudeOAuth()
-      ? getClaudeModels()
-      : LOGIN_PLACEHOLDER_MODELS;
+  // In multi-account mode a non-default account can be signed in while the
+  // ambient one is not, so the catalog must not collapse to the login
+  // placeholder just because the default account has no token yet.
+  const anyAccountReady =
+    accessToken ||
+    detection.loggedIn ||
+    Boolean(readStoredClaudeOAuth()) ||
+    getAccounts().some(
+      (a) => a.configDir && resolveScopedAccountToken(a) !== null,
+    );
 
-  if (!accessToken && !detection.loggedIn) {
+  const models = anyAccountReady ? getClaudeModels() : LOGIN_PLACEHOLDER_MODELS;
+
+  if (!anyAccountReady) {
     // Still seed placeholder models + a proxy so the provider stays visible.
     const port = await startProxy(async () => null);
     const providerModels = buildClaudeProviderModels(models);
@@ -406,8 +449,8 @@ async function loadClaudeRuntime(
     return { port, providerModels };
   }
 
-  const port = await startProxy(async () => {
-    return resolveAccessToken(input, getAuth);
+  const port = await startProxy(async (account) => {
+    return resolveAccessToken(input, getAuth, account);
   });
 
   const providerModels = buildClaudeProviderModels(models);
@@ -418,9 +461,26 @@ async function loadClaudeRuntime(
 /**
  * OpenCode plugin that provides Claude Code authentication and model access.
  */
+export type ClaudeCodePluginOptions = {
+  /**
+   * Claude subscriptions to expose, each with its own CLAUDE_CONFIG_DIR:
+   *   { "accounts": [
+   *       { "id": "work", "label": "Work", "configDir": "~/.claude-work", "default": true },
+   *       { "id": "personal", "label": "Personal", "configDir": "~/.claude-personal" }
+   *   ] }
+   * Omit it entirely for the classic single-subscription behaviour.
+   */
+  accounts?: unknown;
+};
+
 export const ClaudeCodePlugin: Plugin = async (
   input: PluginInput,
+  options?: ClaudeCodePluginOptions,
 ): Promise<Hooks> => {
+  // Resolve the account registry before anything reads it: the model catalog,
+  // the proxy and the credential probes all key off it.
+  configureAccounts(options?.accounts);
+
   // Best-effort CLI sync on load so OpenChamber / headless hosts work without
   // an explicit auth.methods click when `claude` is already logged in.
   try {
@@ -440,15 +500,25 @@ export const ClaudeCodePlugin: Plugin = async (
       // (After a CLI logout the catalog collapsed to login+sonnet and the
       // provider looked broken despite a fresh plugin OAuth token.)
       const hasStoredAuth = Boolean(readStoredClaudeOAuth());
+      const hasScopedAccount = getAccounts().some(
+        (a) => a.configDir && resolveScopedAccountToken(a) !== null,
+      );
       const models =
-        detection.loggedIn || detection.status === "ready" || hasStoredAuth
+        detection.loggedIn ||
+        detection.status === "ready" ||
+        hasStoredAuth ||
+        hasScopedAccount
           ? getClaudeModels()
           : LOGIN_PLACEHOLDER_MODELS;
 
       // Bind first (ephemeral port by default), then seed provider baseURL so
       // OpenCode's static config matches the live listener for this process.
       try {
-        await startProxy(async () => {
+        await startProxy(async (account) => {
+          if (account.configDir) {
+            // Scoped accounts never consult the host auth store.
+            return resolveAccessToken(input, async () => null, account);
+          }
           try {
             const authClient = input.client.auth as {
               get?: (args: { path: { id: string } }) => Promise<unknown>;
@@ -459,7 +529,7 @@ export const ClaudeCodePlugin: Plugin = async (
                 auth && typeof auth === "object" && "data" in auth
                   ? (auth as { data: unknown }).data
                   : auth;
-              return resolveAccessToken(input, async () => payload);
+              return resolveAccessToken(input, async () => payload, account);
             }
           } catch {
             // ignore
@@ -470,7 +540,7 @@ export const ClaudeCodePlugin: Plugin = async (
           // so use the normal resolver with an empty host response. It
           // falls back to the on-disk `claude-code` entry before considering
           // the optional Claude CLI credentials.
-          return resolveAccessToken(input, async () => null);
+          return resolveAccessToken(input, async () => null, account);
         });
       } catch (err) {
         log.error(
@@ -491,8 +561,14 @@ export const ClaudeCodePlugin: Plugin = async (
         typeof messageModel.variant === "string"
           ? messageModel.variant
           : undefined;
+      // The chosen model id carries the account (`opus@work`); the selection
+      // splits it so the proxy gets both without a second switch to keep in
+      // sync with the picker.
       const selected = resolveClaudeModelSelection(hookInput.model.id, variant);
       output.headers[EFFORT_HEADER] = encodeClaudeModelSelection(selected);
+      if (selected.account) {
+        output.headers[ACCOUNT_HEADER] = selected.account;
+      }
       // The proxy runs in the long-lived OpenCode server process, whose cwd is
       // commonly the service account home (for example /home/ubuntu), not the
       // project attached to this plugin instance. Carry the authoritative
