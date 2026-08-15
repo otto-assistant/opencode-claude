@@ -229,6 +229,9 @@ export async function startProxy(tokenProvider: TokenProvider): Promise<number> 
     server = Bun.serve({
       hostname,
       port: bindPort,
+      // Claude Agent SDK turns regularly take longer than Bun's 10-second
+      // default, especially on a cold start.
+      idleTimeout: 255,
       async fetch(req) {
         return handleRequest(req);
       },
