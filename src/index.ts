@@ -43,6 +43,7 @@ import {
   type ClaudeAccount,
 } from "./accounts.js";
 import { readClaudeCliOAuthCredentials } from "./credentials.js";
+import { getAccountIdentity } from "./identity.js";
 import { detectClaudeCode } from "./detect.js";
 import { log } from "./log.js";
 import {
@@ -162,6 +163,24 @@ function buildProviderModel(
   };
 }
 
+/**
+ * Provider name for an account: label plus the Claude login behind it.
+ *
+ * The host shows this under the model name when hovering, and as the group
+ * header in the picker — the one place where "which subscription am I about to
+ * spend" can be answered before spending it. The label alone does not answer
+ * it: labels are operator-chosen and go stale the moment a Claude home is
+ * re-logged to a different account, which is exactly when the question matters.
+ */
+function providerNameForAccount(account: ClaudeAccount): string {
+  const email = getAccountIdentity(account.id)?.email;
+  const label = account.label.trim();
+  // Do not repeat the address when the operator already named the account after
+  // it, which is a natural thing to do.
+  const showEmail = email && !label.toLowerCase().includes(email.toLowerCase());
+  return `Claude Code · ${label}${showEmail ? ` · ${email}` : ""}`;
+}
+
 function buildConfigModelEntry(model: ClaudeModel): Record<string, unknown> {
   const variants = buildConfigVariants(model);
   return {
@@ -235,7 +254,7 @@ function ensureAccountProviderConfigs(config: Record<string, any>): void {
     const baseURL = port ? `http://127.0.0.1:${port}/v1` : undefined;
     config.provider[id] = {
       ...existing,
-      name: `Claude Code · ${account.label}`,
+      name: providerNameForAccount(account),
       npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
       options: {
         apiKey: "claude-code-proxy",
@@ -316,7 +335,9 @@ function ensureClaudeProviderConfig(
     ...existing,
     name:
       customName ||
-      (isMultiAccount() ? `Claude Code · ${defaultAccountLabel}` : "Claude Code"),
+      (isMultiAccount()
+        ? providerNameForAccount(getDefaultAccount())
+        : "Claude Code"),
     npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
     options: {
       apiKey: "claude-code-proxy",

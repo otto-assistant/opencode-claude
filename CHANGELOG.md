@@ -15,6 +15,13 @@
   - Connecting an account writes CLI-format credentials into that account's
     Claude home; from the first turn the spawned CLI owns and rotates that
     chain. The handoff is one-directional, so there is never a second owner.
+- **The provider name carries the Claude login**, not just the label:
+  `Claude Code · Personal · someone@example.com`. The host shows it under the
+  model on hover and as the picker's group header, which is the one moment
+  "which subscription am I about to spend" can still be answered. A label alone
+  cannot answer it — labels are operator-chosen and go stale the moment a Claude
+  home is re-logged to a different account, which is exactly when it matters.
+  Two accounts on one login become obvious at the point of choosing.
 - **One provider per account.** The host groups the model picker by provider, so
   a single provider carrying every account's models produced one flat list —
   twenty-four rows for four accounts, each repeating the account label. Each
