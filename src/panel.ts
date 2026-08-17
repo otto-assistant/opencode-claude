@@ -141,6 +141,19 @@ function countdown(sec) {
   return rm ? h + "h " + rm + "m" : h + "h";
 }
 
+function resetTime(ts) {
+  if (!ts) return "";
+  const absolute = new Intl.DateTimeFormat(undefined, {
+    weekday: "short",
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(new Date(ts));
+  return absolute + " · in " + countdown(Math.round((ts - Date.now()) / 1000));
+}
+
 async function api(path, options) {
   const res = await fetch(path, {
     ...options,
@@ -166,6 +179,7 @@ function note(text, kind) {
 }
 
 let state = { accounts: [], sessions: [] };
+let firstRefresh = true;
 
 function accountCard(account) {
   const rl = account.rateLimit || {};
@@ -256,7 +270,7 @@ function quotaWindow(win, label, binding) {
   if (!win) return "";
   const left = Math.round((win.remaining ?? 0) * 100);
   const tone = left <= 10 ? "bad" : left <= 25 ? "warn" : "";
-  const resets = win.resetsAt ? "resets in " + countdown(Math.round((win.resetsAt - Date.now()) / 1000)) : "";
+  const resets = win.resetsAt ? "resets " + resetTime(win.resetsAt) : "";
   return (
     '<div class="quota-row' + (binding ? " binding" : "") + '">' +
       '<div class="lede"><span>' + esc(label) + (binding ? " · binding" : "") + "</span>" +
@@ -328,8 +342,13 @@ function sessionRow(session) {
 }
 
 async function refresh() {
+  const accountsPath = firstRefresh ? "v1/accounts?refresh=stale" : "v1/accounts";
+  firstRefresh = false;
+  if (accountsPath.includes("refresh=stale")) {
+    note("Refreshing quota samples older than 10 minutes…");
+  }
   const [accounts, sessions] = await Promise.all([
-    api("v1/accounts"),
+    api(accountsPath),
     api("v1/sessions"),
   ]);
   state = { accounts: accounts.data || [], sessions: sessions.data || [] };
@@ -342,6 +361,8 @@ async function refresh() {
   $("#sessions").innerHTML = state.sessions.length
     ? state.sessions.map(sessionRow).join("")
     : '<tr><td colspan="5" class="empty">No sessions bound yet.</td></tr>';
+  if (accountsPath.includes("refresh=stale")) note("");
+
 }
 
 let loginAccount = null;

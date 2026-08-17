@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **The accounts panel refreshes stale quota when opened.** Connected accounts
+  whose last quota sample is over ten minutes old are probed once per page load;
+  active accounts still get free updates from normal request headers. Each probe
+  is a one-token Haiku request, so there is no background timer spending quota
+  while nobody is looking at the page, and one failed account does not block the
+  others. Each reset now shows its absolute local day/time and a countdown, so
+  the weekly boundary is readable without doing calendar arithmetic.
+  The refresh is part of the panel's first read request, allowing private-network
+  GET-only access while every credential or account mutation remains behind SSO.
+- **Session title account tags are authoritative.** A title is tagged only after
+  the session has an account binding, rather than guessing the default during a
+  parallel title request. When two configured slots are the same Claude login,
+  the tag includes the resolved email (`[personal=someone@example.com]`) instead
+  of presenting an operator-chosen id as account identity.
 - **Control panel at the proxy root.** A self-contained page (no external CSS,
   fonts or scripts) showing how many accounts are connected, per-account usage
   and rate-limit state, and which account every session runs on. It adds and

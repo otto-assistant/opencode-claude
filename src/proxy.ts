@@ -594,6 +594,24 @@ async function handlePanelRoutes(
   }
 
   if (req.method === "GET" && path === "/accounts") {
+    // The LAN route deliberately bypasses Keycloak for GETs only. A one-shot
+    // refresh requested by the panel therefore has to happen inside this GET;
+    // all account-management mutations remain POST/DELETE and stay protected.
+    // Normal 15s panel polling omits the flag, so it never spends quota.
+    if (url.searchParams.get("refresh") === "stale") {
+      const now = Date.now();
+      const stale = getAccounts().filter((account) => {
+        if (!credentialProbe(account)) return false;
+        const fetchedAt = getAccountQuota(account.id)?.fetchedAt ?? 0;
+        return now - fetchedAt > 10 * 60_000;
+      });
+      await Promise.allSettled(
+        stale.map(async (account) => {
+          await probeAccountQuota(account);
+          await fetchAccountIdentity(account).catch(() => null);
+        }),
+      );
+    }
     const counts = sessionCountsByAccount();
     return Response.json({
       object: "list",
@@ -968,10 +986,14 @@ export function withAccountTitleTag(
 ): string {
   if (!isMultiAccount() || titleTagDisabled()) return title;
   const clean = title.trim();
-  const tag = `[${account.id}]`;
+  const identity = getAccountIdentity(account.id);
+  const sharedLogin = accountsSharingLogin(account.id).length > 0;
+  const tag = sharedLogin && identity?.email
+    ? `[${account.id}=${identity.email}]`
+    : `[${account.id}]`;
   if (clean.toLowerCase().startsWith(`${tag.toLowerCase()} `)) return clean;
   // Strip a tag from another account before applying this one (session moved).
-  const foreign = /^\[([a-z0-9._-]{1,32})\]\s+/i.exec(clean);
+  const foreign = /^\[([a-z0-9._-]{1,32})(?:=[^\]\s]+)?\]\s+/i.exec(clean);
   const bare =
     foreign && getAccounts().some((a) => a.id === foreign[1].toLowerCase())
       ? clean.slice(foreign[0].length)
@@ -1158,7 +1180,10 @@ async function handleChatCompletions(
     // one on personal" readable without opening anything. Only in
     // multi-account mode, and only for titles — summaries stay clean.
     if (metaKind === "title") {
-      content = withAccountTitleTag(content, account);
+      const boundAccountId = getBoundAccountId(sessionKey);
+      if (boundAccountId) {
+        content = withAccountTitleTag(content, resolveAccount(boundAccountId));
+      }
     }
 
     return metaChatCompletionResponse({

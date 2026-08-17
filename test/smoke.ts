@@ -1800,6 +1800,11 @@ async function main() {
             );
             assert.deepEqual(accountsSharingLogin("work"), ["personal"]);
             assert.deepEqual(accountsSharingLogin("personal"), ["work"]);
+            assert.equal(
+              withAccountTitleTag("Fix the proxy", resolveAccount("work")),
+              "[work] Fix the proxy",
+              "an unidentified duplicate login does not invent an email",
+            );
             // Two seats in one Team org are genuinely separate logins.
             assert.deepEqual(
               accountsSharingLogin("colleague"),
@@ -1825,15 +1830,38 @@ async function main() {
             const { accountsWithLogin, storeAccountIdentity } = await import(
               "../src/identity.ts"
             );
+            storeAccountIdentity("work", {
+              accountUuid: "acct-1",
+              email: "someone@example.com",
+              fetchedAt: 1,
+            });
+            storeAccountIdentity("personal", {
+              accountUuid: "acct-1",
+              email: "someone@example.com",
+              fetchedAt: 1,
+            });
+            assert.equal(
+              withAccountTitleTag("Fix the proxy", resolveAccount("work")),
+              "[work=someone@example.com] Fix the proxy",
+              "a duplicated login makes the real identity visible in the title",
+            );
+            assert.equal(
+              withAccountTitleTag(
+                "[work=someone@example.com] Fix the proxy",
+                resolveAccount("work"),
+              ),
+              "[work=someone@example.com] Fix the proxy",
+              "identity-bearing title tags stay idempotent",
+            );
             assert.deepEqual(
               accountsWithLogin("acct-1", "fresh"),
-              ["work"],
+              ["work", "personal"],
               "a login already connected elsewhere is reported",
             );
             assert.deepEqual(
               accountsWithLogin("acct-1", "work"),
-              [],
-              "reconnecting the SAME account is not a duplicate of itself",
+              ["personal"],
+              "reconnecting one slot still reports another slot on the same login",
             );
             assert.deepEqual(accountsWithLogin("acct-unknown", "fresh"), []);
 
@@ -1994,6 +2022,10 @@ async function main() {
         const page = renderPanel();
         assert.ok(!/(src|href)=["']https?:/i.test(page), "no external resources");
         assert.match(page, /<script>/, "behaviour is inline");
+        assert.match(page, /firstRefresh \? "v1\/accounts\?refresh=stale"/,
+          "the panel requests stale quota exactly on its first refresh");
+        assert.match(page, /timeZoneName: "short"/,
+          "reset times include an absolute local date as well as a countdown");
 
         // Add → connect → disconnect, through the same functions the routes use.
         // The host caches its model catalog, so an account change has to nudge
