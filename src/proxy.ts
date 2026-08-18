@@ -56,6 +56,7 @@ import {
   renameAccountIdentity,
   fetchAccountIdentity,
   getAccountIdentity,
+  labelLoginMismatch,
 } from "./identity.js";
 import {
   getAccountUsage,
@@ -499,6 +500,10 @@ function describeAccount(
     // session re-authorizes the SAME login without ever offering a picker, so
     // the email is the only honest answer to "is this a second subscription".
     identity: getAccountIdentity(account.id),
+    // The label names a login that is not the one behind the credential. Older
+    // labels predate the write-time rule, and a label written when the cached
+    // identity said somebody else was never refused in the first place.
+    labelClaimsLogin: labelLoginMismatch(account.id, account.label),
     sharesLoginWith: accountsSharingLogin(account.id),
     // A login exchanged but deliberately not written, awaiting a decision.
     heldDuplicateLogin: Boolean(getHeldLogin(account.id)),

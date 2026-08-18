@@ -17,7 +17,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { accountConfigDir, type ClaudeAccount } from "./accounts.js";
+import { accountConfigDir, labelEmail, type ClaudeAccount } from "./accounts.js";
 import { readClaudeCliOAuthCredentials } from "./credentials.js";
 import { log } from "./log.js";
 
@@ -158,6 +158,33 @@ export function clearAccountIdentity(accountId: string): void {
   const store = readStore();
   delete store.accounts[normalizeKey(accountId)];
   writeStore(store);
+}
+
+/**
+ * A label that names one login while the credential belongs to another.
+ *
+ * Writing this off as a cosmetic slip is how it bites: the label is the FIRST
+ * thing read and the resolved login sits three lines below, so the card
+ * contradicts itself and the wrong half wins. Refusing emails in new labels
+ * (see `assertLabelNamesNoLogin`) does not cover the case that actually
+ * happened — the label agreed with the cached identity when it was written and
+ * only became a lie once the identity resolved to somebody else. So it is
+ * checked on every read, against the live-resolved email, not against whatever
+ * was true at write time.
+ */
+export function labelLoginMismatch(
+  accountId: string,
+  label: string,
+): { claimed: string; actual: string } | null {
+  const claimed = labelEmail(label || "");
+  if (!claimed) return null;
+  const actual = getAccountIdentity(accountId)?.email;
+  // Unresolved identity is "unknown", not "mismatch": claiming a contradiction
+  // we cannot prove would be the same sin in the other direction.
+  if (!actual) return null;
+  return claimed.toLowerCase() === actual.toLowerCase()
+    ? null
+    : { claimed, actual };
 }
 
 /**

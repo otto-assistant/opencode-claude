@@ -35,6 +35,7 @@ import {
   clearAccountIdentity,
   fetchAccountIdentity,
   getAccountIdentity,
+  labelLoginMismatch,
 } from "./identity.js";
 import { LOOPBACK_CALLBACK_PATH } from "./constants.js";
 import { getProxyPort, migrateAccountStores } from "./proxy.js";
@@ -109,6 +110,13 @@ function describe(accountId: string, currentForSession?: string): string {
   if (shared.length) {
     lines.push(
       `  WARNING: same Claude login as ${shared.join(", ")} — one quota pool, no extra capacity`,
+    );
+  }
+  const claims = labelLoginMismatch(accountId, account.label);
+  if (claims) {
+    lines.push(
+      `  WARNING: the label says ${claims.claimed} but this credential is ${claims.actual}` +
+        ` — rename the slot; the login above is the resolved one`,
     );
   }
   return lines.join("\n");

@@ -1865,6 +1865,53 @@ async function main() {
             );
             assert.deepEqual(accountsWithLogin("acct-unknown", "fresh"), []);
 
+            // A label must never name a login. The label is read first and the
+            // resolved login sits below it, so when they disagree the card
+            // contradicts itself and the wrong half wins.
+            {
+              const { labelLoginMismatch } = await import("../src/identity.ts");
+              const { assertLabelNamesNoLogin, labelEmail } = await import(
+                "../src/accounts.ts"
+              );
+
+              assert.equal(labelEmail("Work"), null);
+              assert.equal(
+                labelEmail("Work · Daniel.Ibanez@cloudblue.com"),
+                "Daniel.Ibanez@cloudblue.com",
+              );
+              assert.throws(
+                () => assertLabelNamesNoLogin("Work · Daniel.Ibanez@cloudblue.com"),
+                /must not contain an email address/,
+                "a new label naming a login is refused outright",
+              );
+              assert.doesNotThrow(() => assertLabelNamesNoLogin("Work"));
+
+              storeAccountIdentity("mislabelled", {
+                accountUuid: "u-speedo",
+                email: "daniel.speedo@cloudblue.com",
+                fetchedAt: 1,
+              });
+              // The case that actually shipped: the label agreed with the
+              // cached identity when it was written, so a write-time guard
+              // could never have caught it. Only re-reading does.
+              assert.deepEqual(
+                labelLoginMismatch("mislabelled", "Work · Daniel.Ibanez@cloudblue.com"),
+                { claimed: "Daniel.Ibanez@cloudblue.com", actual: "daniel.speedo@cloudblue.com" },
+              );
+              assert.equal(
+                labelLoginMismatch("mislabelled", "Work · daniel.SPEEDO@cloudblue.com"),
+                null,
+                "same login in a different case is not a contradiction",
+              );
+              assert.equal(labelLoginMismatch("mislabelled", "Work"), null);
+              // Unresolved identity is "unknown", not "mismatch": asserting a
+              // contradiction we cannot prove is the same sin in reverse.
+              assert.equal(
+                labelLoginMismatch("never-resolved", "Work · someone@example.com"),
+                null,
+              );
+            }
+
             // Regression: the duplicate guard once compared against a CACHED
             // identity. A Claude home re-logged behind our back left the cache
             // naming the previous owner, the uuids differed, and a duplicate

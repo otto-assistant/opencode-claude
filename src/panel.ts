@@ -199,10 +199,21 @@ function accountCard(account) {
     (account.sharesLoginWith || []).length
       ? '<span class="tag shared" title="the same Claude login — one quota pool">same login as ' +
         esc(account.sharesLoginWith.join(", ")) + "</span>"
-      : (account.sharesOrganizationWith || []).length
-        ? '<span class="tag" title="different logins, same organization">same org as ' +
-          esc(account.sharesOrganizationWith.join(", ")) + "</span>"
-        : "",
+        : (account.sharesOrganizationWith || []).length
+          ? '<span class="tag" title="different logins, same organization">same org as ' +
+            esc(account.sharesOrganizationWith.join(", ")) + "</span>"
+          : "",
+    // The title of the card naming a login the credential does not belong to.
+    // Unflagged this is the most convincing lie the panel can tell, because the
+    // label is read first and the true login sits below it.
+    account.labelClaimsLogin
+      ? '<span class="tag limited" title="' +
+        esc(
+          "the label says " + account.labelClaimsLogin.claimed +
+          " but this credential is " + account.labelClaimsLogin.actual +
+          " — rename the slot, the login is resolved on its own",
+        ) + '">label says ' + esc(account.labelClaimsLogin.claimed) + ", not this login</span>"
+      : "",
   ].join("");
 
   const id0 = account.identity;

@@ -325,6 +325,41 @@ function uniqueAccountId(base: string, taken: Set<string>): string {
   throw new AccountError("could not derive a free account id");
 }
 
+/**
+ * The email address written inside a label, if there is one.
+ *
+ * Kept here, free of any identity import, because `identity.ts` already
+ * imports this module and the cycle would be real.
+ */
+export function labelEmail(label: string): string | null {
+  const match = /[^\s<>()[\],;:"]+@[^\s<>()[\],;:"]+\.[a-z]{2,}/i.exec(label || "");
+  return match ? match[0] : null;
+}
+
+/**
+ * A label must not name a login.
+ *
+ * The label is a string an operator types once; the login is resolved against
+ * Anthropic and can turn out to be — or become — somebody else. When they
+ * disagree the card contradicts itself three lines apart, and the half a human
+ * reads first is the label. It happened: a slot titled
+ * "Work · Daniel.Ibanez@cloudblue.com" whose token belonged to
+ * daniel.speedo@cloudblue.com, with the true login printed right underneath.
+ *
+ * Note this guard alone would NOT have prevented that: the label matched the
+ * (wrong) cached identity the moment it was written. That is why the
+ * contradiction is also detected on read — see `labelLoginMismatch`.
+ */
+export function assertLabelNamesNoLogin(label: string): void {
+  const email = labelEmail(label);
+  if (!email) return;
+  throw new AccountError(
+    `a label must not contain an email address (${email}) — the login is resolved ` +
+      `from the credential and shown on its own line, so a hand-written one only ` +
+      `gets a chance to be wrong. Name the slot for its role instead, e.g. "Work".`,
+  );
+}
+
 export class AccountError extends Error {
   status: number;
   constructor(message: string, status = 400) {
@@ -374,6 +409,7 @@ export function addAccount(input: {
     id = uniqueAccountId(slug, taken);
   }
   const label = givenLabel || id;
+  assertLabelNamesNoLogin(label);
   const rawDir =
     typeof input.configDir === "string" && input.configDir.trim()
       ? input.configDir
@@ -452,6 +488,9 @@ export function renameAccount(
   const clean = trimmedLabel || current.label;
   if (!clean) throw new AccountError("label cannot be empty");
   if (clean.length > 64) throw new AccountError("label is too long (max 64 chars)");
+  // Only when the caller is actually setting a label: an id-only rename must
+  // not fail because of a bad label somebody else wrote before this rule.
+  if (trimmedLabel) assertLabelNamesNoLogin(clean);
 
   // The id is not cosmetic: it appears in model ids as opus@<id>, and a slot
   // named for the account it used to hold is exactly how an operator ends up
