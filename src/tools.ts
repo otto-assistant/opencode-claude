@@ -17,12 +17,14 @@ import { join } from "node:path";
 import { tool, type ToolDefinition } from "@opencode-ai/plugin";
 import {
   accountConfigDir,
+  accountIcon,
   addAccount,
   findAccount,
   getAccounts,
   getDefaultAccount,
   removeAccount,
   renameAccount,
+  setAccountIcon,
   setDefaultAccount,
 } from "./accounts.js";
 import {
@@ -87,7 +89,7 @@ function describe(accountId: string, currentForSession?: string): string {
   ].filter(Boolean);
 
   const lines = [
-    `${account.id} — ${account.label}${marks.length ? `  [${marks.join(" · ")}]` : ""}`,
+    `${accountIcon(account)} ${account.id} — ${account.label}${marks.length ? `  [${marks.join(" · ")}]` : ""}`,
     `  status: ${connected(accountId) ? "connected" : "NOT connected"}`,
     `  claude home: ${accountConfigDir(account)}`,
   ];
@@ -185,7 +187,7 @@ export function buildAccountTools(): Record<string, ToolDefinition> {
 
     claude_account_manage: tool({
       description:
-        "Switch the current session to another Claude account (action \"use\"), or add, connect, rename, remove, disconnect an account, set the default for new sessions, or refresh quota. To add, just give a label — the id and Claude home are derived from it. Adding returns a sign-in URL — each account needs its own browser approval, so several accounts cannot be connected in one go.",
+        "Switch the current session to another Claude account (action \"use\"), or add, connect, rename, remove, disconnect an account, set the default for new sessions, change its icon, or refresh quota. To add, just give a label — the id and Claude home are derived from it. Adding returns a sign-in URL — each account needs its own browser approval, so several accounts cannot be connected in one go.",
       args: {
         action: tool.schema
           .enum([
@@ -196,6 +198,7 @@ export function buildAccountTools(): Record<string, ToolDefinition> {
             "remove",
             "disconnect",
             "set-default",
+            "set-icon",
             "refresh-quota",
           ])
           .describe("What to do."),
@@ -209,6 +212,12 @@ export function buildAccountTools(): Record<string, ToolDefinition> {
           .string()
           .optional()
           .describe("Display name, for add and rename."),
+        icon: tool.schema
+          .string()
+          .optional()
+          .describe(
+            "One glyph standing in for the label in the model picker and session header, for add and set-icon. Derived from the label when unset (shared/personal/work); pass an empty string to go back to the derived one.",
+          ),
         newId: tool.schema
           .string()
           .optional()
@@ -246,6 +255,7 @@ export function buildAccountTools(): Record<string, ToolDefinition> {
             const created = addAccount({
               ...(id ? { id } : {}),
               label: args.label,
+              icon: args.icon,
               configDir: args.configDir,
             });
             await refreshHostCatalog();
@@ -285,6 +295,13 @@ export function buildAccountTools(): Record<string, ToolDefinition> {
             clearAccountIdentity(id);
             clearAccountQuota(id);
             return `Disconnected ${id}. The account is still registered — connect it again whenever.`;
+          }
+          case "set-icon": {
+            const updated = setAccountIcon(id, args.icon ?? "");
+            await refreshHostCatalog();
+            return updated.icon
+              ? `${id} now shows as ${updated.icon} in the model picker.`
+              : `${id} is back to its derived icon (${accountIcon(updated)}).`;
           }
           case "set-default": {
             const chosen = setDefaultAccount(id).id;

@@ -39,6 +39,7 @@ h2 { font-size: 1rem; margin: 2.25rem 0 .75rem; letter-spacing: -.01em; }
 .card.is-default { border-color: var(--accent); }
 .card-head { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
 .card-head strong { font-size: 1.05rem; }
+.card-head .icon { font-size: 1.15rem; line-height: 1; }
 .tag {
   font-size: .7rem; text-transform: uppercase; letter-spacing: .06em;
   padding: .12rem .4rem; border-radius: 4px; border: 1px solid var(--line);
@@ -242,7 +243,11 @@ function accountCard(account) {
 
   return (
     '<article class="card' + (account.default ? " is-default" : "") + '">' +
-      '<div class="card-head"><strong>' + esc(account.label) + "</strong>" +
+      '<div class="card-head">' +
+        '<span class="icon" title="' +
+          esc(account.iconPinned ? "pinned icon" : "icon derived from the label") +
+        '">' + esc(account.icon || "") + "</span>" +
+        "<strong>" + esc(account.label) + "</strong>" +
         '<span class="tag">' + esc(account.id) + "</span>" + badges +
       "</div>" +
       who +
@@ -268,6 +273,7 @@ function accountCard(account) {
             '<button data-act="disconnect" data-id="' + esc(account.id) + '">Disconnect</button>'
           : '<button class="primary" data-act="connect" data-id="' + esc(account.id) + '">Connect</button>') +
         '<button data-act="rename" data-id="' + esc(account.id) + '">Rename</button>' +
+        '<button data-act="icon" data-id="' + esc(account.id) + '">Icon</button>' +
         (account.default
           ? ""
           : '<button data-act="default" data-id="' + esc(account.id) + '">Make default</button>' +
@@ -462,6 +468,20 @@ document.addEventListener("click", async (event) => {
           body: JSON.stringify({ label: label.trim() }),
         });
         note("Renamed " + id + " to " + label.trim() + ".", "ok");
+        await refresh();
+      }
+    } else if (act === "icon") {
+      const account = state.accounts.find((a) => a.id === id) || {};
+      const icon = prompt(
+        "Icon for " + id + " — one emoji or character. Empty goes back to the one derived from the label.",
+        account.iconPinned ? account.icon : "",
+      );
+      if (icon !== null) {
+        const res = await api("v1/accounts/" + encodeURIComponent(id) + "/icon", {
+          method: "POST",
+          body: JSON.stringify({ icon: icon.trim() }),
+        });
+        note(id + " now shows as " + res.icon + ".", "ok");
         await refresh();
       }
     } else if (act === "default") {

@@ -36,6 +36,7 @@ import {
   PROVIDER_ID,
 } from "./constants.js";
 import {
+  accountIcon,
   configureAccounts,
   getAccounts,
   getDefaultAccount,
@@ -178,7 +179,10 @@ function providerNameForAccount(account: ClaudeAccount): string {
   // Do not repeat the address when the operator already named the account after
   // it, which is a natural thing to do.
   const showEmail = email && !label.toLowerCase().includes(email.toLowerCase());
-  return `Claude Code · ${label}${showEmail ? ` · ${email}` : ""}`;
+  // The icon leads, matching the model rows underneath: the group header is the
+  // legend that says which account a glyph stands for.
+  const icon = isMultiAccount() ? `${accountIcon(account)} ` : "";
+  return `${icon}Claude Code · ${label}${showEmail ? ` · ${email}` : ""}`;
 }
 
 function buildConfigModelEntry(model: ClaudeModel): Record<string, unknown> {

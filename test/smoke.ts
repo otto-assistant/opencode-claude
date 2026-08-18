@@ -1315,6 +1315,9 @@ async function main() {
       isMultiAccount,
       resolveAccount,
       accountConfigDir,
+      accountIcon,
+      accountIcons,
+      sanitizeIcon,
       applyAccountEnv,
     } = await import("../src/accounts.ts");
     const {
@@ -1379,12 +1382,60 @@ async function main() {
     const ids = accountModels().map((m) => m.id);
     assert.ok(ids.includes("opus"), "default account keeps the bare id");
     assert.ok(ids.includes("opus@personal"));
+    // The account rides the model name as a one-glyph MARK rather than as the
+    // label: the name also carries two quota figures, and the session header
+    // shows it whole, so a label up to 64 chars pushed the numbers out of view.
+    const personalName = accountModels().find((m) => m.id === "opus@personal")!.name;
     assert.ok(
-      accountModels()
-        .find((m) => m.id === "opus@personal")
-        ?.name.includes("Personal"),
-      "the account label rides the model name into the picker",
+      personalName.startsWith("\u{1F3E0} "),
+      `the account icon leads the model name: ${personalName}`,
     );
+    assert.ok(
+      !personalName.includes("Personal"),
+      "the label itself stays in the provider group header, not in every row",
+    );
+    assert.equal(accountIcon(resolveAccount("work")), "\u{1F4BC}");
+
+    // Uniqueness is a property of the SET: "Work personal" does mention
+    // personal, but a plain "Personal" owns the house, so the compound has to
+    // get a mark of its own instead of a duplicate.
+    configureAccounts([
+      { id: "work", label: "Work", configDir: "/tmp/oc-claude-work", default: true },
+      { id: "tercera", label: "Work personal", configDir: "/tmp/oc-claude-tercera" },
+      { id: "works-shared", label: "Works Shared", configDir: "/tmp/oc-claude-shared" },
+      { id: "personal", label: "Personal", configDir: "/tmp/oc-claude-personal" },
+    ]);
+    const icons = accountIcons();
+    assert.equal(icons.get("work"), "\u{1F4BC}");
+    assert.equal(icons.get("personal"), "\u{1F3E0}");
+    assert.equal(icons.get("works-shared"), "\u{1F465}");
+    assert.equal(
+      new Set([...icons.values()]).size,
+      icons.size,
+      "no two accounts wear the same glyph",
+    );
+
+    // A pinned icon is never overruled by derivation, and an icon is a mark:
+    // anything long enough to read as words is refused, not truncated.
+    configureAccounts([
+      {
+        id: "work",
+        label: "Work",
+        icon: "\u{1F3E2}",
+        configDir: "/tmp/oc-claude-work",
+        default: true,
+      },
+      { id: "personal", label: "Personal", configDir: "/tmp/oc-claude-personal" },
+    ]);
+    assert.equal(accountIcon(resolveAccount("work")), "\u{1F3E2}");
+    assert.equal(sanitizeIcon("shared"), undefined);
+    assert.equal(sanitizeIcon(" \u{1F465} "), "\u{1F465}");
+
+    // Back to the two plain accounts the rest of this block expects.
+    configureAccounts([
+      { id: "work", label: "Work", configDir: "/tmp/oc-claude-work", default: true },
+      { id: "personal", label: "Personal", configDir: "/tmp/oc-claude-personal" },
+    ]);
 
     // One provider per account: the host groups the picker by provider, so the
     // account is the group rather than a suffix repeated on every row.

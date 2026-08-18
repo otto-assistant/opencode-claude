@@ -25,6 +25,7 @@ import { hasClaudeCliOAuthCredentials } from "./credentials.js";
 import {
   accountConfigDir,
   AccountError,
+  accountIcon,
   addAccount,
   applyAccountEnv,
   findAccount,
@@ -35,6 +36,7 @@ import {
   removeAccount,
   renameAccount,
   resolveAccount,
+  setAccountIcon,
   setDefaultAccount,
   type ClaudeAccount,
 } from "./accounts.js";
@@ -489,6 +491,8 @@ function describeAccount(
   return {
     id: account.id,
     label: account.label,
+    icon: accountIcon(account),
+    iconPinned: Boolean(account.icon),
     default: account.isDefault,
     configDir: accountConfigDir(account),
     authenticated: credentialProbe(account),
@@ -665,7 +669,7 @@ async function handlePanelRoutes(
   }
 
   // ---- mutations ----
-  const accountMatch = /^\/accounts\/([^/]+)(?:\/(login\/start|login\/complete|login\/confirm|login\/discard|disconnect|default|rename|quota\/refresh))?$/
+  const accountMatch = /^\/accounts\/([^/]+)(?:\/(login\/start|login\/complete|login\/confirm|login\/discard|disconnect|default|rename|icon|quota\/refresh))?$/
     .exec(path);
   const sessionMatch = /^\/sessions\/([^/]+)\/account$/.exec(path);
   const isMutation =
@@ -718,6 +722,12 @@ async function handlePanelRoutes(
         });
         await refreshHostCatalog();
         return Response.json({ account: renamed.id, label: renamed.label });
+      }
+      if (req.method === "POST" && action === "icon") {
+        const body = await readJsonBody(req);
+        const updated = setAccountIcon(id, body.icon ?? "");
+        await refreshHostCatalog();
+        return Response.json({ account: updated.id, icon: accountIcon(updated) });
       }
       if (req.method === "POST" && action === "disconnect") {
         clearAccountCredentials(account);

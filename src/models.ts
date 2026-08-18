@@ -7,6 +7,7 @@ import {
   type ClaudeEffort,
 } from "./constants.js";
 import {
+  accountIcons,
   getAccounts,
   getDefaultAccount,
   isMultiAccount,
@@ -131,9 +132,14 @@ export function composeAccountModelId(
  * Catalog as OpenCode should show it.
  *
  * Single account: the plain catalog, unchanged. Several accounts: every model
- * appears once per account, and each NAME carries the account label — that
- * label is what OpenChamber prints in the model picker and in the session
+ * appears once per account, and each NAME leads with the account ICON — that
+ * name is what OpenChamber prints in the model picker and in the session
  * header, so the account a session runs on is readable at a glance.
+ *
+ * A one-glyph mark rather than the label: the label is up to 64 characters and
+ * sits in front of a name that already carries model plus two quota figures,
+ * where it pushed the numbers off the visible line. The full label stays in the
+ * provider group header, which is where there is room for it.
  */
 /**
  * Remaining quota as a model-name suffix, e.g. `5h 96% · 7d 4%`.
@@ -171,12 +177,14 @@ export function getClaudeModels(): ClaudeModel[] {
       name: `${model.name}${suffix}`,
     }));
   }
+  const icons = accountIcons();
   return getAccounts().flatMap((account) => {
     const suffix = quotaNameSuffix(account.id);
+    const icon = icons.get(account.id);
     return CLAUDE_CODE_MODELS.map((model) => ({
       ...model,
       id: composeAccountModelId(model.id, account),
-      name: `${model.name} · ${account.label}${suffix}`,
+      name: `${icon ? `${icon} ` : ""}${model.name}${suffix}`,
       // resolvedId stays the real Claude model — the account rides the id.
       ...(model.resolvedId ? { resolvedId: model.resolvedId } : {}),
     }));
@@ -184,15 +192,18 @@ export function getClaudeModels(): ClaudeModel[] {
 }
 
 /**
- * Catalog for ONE account's provider: plain model ids, and names carrying only
- * the quota — the provider group already says which account it is, so
- * repeating the label in every row is noise.
+ * Catalog for ONE account's provider: plain model ids, and names carrying the
+ * account icon plus the quota — the provider group already says which account
+ * it is, so repeating the whole label in every row is noise, but the glyph is
+ * what makes the SESSION HEADER (which shows the model name alone) say which
+ * subscription is being spent.
  */
 export function getClaudeModelsForAccount(account: ClaudeAccount): ClaudeModel[] {
   const suffix = quotaNameSuffix(account.id);
+  const icon = isMultiAccount() ? accountIcons().get(account.id) : undefined;
   return CLAUDE_CODE_MODELS.map((model) => ({
     ...model,
-    name: `${model.name}${suffix}`,
+    name: `${icon ? `${icon} ` : ""}${model.name}${suffix}`,
   }));
 }
 

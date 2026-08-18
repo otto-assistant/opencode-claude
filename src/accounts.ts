@@ -31,6 +31,11 @@ export type ClaudeAccount = {
   /** Human label shown in the model picker and session titles. */
   label: string;
   /**
+   * One-glyph mark standing in for the label where space is scarce (model
+   * names, session header). Optional: derived from the label when absent.
+   */
+  icon?: string;
+  /**
    * CLAUDE_CONFIG_DIR for this account. Undefined means the ambient Claude
    * home (`~/.claude` or an inherited CLAUDE_CONFIG_DIR) — at most one account
    * may leave it undefined.
@@ -103,12 +108,30 @@ function parseAccountEntry(raw: unknown): ClaudeAccount | null {
     typeof entry.label === "string" && entry.label.trim()
       ? entry.label.trim()
       : id;
+  const icon = sanitizeIcon(entry.icon);
   return {
     id,
     label,
+    ...(icon ? { icon } : {}),
     ...(configDir ? { configDir } : {}),
     isDefault: entry.default === true || entry.isDefault === true,
   };
+}
+
+/**
+ * An icon is a MARK, not a second label: anything long enough to be read as
+ * words defeats the point of having one, so it is rejected rather than
+ * truncated into something the operator did not write.
+ */
+export function sanitizeIcon(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  // Count grapheme-ish units: an emoji with a variation selector or a ZWJ
+  // sequence is one glyph on screen but several code points.
+  const glyphs = [...trimmed.replace(/[\u200D\uFE0E\uFE0F]/g, "")].length;
+  if (glyphs > 2) return undefined;
+  return trimmed;
 }
 
 /**
@@ -273,6 +296,86 @@ export function getAccountsFilePath(): string {
   return accountsFilePath();
 }
 
+/**
+ * Concepts an account label can name, and the mark that stands for each.
+ *
+ * Order is priority: "Works Shared" is a shared account that happens to say
+ * "work", so `shared` has to be tested before `work`, or every account in a
+ * work org collapses onto the same glyph.
+ */
+const ICON_RULES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/shared|team|pool/, "\u{1F465}"],
+  [/personal|private|home/, "\u{1F3E0}"],
+  [/work|job|office|corp|company/, "\u{1F4BC}"],
+  [/test|dev|sandbox|lab|staging/, "\u{1F9EA}"],
+  [/bot|agent|ci|auto/, "\u{1F916}"],
+];
+
+/**
+ * Marks handed out when the label names no known concept, or names one already
+ * taken. Two accounts wearing the same glyph would be worse than no glyph at
+ * all -- telling them apart is the whole point -- so uniqueness beats meaning.
+ */
+const ICON_POOL = [
+  "\u{1F535}",
+  "\u{1F7E3}",
+  "\u{1F7E0}",
+  "\u{1F7E2}",
+  "\u{1F534}",
+  "\u{1F7E1}",
+  "⬛",
+  "⬜",
+] as const;
+
+function iconCandidates(account: ClaudeAccount, singleWordOnly: boolean): string[] {
+  const label = (account.label || account.id).toLowerCase();
+  const words = label.split(/[^a-z0-9]+/).filter(Boolean);
+  // First pass: a label that IS the concept ("Personal") outranks one that
+  // merely mentions it ("Work personal"), which would otherwise take the glyph
+  // just by sorting earlier in the registry.
+  if (singleWordOnly && words.length !== 1) return [];
+  const haystack = singleWordOnly ? words[0] : `${label} ${account.id}`;
+  return ICON_RULES.filter(([pattern]) => pattern.test(haystack)).map(([, icon]) => icon);
+}
+
+/**
+ * One distinct mark per account, keyed by id.
+ *
+ * Resolved for the whole registry at once because uniqueness is a property of
+ * the set, not of any single account: which glyph "Work personal" ends up with
+ * depends on whether a plain "Personal" already claimed the house.
+ */
+export function accountIcons(list: ClaudeAccount[] = getAccounts()): Map<string, string> {
+  const resolved = new Map<string, string>();
+  const taken = new Set<string>();
+  const claim = (id: string, icon: string) => {
+    resolved.set(id, icon);
+    taken.add(icon);
+  };
+  // An icon the operator pinned is never overruled by derivation.
+  for (const account of list) {
+    const explicit = sanitizeIcon(account.icon);
+    if (explicit) claim(account.id, explicit);
+  }
+  for (const singleWordOnly of [true, false]) {
+    for (const account of list) {
+      if (resolved.has(account.id)) continue;
+      const free = iconCandidates(account, singleWordOnly).find((i) => !taken.has(i));
+      if (free) claim(account.id, free);
+    }
+  }
+  for (const account of list) {
+    if (resolved.has(account.id)) continue;
+    claim(account.id, ICON_POOL.find((i) => !taken.has(i)) ?? "\u{1F518}");
+  }
+  return resolved;
+}
+
+/** The mark for one account. */
+export function accountIcon(account: ClaudeAccount): string {
+  return sanitizeIcon(account.icon) ?? accountIcons().get(account.id) ?? "\u{1F518}";
+}
+
 function persistAccounts(list: ClaudeAccount[]): void {
   const path = accountsFilePath();
   mkdirSync(dirname(path), { recursive: true });
@@ -283,6 +386,7 @@ function persistAccounts(list: ClaudeAccount[]): void {
         accounts: list.map((a) => ({
           id: a.id,
           label: a.label,
+          ...(a.icon ? { icon: a.icon } : {}),
           ...(a.configDir ? { configDir: a.configDir } : {}),
           default: a.isDefault,
         })),
@@ -376,6 +480,7 @@ export class AccountError extends Error {
 export function addAccount(input: {
   id?: unknown;
   label?: unknown;
+  icon?: unknown;
   configDir?: unknown;
   makeDefault?: boolean;
 }): ClaudeAccount {
@@ -434,7 +539,14 @@ export function addAccount(input: {
       ? { ...account, configDir: accountConfigDir(account) }
       : account,
   );
-  const created: ClaudeAccount = { id, label, configDir, isDefault: false };
+  const icon = sanitizeIcon(input.icon);
+  const created: ClaudeAccount = {
+    id,
+    label,
+    ...(icon ? { icon } : {}),
+    configDir,
+    isDefault: false,
+  };
   const next = [...baseline, created];
   if (input.makeDefault) {
     for (const account of next) account.isDefault = account.id === id;
@@ -529,6 +641,39 @@ export function renameAccount(
     label: clean,
   });
   return next.find((a) => a.id === (newId ?? wanted))!;
+}
+
+/**
+ * Pin the mark for an account, or clear it back to the derived one.
+ *
+ * Derivation reads the label, so it can only guess: an account named after a
+ * person or a client matches no concept and gets a coloured dot. This is the
+ * escape hatch, and it is why the icon is persisted rather than computed fresh
+ * every time.
+ */
+export function setAccountIcon(id: string, icon: unknown): ClaudeAccount {
+  const wanted = id.trim().toLowerCase();
+  const existing = getAccounts();
+  const current = existing.find((a) => a.id === wanted);
+  if (!current) throw new AccountError(`unknown account "${wanted}"`, 404);
+  const clearing =
+    icon === null || (typeof icon === "string" && icon.trim() === "");
+  const clean = clearing ? undefined : sanitizeIcon(icon);
+  if (!clearing && !clean) {
+    throw new AccountError(
+      "an icon must be a single glyph (an emoji or one character) — it stands in for the label, it is not a second one",
+    );
+  }
+  const next = existing.map((account) => ({
+    ...account,
+    ...(account.id === AMBIENT_ACCOUNT_ID && !account.configDir
+      ? { configDir: accountConfigDir(account) }
+      : {}),
+    ...(account.id === wanted ? { icon: clean } : {}),
+  }));
+  persistAccounts(normalize(next));
+  log.info("[opencode-claude] account icon set", { id: wanted, icon: clean ?? null });
+  return next.find((a) => a.id === wanted)!;
 }
 
 /** Which account new sessions land on when nothing else says otherwise. */
