@@ -26,6 +26,7 @@ import {
   accountConfigDir,
   AccountError,
   accountIcon,
+  accountIcons,
   addAccount,
   applyAccountEnv,
   findAccount,
@@ -991,29 +992,49 @@ function titleTagDisabled(): boolean {
 }
 
 /**
- * Prefix a generated session title with its account: "[work] Fix the proxy".
+ * Prefix a generated session title with its account MARK: "<icon> Fix the proxy".
+ *
  * No-op for single-account setups, and idempotent so a re-titled session does
- * not accumulate tags.
+ * not accumulate marks. The tag used to be the account id, and the id plus the
+ * login when two slots share one: `[works-shared=daniel.speedo@cloudblue.com] `
+ * is 44 characters of prefix in front of a session list that shows maybe sixty,
+ * so the titles themselves stopped being readable — which is the only reason
+ * the tag was there. The icon says the same thing in one glyph; the panel and
+ * the provider header still spell out the login.
  */
 export function withAccountTitleTag(
   title: string,
   account: ClaudeAccount,
 ): string {
   if (!isMultiAccount() || titleTagDisabled()) return title;
+  const clean = stripAccountTitleTag(title.trim());
+  const icon = accountIcon(account);
+  return clean ? `${icon} ${clean}` : icon;
+}
+
+/**
+ * Remove a tag this plugin wrote, whichever generation it belongs to.
+ *
+ * Both forms have to go: a session that moves between accounts would otherwise
+ * wear two marks, and every title written before this change still carries the
+ * old bracketed id.
+ */
+export function stripAccountTitleTag(title: string): string {
   const clean = title.trim();
-  const identity = getAccountIdentity(account.id);
-  const sharedLogin = accountsSharingLogin(account.id).length > 0;
-  const tag = sharedLogin && identity?.email
-    ? `[${account.id}=${identity.email}]`
-    : `[${account.id}]`;
-  if (clean.toLowerCase().startsWith(`${tag.toLowerCase()} `)) return clean;
-  // Strip a tag from another account before applying this one (session moved).
-  const foreign = /^\[([a-z0-9._-]{1,32})(?:=[^\]\s]+)?\]\s+/i.exec(clean);
-  const bare =
-    foreign && getAccounts().some((a) => a.id === foreign[1].toLowerCase())
-      ? clean.slice(foreign[0].length)
-      : clean;
-  return `${tag} ${bare}`;
+  // Old form: [work] / [work=someone@example.com]. Only for an id that is
+  // actually an account of ours — a title genuinely starting with a bracket is
+  // not ours to rewrite.
+  const bracket = /^\[([a-z0-9._-]{1,32})(?:=[^\]\s]+)?\]\s+/i.exec(clean);
+  if (bracket && getAccounts().some((a) => a.id === bracket[1].toLowerCase())) {
+    return clean.slice(bracket[0].length).trim();
+  }
+  // Current form: a leading glyph belonging to some account in the registry.
+  const icons = new Set(accountIcons().values());
+  for (const icon of icons) {
+    if (clean.startsWith(`${icon} `)) return clean.slice(icon.length).trim();
+    if (clean === icon) return "";
+  }
+  return clean;
 }
 
 async function handleChatCompletions(

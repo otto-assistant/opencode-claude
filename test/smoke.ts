@@ -1478,20 +1478,35 @@ async function main() {
     assert.equal(picked.account, "personal");
     assert.equal(picked.effort, "high");
 
-    // Titles carry the account, idempotently, and follow a session that moves.
+    // Titles carry the account as a one-glyph MARK, idempotently, and follow a
+    // session that moves. The old bracketed tag has to go too: every title
+    // written before this change still wears one.
     assert.equal(
       withAccountTitleTag("Fix the proxy", resolveAccount("personal")),
-      "[personal] Fix the proxy",
+      "🏠 Fix the proxy",
+    );
+    assert.equal(
+      withAccountTitleTag("🏠 Fix the proxy", resolveAccount("personal")),
+      "🏠 Fix the proxy",
+      "re-titling does not stack marks",
+    );
+    assert.equal(
+      withAccountTitleTag("🏠 Fix the proxy", resolveAccount("work")),
+      "💼 Fix the proxy",
+      "a moved session is re-marked, not double-marked",
     );
     assert.equal(
       withAccountTitleTag("[personal] Fix the proxy", resolveAccount("personal")),
-      "[personal] Fix the proxy",
-      "re-titling does not stack tags",
+      "🏠 Fix the proxy",
+      "the old bracketed tag is replaced, not carried along",
     );
     assert.equal(
-      withAccountTitleTag("[personal] Fix the proxy", resolveAccount("work")),
-      "[work] Fix the proxy",
-      "a moved session is re-tagged, not double-tagged",
+      withAccountTitleTag(
+        "[work=someone@example.com] Fix the proxy",
+        resolveAccount("work"),
+      ),
+      "💼 Fix the proxy",
+      "including the form that spelled the login out in the session list",
     );
 
     // Session bindings survive a dead transcript and block cross-account resume.
@@ -1853,8 +1868,7 @@ async function main() {
             assert.deepEqual(accountsSharingLogin("personal"), ["work"]);
             assert.equal(
               withAccountTitleTag("Fix the proxy", resolveAccount("work")),
-              "[work] Fix the proxy",
-              "an unidentified duplicate login does not invent an email",
+              "💼 Fix the proxy",
             );
             // Two seats in one Team org are genuinely separate logins.
             assert.deepEqual(
@@ -1891,18 +1905,13 @@ async function main() {
               email: "someone@example.com",
               fetchedAt: 1,
             });
+            // A shared login used to be spelled out in every title. The panel
+            // and the provider header answer "which login is this" now; the
+            // session list gets the mark and keeps its width.
             assert.equal(
               withAccountTitleTag("Fix the proxy", resolveAccount("work")),
-              "[work=someone@example.com] Fix the proxy",
-              "a duplicated login makes the real identity visible in the title",
-            );
-            assert.equal(
-              withAccountTitleTag(
-                "[work=someone@example.com] Fix the proxy",
-                resolveAccount("work"),
-              ),
-              "[work=someone@example.com] Fix the proxy",
-              "identity-bearing title tags stay idempotent",
+              "💼 Fix the proxy",
+              "a duplicated login does not put an address in the session list",
             );
             assert.deepEqual(
               accountsWithLogin("acct-1", "fresh"),
