@@ -30,11 +30,11 @@ import {
   isClaudeProviderId,
   providerIdForAccount,
   DEFAULT_MODEL_ID,
-  DIRECTORY_HEADER,
   EFFORT_HEADER,
   OPENAI_COMPATIBLE_NPM,
   PROVIDER_ID,
 } from "./constants.js";
+import { applyClaudeRequestContextHeaders } from "./request-context.js";
 import {
   accountIcon,
   configureAccounts,
@@ -90,15 +90,6 @@ function zeroCost() {
     output: 0,
     cache: { read: 0, write: 0 },
   };
-}
-
-export function applyClaudeRequestContextHeaders(
-  headers: Record<string, string>,
-  directory: string,
-  sessionID?: string,
-): void {
-  headers[DIRECTORY_HEADER] = directory;
-  if (sessionID) headers["x-opencode-claude-session"] = sessionID;
 }
 
 function buildProviderModel(
@@ -849,6 +840,6 @@ export const ClaudeCodePlugin: Plugin = async (
 export default ClaudeCodePlugin;
 
 export type { ClaudeOAuthTokens };
-export { detectClaudeCode } from "./detect.js";
-export { getClaudeModels } from "./models.js";
-export { startProxy, stopProxy, getClaudeProxyBaseUrl } from "./proxy.js";
+// Nada mas se exporta aqui: OpenCode invoca CADA export del entrypoint como
+// si fuera otro plugin. Los helpers viven en sus modulos (./detect.js,
+// ./models.js, ./proxy.js, ./request-context.js) y se importan desde alli.

@@ -56,9 +56,10 @@ async function main() {
   const { isClaudeEffort, PROVIDER_ID, EFFORT_LEVELS } = await import(
     "../src/constants.ts"
   );
-  const { applyClaudeRequestContextHeaders, ClaudeCodePlugin } = await import(
-    "../src/index.ts"
+  const { applyClaudeRequestContextHeaders } = await import(
+    "../src/request-context.ts"
   );
+  const { ClaudeCodePlugin } = await import("../src/index.ts");
   const {
     startProxy,
     stopProxy,
