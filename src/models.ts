@@ -13,7 +13,7 @@ import {
   isMultiAccount,
   type ClaudeAccount,
 } from "./accounts.js";
-import { getAccountQuota } from "./quota.js";
+import { formatShortDuration, getAccountQuota } from "./quota.js";
 
 export type ClaudeModel = {
   id: string;
@@ -141,23 +141,56 @@ export function composeAccountModelId(
  * where it pushed the numbers off the visible line. The full label stays in the
  * provider group header, which is where there is room for it.
  */
+/** Short window (five-hour) marker. */
+const SHORT_WINDOW_MARK = "\u{1F7E2}"; // green circle
+/** Long window (seven-day) marker. */
+const LONG_WINDOW_MARK = "\u{1F535}"; // blue circle
+
 /**
- * Remaining quota as a model-name suffix, e.g. `5h 96% · 7d 4%`.
+ * One window as `<mark> <pct>% <time until it refills>`.
+ *
+ * Naming the window ("5h", "7d") spent characters on the one thing that never
+ * changes. What an operator actually decides on is when the ceiling lifts, so
+ * the countdown takes that slot and the colour carries the identity instead:
+ * green is the short window, blue the long one.
+ *
+ * Once `resetsAt` is behind us the stored utilization describes a window that
+ * has already refilled, and printing it would answer a question nobody asked.
+ * The store is written from live turns, so no update since the reset means no
+ * spend since the reset: report it full, and drop the countdown because the
+ * next window's reset is not known until the account is used again.
+ */
+function windowLabel(
+  window: { remaining: number; resetsAt?: number } | undefined,
+  mark: string,
+  now: number,
+): string | null {
+  if (!window) return null;
+  const refilled = window.resetsAt !== undefined && window.resetsAt <= now;
+  if (refilled) return `${mark} 100%`;
+  const pct = `${Math.round(window.remaining * 100)}%`;
+  if (window.resetsAt === undefined) return `${mark} ${pct}`;
+  return `${mark} ${pct} ${formatShortDuration(window.resetsAt - now)}`;
+}
+
+/**
+ * Remaining quota as a model-name suffix, e.g. `🟢 96% 2h 20m · 🔵 4% 5d 3h`.
  *
  * The model name is the one string this plugin controls that the host renders
  * next to the composer, so it is where "how much is left on the account I am
  * about to use" can actually be read at the moment of choosing. Refreshes
- * whenever the host rebuilds the catalog.
+ * whenever the host rebuilds the catalog — the countdowns are computed then,
+ * so a picker left open drifts until the next rebuild.
  */
 export function quotaNameSuffix(accountId: string): string {
   if (nameQuotaDisabled()) return "";
   const quota = getAccountQuota(accountId);
   if (!quota) return "";
-  const parts: string[] = [];
-  const five = quota.windows.fiveHour;
-  const seven = quota.windows.sevenDay;
-  if (five) parts.push(`5h ${Math.round(five.remaining * 100)}%`);
-  if (seven) parts.push(`7d ${Math.round(seven.remaining * 100)}%`);
+  const now = Date.now();
+  const parts = [
+    windowLabel(quota.windows.fiveHour, SHORT_WINDOW_MARK, now),
+    windowLabel(quota.windows.sevenDay, LONG_WINDOW_MARK, now),
+  ].filter((p): p is string => p !== null);
   return parts.length ? ` · ${parts.join(" · ")}` : "";
 }
 
