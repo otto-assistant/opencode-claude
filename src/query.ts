@@ -124,7 +124,17 @@ export type ClaudeQueryHandle = {
   interrupt: () => Promise<void>;
   close: () => void;
   getPid: () => number | null | undefined;
+  /**
+   * Plan rate-limit windows over the SDK control channel, or null when this
+   * SDK/CLI pair does not speak `get_usage`. Only answers while the message
+   * loop is running, so call it during the turn, never from its `finally`.
+   */
+  readPlanUsage: () => Promise<unknown | null>;
 };
+
+/** Control method behind `/usage`. Experimental upstream, so feature-detected. */
+const PLAN_USAGE_METHOD =
+  "usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET";
 
 export type StartClaudeQueryParams = {
   prompt: string | AsyncIterable<unknown>;
@@ -353,5 +363,18 @@ export async function startClaudeQuery(
     }
   };
 
-  return { stream: result as AsyncIterable<unknown>, interrupt, close, getPid };
+  const readPlanUsage = async (): Promise<unknown | null> => {
+    if (closed) return null;
+    const fn = (result as Record<string, unknown> | null)?.[PLAN_USAGE_METHOD];
+    if (typeof fn !== "function") return null;
+    return await (fn as () => Promise<unknown>).call(result);
+  };
+
+  return {
+    stream: result as AsyncIterable<unknown>,
+    interrupt,
+    close,
+    getPid,
+    readPlanUsage,
+  };
 }

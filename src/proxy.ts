@@ -75,6 +75,7 @@ import {
   getAllAccountQuota,
   mergeSdkRateLimitEvent,
   probeAccountQuota,
+  recordQuotaFromPlanUsage,
   renameAccountQuota,
 } from "./quota.js";
 import {
@@ -217,6 +218,48 @@ type ChatCompletionRequest = {
 let server: ReturnType<typeof Bun.serve> | null = null;
 let proxyPort: number | null = null;
 let getAccessToken: TokenProvider | null = null;
+
+/**
+ * Refresh the stored quota from the SDK control channel during a turn.
+ *
+ * This is the only path that sees BOTH windows while turns run: the `claude`
+ * subprocess owns the HTTP calls, so `anthropic-ratelimit-unified-*` response
+ * headers never reach this process, and `rate_limit_event` carries one window
+ * and only sometimes. It works at all because turns no longer authenticate by
+ * injected token — see the note where childEnv is built.
+ *
+ * Fired while the session is alive and NOT awaited: the control request only
+ * answers while the message loop is pumping (in the turn's `finally` it just
+ * times out — measured), and the turn must never wait on it. ~10s when warm.
+ *
+ * Throttled: this is a request to the claude.ai usage endpoint, not a free
+ * header read. Every failure is a no-op; the label going stale is never worth
+ * breaking a turn over.
+ */
+const PLAN_USAGE_MIN_INTERVAL_MS = 60_000;
+const PLAN_USAGE_TIMEOUT_MS = 30_000;
+
+async function refreshPlanQuota(
+  handle: ClaudeQueryHandle | null | undefined,
+  accountId: string | undefined,
+): Promise<void> {
+  if (typeof handle?.readPlanUsage !== "function") return;
+  const current = getAccountQuota(accountId);
+  if (current && Date.now() - current.fetchedAt < PLAN_USAGE_MIN_INTERVAL_MS) {
+    return;
+  }
+  try {
+    const usage = await Promise.race([
+      handle.readPlanUsage(),
+      new Promise<null>((resolve) =>
+        setTimeout(() => resolve(null), PLAN_USAGE_TIMEOUT_MS),
+      ),
+    ]);
+    if (usage) recordQuotaFromPlanUsage(accountId, usage);
+  } catch {
+    // stale numbers beat a broken turn
+  }
+}
 
 /** Injectable for smoke tests — production path always uses startClaudeQuery. */
 let queryStarter: typeof startClaudeQuery = startClaudeQuery;
@@ -1258,11 +1301,26 @@ async function handleChatCompletions(
     );
   }
 
-  const env = accessToken
-    ? withClaudeOAuthToken(accessToken)
-    : withClaudeOAuthToken("", process.env);
+  // An account pinned to its own Claude home is better served by letting the
+  // CLI read that credentials file than by handing it the very token we just
+  // read out of it. Same credentials either way — but a session authenticated
+  // by injected token is treated as token auth and loses the plan profile,
+  // and with it the rate-limit windows. Measured A/B on one account, same
+  // configDir, same token:
+  //
+  //   CLAUDE_CONFIG_DIR only                  -> rate_limits_available: true
+  //   CLAUDE_CONFIG_DIR + CLAUDE_CODE_OAUTH_TOKEN -> rate_limits_available: false
+  //
+  // A non-null accessToken for an account with a configDir came from that
+  // file and is unexpired (resolveScopedAccountToken returns null otherwise),
+  // so the CLI can certainly authenticate itself with it.
+  const cliOwnsCredentials = Boolean(account.configDir) && Boolean(accessToken);
+  const env =
+    accessToken && !cliOwnsCredentials
+      ? withClaudeOAuthToken(accessToken)
+      : withClaudeOAuthToken("", process.env);
 
-  if (!accessToken) {
+  if (!accessToken || cliOwnsCredentials) {
     delete env.CLAUDE_CODE_OAUTH_TOKEN;
   }
 
@@ -1467,6 +1525,11 @@ async function handleChatCompletions(
         : {}),
     },
   });
+
+  // Session is alive from here until close(); this is the window in which the
+  // control channel answers. Not awaited — the turn never waits on quota.
+  void refreshPlanQuota(handle, account.id);
+
 
   const bridge: ParkedBridge = {
     id: bridgeId,
