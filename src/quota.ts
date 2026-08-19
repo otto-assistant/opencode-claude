@@ -57,8 +57,11 @@ export type AccountQuota = {
    */
   organizationId?: string;
   fetchedAt: number;
-  /** "headers" (free harvest) or "probe" (explicit refresh). */
-  source: "headers" | "probe";
+  /**
+   * "headers" (free harvest), "probe" (explicit refresh) or "plan-usage" (the
+   * Agent SDK control channel, read at the end of a turn).
+   */
+  source: "headers" | "probe" | "plan-usage";
 };
 
 type QuotaStore = { version: 1; accounts: Record<string, AccountQuota> };
@@ -231,6 +234,90 @@ export function recordQuotaFromHeaders(
   store.accounts[normalizeKey(accountId)] = parsed;
   writeStore(store);
   return parsed;
+}
+
+/**
+ * Plan usage as the Agent SDK control channel reports it (`get_usage`).
+ *
+ * This is the only path that sees BOTH windows on the Agent SDK route. Turns
+ * run inside the `claude` subprocess, so the `anthropic-ratelimit-unified-*`
+ * response headers never reach this process; all that surfaces mid-stream is
+ * `rate_limit_event`, one window at a time and only when the SDK feels like
+ * emitting it. Hence the stored numbers going hours stale while turns ran.
+ *
+ * Two unit conversions, and both bite silently if skipped:
+ *   - `utilization` here is 0-100. The header path is 0..1. Feeding one
+ *     through the other's arithmetic yields remaining = -94.
+ *   - `resets_at` here is an ISO 8601 string. The store keeps epoch ms.
+ *
+ * Replaces rather than merges: unlike `rate_limit_event`, this payload
+ * describes every window at once, so a stale sibling would be a lie.
+ */
+export function recordQuotaFromPlanUsage(
+  accountId: string | undefined,
+  usage: unknown,
+  now: number = Date.now(),
+): AccountQuota | null {
+  const parsed = parsePlanUsage(usage, now);
+  if (!parsed) return null;
+  const store = readStore();
+  const key = normalizeKey(accountId);
+  const previous = store.accounts[key];
+  store.accounts[key] = {
+    ...parsed,
+    // Facts this payload does not carry are worth keeping.
+    ...(previous?.organizationId ? { organizationId: previous.organizationId } : {}),
+    ...(previous?.overage ? { overage: previous.overage } : {}),
+  };
+  writeStore(store);
+  return store.accounts[key];
+}
+
+/** Percentage (0-100) consumed -> the 0..1 `remaining` the store speaks. */
+function planWindow(raw: unknown): QuotaWindow | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const entry = raw as { utilization?: unknown; resets_at?: unknown };
+  if (typeof entry.utilization !== "number" || !Number.isFinite(entry.utilization)) {
+    return undefined;
+  }
+  const utilization = Math.min(1, Math.max(0, entry.utilization / 100));
+  const window: QuotaWindow = {
+    utilization,
+    remaining: Math.min(1, Math.max(0, 1 - utilization)),
+  };
+  if (typeof entry.resets_at === "string") {
+    const at = Date.parse(entry.resets_at);
+    if (Number.isFinite(at)) window.resetsAt = at;
+  }
+  return window;
+}
+
+export function parsePlanUsage(
+  usage: unknown,
+  now: number = Date.now(),
+): AccountQuota | null {
+  if (!usage || typeof usage !== "object") return null;
+  const payload = usage as {
+    rate_limits_available?: unknown;
+    rate_limits?: unknown;
+  };
+  if (payload.rate_limits_available === false) return null;
+  const limits = payload.rate_limits;
+  if (!limits || typeof limits !== "object") return null;
+  const source = limits as Record<string, unknown>;
+  const fiveHour = planWindow(source.five_hour);
+  const sevenDay = planWindow(source.seven_day);
+  const opus = planWindow(source.seven_day_opus);
+  if (!fiveHour && !sevenDay && !opus) return null;
+  return {
+    windows: {
+      ...(fiveHour ? { fiveHour } : {}),
+      ...(sevenDay ? { sevenDay } : {}),
+      ...(opus ? { opus } : {}),
+    },
+    fetchedAt: now,
+    source: "plan-usage",
+  };
 }
 
 /**

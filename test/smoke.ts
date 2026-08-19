@@ -1695,6 +1695,62 @@ async function main() {
           "count_tokens-style responses carry none and must not be stored",
         );
 
+        // ---- Plan usage over the SDK control channel (`get_usage`) ----
+        // Payload captured from claude 2.1.235. Its units are NOT the header
+        // units, and both differences are silent if unhandled: utilization is
+        // a percentage (0-100, vs 0..1) and resets_at is an ISO string (vs
+        // epoch seconds). Getting it wrong renders as "-9400%".
+        const { parsePlanUsage, recordQuotaFromPlanUsage } = await import(
+          "../src/quota.ts"
+        );
+        const planResets5h = new Date(Date.now() + 3_600_000).toISOString();
+        const planUsage = {
+          rate_limits_available: true,
+          subscription_type: "max",
+          rate_limits: {
+            five_hour: { utilization: 79, resets_at: planResets5h },
+            seven_day: { utilization: 20, resets_at: null },
+            seven_day_opus: null,
+          },
+        };
+        const plan = parsePlanUsage(planUsage)!;
+        assert.ok(plan, "control-channel usage is recognised");
+        assert.equal(plan.source, "plan-usage");
+        // 79 out of 100 spent -> 0.79 utilization, 21% left. NOT -7800%.
+        assert.equal(plan.windows.fiveHour?.utilization, 0.79);
+        assert.equal(
+          Math.round((plan.windows.fiveHour?.remaining ?? 0) * 100),
+          21,
+        );
+        assert.equal(
+          Math.round((plan.windows.sevenDay?.remaining ?? 0) * 100),
+          80,
+        );
+        // ISO string -> epoch ms, in the future rather than NaN or 1970.
+        assert.equal(
+          plan.windows.fiveHour?.resetsAt,
+          Date.parse(planResets5h),
+        );
+        assert.equal(
+          plan.windows.sevenDay?.resetsAt,
+          undefined,
+          "a null resets_at leaves no countdown behind",
+        );
+        // Sessions where plan limits do not apply carry no quota at all.
+        assert.equal(
+          parsePlanUsage({ rate_limits_available: false, rate_limits: null }),
+          null,
+        );
+        assert.equal(parsePlanUsage(null), null);
+        assert.equal(parsePlanUsage({ rate_limits: {} }), null);
+
+        recordQuotaFromPlanUsage("acct-plan", planUsage);
+        assert.equal(getAccountQuota("acct-plan")?.source, "plan-usage");
+        assert.equal(
+          Math.round((getAccountQuota("acct-plan")?.windows.fiveHour?.remaining ?? 0) * 100),
+          21,
+        );
+
         recordQuotaFromHeaders("acct-a", headers);
         assert.equal(getAccountQuota("acct-a")?.representative, "seven_day");
         assert.equal(getAccountQuota("acct-a")?.source, "headers");
