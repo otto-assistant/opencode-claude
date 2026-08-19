@@ -850,5 +850,5 @@ export default ClaudeCodePlugin;
 
 export type { ClaudeOAuthTokens };
 export { detectClaudeCode } from "./detect.js";
-export { getClaudeModels, CLAUDE_CODE_MODELS } from "./models.js";
+export { getClaudeModels } from "./models.js";
 export { startProxy, stopProxy, getClaudeProxyBaseUrl } from "./proxy.js";
