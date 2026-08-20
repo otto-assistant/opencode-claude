@@ -719,8 +719,21 @@ export const ClaudeCodePlugin: Plugin = async (
       const selected = resolveClaudeModelSelection(hookInput.model.id, variant);
       // With one provider per account the provider IS the account; the
       // `model@account` form still works for anything pinned to it earlier.
-      const account =
-        accountIdFromProviderId(hookInput.model.providerID) ?? selected.account;
+      // The DEFAULT account keeps the bare `claude-code` provider id, so
+      // accountIdFromProviderId returns null for it — indistinguishable from
+      // "no account requested". The proxy then falls back to the session's
+      // sticky binding, and picking the default account in the model picker
+      // silently did nothing: the turn kept running on whatever account the
+      // conversation was already pinned to, while the model name showed the
+      // DEFAULT account's quota. Two accounts were spent to zero this way
+      // while the picker read 68% free.
+      //
+      // Choosing the bare provider IS choosing the default account. Say so.
+      const providerAccount = isClaudeProviderId(hookInput.model.providerID)
+        ? (accountIdFromProviderId(hookInput.model.providerID) ??
+            (isMultiAccount() ? getDefaultAccount().id : null))
+        : null;
+      const account = providerAccount ?? selected.account;
       if (account) {
         selected.account = account;
         output.headers[ACCOUNT_HEADER] = account;

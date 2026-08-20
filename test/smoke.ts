@@ -1802,6 +1802,31 @@ async function main() {
           "count_tokens-style responses carry none and must not be stored",
         );
 
+        // ---- Picking the default account must actually switch to it ----
+        // Regression: the default account keeps the bare `claude-code`
+        // provider id, so it decoded to null — "no account requested" — and
+        // the proxy kept the session on its old sticky binding. The picker
+        // showed the default account's quota while spending someone else's.
+        {
+          const { accountIdFromProviderId, isClaudeProviderId, providerIdForAccount } =
+            await import("../src/constants.ts");
+
+          // The bare id carries no account of its own...
+          assert.equal(accountIdFromProviderId("claude-code"), null);
+          // ...but it IS one of ours, which is what lets the caller map it to
+          // the default account instead of treating it as "no preference".
+          assert.equal(isClaudeProviderId("claude-code"), true);
+          assert.equal(isClaudeProviderId("litellm-auto"), false);
+
+          // Non-default accounts were never affected: their id is in the
+          // provider id, so they always sent an explicit account.
+          assert.equal(providerIdForAccount("tercera", false), "claude-code-tercera");
+          assert.equal(accountIdFromProviderId("claude-code-tercera"), "tercera");
+          // And the default keeps the bare id, so nothing renames for
+          // single-account installs.
+          assert.equal(providerIdForAccount("personal", true), "claude-code");
+        }
+
         // ---- Guardrails added after the 32-session sweep (2026-08-20) ----
         {
           // session-store derives its path from XDG_DATA_HOME; point that at a
