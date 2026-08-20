@@ -4,6 +4,10 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 
+function dirnameOf(p: string): string {
+  return p.slice(0, p.lastIndexOf("/"));
+}
+
 async function main() {
   // Isolate the whole data dir for the run. Without this the suite reads the
   // operator's real accounts.json (so "nothing configured" is not true),
@@ -1798,6 +1802,54 @@ async function main() {
           "count_tokens-style responses carry none and must not be stored",
         );
 
+        // ---- Guardrails added after the 32-session sweep (2026-08-20) ----
+        {
+          // session-store derives its path from XDG_DATA_HOME; point that at a
+          // scratch dir rather than building the path by hand.
+          const prevHome = process.env.XDG_DATA_HOME;
+          process.env.XDG_DATA_HOME = mkdtempSync(
+            joinPath(tmpdir(), "oc-claude-bind-"),
+          );
+          try {
+            const ss = await import("../src/session-store.ts");
+            ss.setForeignSessionId("conv-a", "uuid-a", {
+              accountId: "gone",
+              accountLabel: "Gone",
+            });
+            const before = ss.getSessionBinding("conv-a")!;
+
+            // Removing an account must be countable BEFORE it is removed.
+            assert.equal(ss.countBoundSessions("gone"), 1);
+            assert.equal(ss.countBoundSessions("nobody"), 0);
+
+            const repaired = ss.reconcileAccountBindings(
+              new Map([["personal", "Personal"]]),
+              "personal",
+            );
+            assert.equal(repaired, 1);
+            const after = ss.getSessionBinding("conv-a")!;
+            assert.equal(after.accountId, "personal");
+            // Marked, so the next turn starts fresh instead of paying to carry
+            // the old transcript into a different subscription.
+            assert.equal(after.rebound, true);
+            assert.equal(after.foreignSessionId, "");
+            // And NOT restamped: restamping made long-moved conversations
+            // resurface at the top of the session list as freshly used.
+            assert.equal(
+              after.updatedAt,
+              before.updatedAt,
+              "a sweep must not look like activity",
+            );
+
+            // Recording a real session id clears the mark.
+            ss.setForeignSessionId("conv-a", "uuid-b", { accountId: "personal" });
+            assert.equal(ss.getSessionBinding("conv-a")?.rebound, undefined);
+          } finally {
+            if (prevHome === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = prevHome;
+          }
+        }
+
         // ---- API reference pricing on the model catalog ----
         // The host renders per-response cost from `model.cost`; leaving it at
         // zero renders "$0.00", which reads as a price rather than a blank.
@@ -2332,8 +2384,21 @@ async function main() {
           );
           let calls = 0;
           setHostCatalogRefresher(async () => { calls++; });
+
+          // Disabled by default since 2026-08-20: the refresh is an empty
+          // PATCH /config, which has been seen to 503 a live server and abort
+          // in-flight sessions. Merely reading a list must not risk that.
+          const prevFlag = process.env.OPENCODE_CLAUDE_HOST_REFRESH;
+          delete process.env.OPENCODE_CLAUDE_HOST_REFRESH;
           await refreshHostCatalog();
-          assert.equal(calls, 1);
+          assert.equal(calls, 0, "no refresh unless explicitly enabled");
+
+          process.env.OPENCODE_CLAUDE_HOST_REFRESH = "1";
+          await refreshHostCatalog();
+          assert.equal(calls, 1, "opt-in still works");
+          if (prevFlag === undefined) delete process.env.OPENCODE_CLAUDE_HOST_REFRESH;
+          else process.env.OPENCODE_CLAUDE_HOST_REFRESH = prevFlag;
+          process.env.OPENCODE_CLAUDE_HOST_REFRESH = "1";
 
           setHostCatalogRefresher(async () => {
             throw new Error("host is not listening");

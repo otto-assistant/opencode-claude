@@ -24,6 +24,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "no
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { log } from "./log.js";
+import { countBoundSessions } from "./session-store.js";
 
 export type ClaudeAccount = {
   /** Slug used in model ids, store keys and headers. */
@@ -586,7 +587,7 @@ export function addAccount(input: {
 }
 
 /** Forget an account. Its Claude home is left on disk — credentials are the operator's. */
-export function removeAccount(id: string): void {
+export function removeAccount(id: string, force = false): void {
   const wanted = id.trim().toLowerCase();
   const existing = getAccounts();
   const target = existing.find((a) => a.id === wanted);
@@ -594,10 +595,24 @@ export function removeAccount(id: string): void {
   if (existing.length === 1) {
     throw new AccountError("cannot remove the only account", 409);
   }
+  // Conversations bound to this account do not disappear with it. They get
+  // swept onto the default account, lose the transcript that lived in this
+  // account's Claude home, and resurface where nobody put them. Removing an
+  // account with live conversations is therefore a decision about THOSE
+  // conversations, and it has to be made deliberately.
+  const bound = countBoundSessions(wanted);
+  if (bound > 0 && !force) {
+    throw new AccountError(
+      `"${wanted}" still owns ${bound} conversation${bound === 1 ? "" : "s"}. ` +
+        `Removing it moves them to the default account and loses their Claude ` +
+        `transcript. Move them first, or pass force to accept that.`,
+      409,
+    );
+  }
   const next = existing.filter((a) => a.id !== wanted);
   if (target.isDefault) next[0].isDefault = true;
   persistAccounts(normalize(next));
-  log.info("[opencode-claude] account removed", { id: wanted });
+  log.info("[opencode-claude] account removed", { id: wanted, boundSessions: bound });
 }
 
 /**

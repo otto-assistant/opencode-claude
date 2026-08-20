@@ -27,8 +27,29 @@ export function setHostCatalogRefresher(fn: Refresher | null): void {
  * would not re-read its config. The worst case is a stale picker until the
  * next restart, which is where we were before.
  */
+/**
+ * Off by default since 2026-08-20.
+ *
+ * The refresh is an empty `PATCH /config`, which is not the inert no-op it
+ * looks like: issued against a live server it has been observed returning 503
+ * and aborting in-flight sessions. It also rebuilds the host's model catalog
+ * underneath whatever the operator had selected. That is an acceptable price
+ * when someone just renamed an account and is looking at the panel; it is not
+ * acceptable as a side effect of merely reading a list.
+ *
+ * Set OPENCODE_CLAUDE_HOST_REFRESH=1 to allow it again.
+ */
+function hostRefreshEnabled(): boolean {
+  const flag = (process.env.OPENCODE_CLAUDE_HOST_REFRESH ?? "").toLowerCase();
+  return flag === "1" || flag === "true" || flag === "on";
+}
+
 export async function refreshHostCatalog(): Promise<void> {
   if (!refresher) return;
+  if (!hostRefreshEnabled()) {
+    log.info("[opencode-claude] host catalog refresh skipped (disabled)");
+    return;
+  }
   try {
     await refresher();
   } catch (err) {

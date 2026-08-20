@@ -125,6 +125,7 @@ import {
 } from "./rate-limit.js";
 import {
   buildConversationTranscript,
+  historyMaxChars,
   extractTextContent,
   latestUserPrompt,
   priorMessagesOf,
@@ -281,6 +282,13 @@ async function refreshPlanQuota(
   planUsageInFlight.set(key, request);
   return request;
 }
+
+/**
+ * A transferred history this large is worth saying out loud. Not a limit — the
+ * limit is historyMaxChars() — just the point past which silence is the wrong
+ * default.
+ */
+const UNUSUAL_TRANSFER_CHARS = 50_000;
 
 /** Injectable for smoke tests — production path always uses startClaudeQuery. */
 let queryStarter: typeof startClaudeQuery = startClaudeQuery;
@@ -1488,18 +1496,44 @@ async function handleChatCompletions(
     lostResumeTarget = true;
   }
 
+  // A conversation swept between accounts by machinery never asked to move, so
+  // it must not pay to carry its history into a different subscription. This is
+  // not hypothetical: removing one account orphaned 32 conversations, the
+  // reconciler swept them all onto the default, and each one then queued a
+  // six-figure-character transfer against the only account with quota left.
+  const reboundByMachinery = Boolean(getSessionBinding(conversationKey)?.rebound);
+
   // A resumable Claude session already owns the conversation context. When
   // that transcript is lost, start Claude fresh but transfer the history that
   // OpenCode still has instead of silently reducing the turn to one message.
-  const transcript = resume
-    ? ""
-    : buildConversationTranscript(priorMessagesOf(messages));
+  const transcript =
+    resume || reboundByMachinery
+      ? ""
+      : buildConversationTranscript(priorMessagesOf(messages));
+  if (reboundByMachinery) {
+    log.warn(
+      "[opencode-claude] account rebound by reconcile; starting fresh without transferring history",
+      { conversationKey, account: account.id },
+    );
+  }
   if (transcript) {
     log.info("[opencode-claude] injecting transferred conversation history", {
       conversationKey,
       transcriptChars: transcript.length,
       historyMessages: priorMessagesOf(messages).length,
     });
+    // Loud, and BEFORE the turn is spent rather than in next month's usage.
+    // A transfer this size is a one-off cost by design, but it is charged to a
+    // subscription window, and the operator deserves to see it coming.
+    if (transcript.length >= UNUSUAL_TRANSFER_CHARS) {
+      log.warn("[opencode-claude] unusually large history transfer", {
+        conversationKey,
+        account: account.id,
+        transcriptChars: transcript.length,
+        approxTokens: Math.round(transcript.length / 4),
+        cap: historyMaxChars(),
+      });
+    }
   }
   const contextualPrompt = withConversationContext(prompt, transcript);
 

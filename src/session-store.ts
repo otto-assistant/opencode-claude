@@ -15,6 +15,14 @@ export type ClaudeSessionBinding = {
   accountId?: string;
   /** Label of that account at bind time — for read-only displays. */
   accountLabel?: string;
+  /**
+   * The binding was moved between accounts by machinery, not by the operator
+   * continuing a conversation. The Claude transcript this pointed at lives in
+   * the OLD account's home and is unreachable from the new one, so the next
+   * turn must start FRESH — and must not pay to carry the old history into a
+   * different subscription. Cleared as soon as a real session id is recorded.
+   */
+  rebound?: boolean;
   updatedAt: number;
 };
 
@@ -86,12 +94,26 @@ export function reconcileAccountBindings(
       accountId: defaultAccountId,
       accountLabel: fallbackLabel,
       foreignSessionId: "",
-      updatedAt: Date.now(),
+      // The next turn starts fresh WITHOUT transferring history: this
+      // conversation did not move accounts because anyone asked it to.
+      rebound: true,
+      // `updatedAt` is left alone on purpose. Stamping it here reordered the
+      // session list and made conversations the operator had long since moved
+      // elsewhere resurface as freshly-used Claude sessions.
     };
     repaired++;
   }
   if (repaired) writeStore(store);
   return repaired;
+}
+
+/**
+ * How many stored conversations name this account. Removing an account is only
+ * safe to do quietly when the answer is zero.
+ */
+export function countBoundSessions(accountId: string): number {
+  const wanted = accountId.trim().toLowerCase();
+  return Object.values(readStore()).filter((b) => b.accountId === wanted).length;
 }
 
 /** Repoint every session bound to an old account id (see renameAccount). */
