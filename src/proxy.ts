@@ -789,7 +789,14 @@ async function handlePanelRoutes(
       if (!account) return jsonError(`unknown account "${id}"`, 404);
 
       if (req.method === "DELETE" && !action) {
-        removeAccount(id);
+        // Without a way to say "yes, I know", the 409 guard just sends the
+        // operator to edit accounts.json by hand — which is the one path that
+        // skips every check and is exactly how the account with 32 bound
+        // conversations disappeared.
+        const force = ["1", "true", "yes"].includes(
+          (url.searchParams.get("force") ?? "").trim().toLowerCase(),
+        );
+        removeAccount(id, force);
         clearAccountIdentity(id);
         clearAccountQuota(id);
         await refreshHostCatalog();

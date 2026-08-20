@@ -235,6 +235,12 @@ export function buildAccountTools(): Record<string, ToolDefinition> {
           .describe(
             "New id, for rename. Changes the model ids (opus@<id>); quota, usage and session bindings move with it.",
           ),
+        force: tool.schema
+          .boolean()
+          .optional()
+          .describe(
+            "For remove: accept that the account still owns conversations. They move to the default account and lose their Claude transcript, so their next turn starts fresh. Without this the removal is refused and says how many.",
+          ),
         configDir: tool.schema
           .string()
           .optional()
@@ -295,7 +301,7 @@ export function buildAccountTools(): Record<string, ToolDefinition> {
               : `Renamed ${id} to "${renamed.label}".`;
           }
           case "remove":
-            removeAccount(id);
+            removeAccount(id, args.force === true);
             clearAccountIdentity(id);
             clearAccountQuota(id);
             await refreshHostCatalog();
