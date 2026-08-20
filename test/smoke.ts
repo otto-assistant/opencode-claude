@@ -15,10 +15,16 @@ async function main() {
   const { join: joinTmp } = await import("node:path");
   const suiteDataDir = mkTmp(joinTmp(osTmpdir(), "oc-claude-suite-"));
   const prevSuiteXdg = process.env.XDG_DATA_HOME;
+  const prevProxyPort = process.env.OPENCODE_CLAUDE_PROXY_PORT;
   process.env.XDG_DATA_HOME = suiteDataDir;
+  // The smoke suite must bind its own ephemeral listener, not reuse the live
+  // plugin proxy when the developer shell exports the production port.
+  delete process.env.OPENCODE_CLAUDE_PROXY_PORT;
   const restoreSuiteEnv = () => {
     if (prevSuiteXdg === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = prevSuiteXdg;
+    if (prevProxyPort === undefined) delete process.env.OPENCODE_CLAUDE_PROXY_PORT;
+    else process.env.OPENCODE_CLAUDE_PROXY_PORT = prevProxyPort;
     rmTmp(suiteDataDir, { recursive: true, force: true });
   };
 
@@ -591,7 +597,7 @@ async function main() {
     assert.ok(titleMs < 2000, `title path too slow: ${titleMs}ms`);
     assert.match(titleBody, /data: /);
     assert.match(titleBody, /\[DONE\]/);
-    assert.match(titleBody, /binary search trees/i);
+    assert.match(titleBody, /binary\s+search\s+tree/i);
     assert.doesNotMatch(titleBody, /reasoning_content/);
   }
 
@@ -1121,8 +1127,8 @@ async function main() {
       );
       rmSync(fakeProjectsDir, { recursive: true, force: true });
 
-      // 3. Stored binding with a MISSING transcript file → binding dropped,
-      //    history injected instead of a doomed resume
+      // 3. Stored binding with a MISSING transcript file → binding dropped and
+      //    a fresh turn starts without replaying stale history.
       setForeignSessionId("smoke-history-dead", "mock-sess-gone");
       const seen3 = { params: null as Record<string, unknown> | null };
       mockTurn(seen3, null); // no init event → store not rewritten
@@ -1130,7 +1136,8 @@ async function main() {
       assert.equal(res3.status, 200);
       await res3.text();
       assert.equal(seen3.params!.resume, undefined);
-      assert.match(String(seen3.params!.prompt ?? ""), /<conversation_history>/);
+      assert.doesNotMatch(String(seen3.params!.prompt ?? ""), /<conversation_history>/);
+      assert.match(String(seen3.params!.prompt ?? ""), /what is the codename\?/);
       assert.equal(getForeignSessionId("smoke-history-dead"), undefined);
 
       clearForeignSessionId("smoke-history-fresh");
