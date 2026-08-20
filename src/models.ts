@@ -22,7 +22,58 @@ export type ClaudeModel = {
   contextWindow: number;
   maxTokens: number;
   resolvedId?: string;
+  /** List API price, $/1M tokens. See API_PRICING. */
+  cost?: ModelCost;
 };
+
+export type ModelCost = {
+  input: number;
+  output: number;
+  cache: { read: number; write: number };
+};
+
+/**
+ * Anthropic list prices, $ per 1M tokens — what these turns WOULD cost on an
+ * API key. Nothing here is billed: a subscription turn costs quota, not money.
+ * It is published because "what am I spending" is unanswerable otherwise, and
+ * because the host renders cost per response from this very field: without it
+ * every turn reads $0.00, which is a claim, not a blank.
+ *
+ * Cache rates follow Anthropic's published multipliers on the input rate:
+ * reads at 0.1x, 5-minute writes at 1.25x.
+ *
+ * Set OPENCODE_CLAUDE_MODEL_COST=0 to publish nothing and go back to zeros.
+ */
+const API_PRICING: Record<string, { input: number; output: number }> = {
+  "Fable 5": { input: 10, output: 50 },
+  "Opus 5": { input: 5, output: 25 },
+  "Opus 4.8": { input: 5, output: 25 },
+  "Sonnet 5": { input: 3, output: 15 },
+  "Sonnet 4.6": { input: 3, output: 15 },
+  "Haiku 4.5": { input: 1, output: 5 },
+};
+
+const CACHE_READ_MULTIPLIER = 0.1;
+const CACHE_WRITE_MULTIPLIER = 1.25;
+
+export function costFor(name: string): ModelCost | undefined {
+  if (modelCostDisabled()) return undefined;
+  const listed = API_PRICING[name];
+  if (!listed) return undefined;
+  return {
+    input: listed.input,
+    output: listed.output,
+    cache: {
+      read: Number((listed.input * CACHE_READ_MULTIPLIER).toFixed(4)),
+      write: Number((listed.input * CACHE_WRITE_MULTIPLIER).toFixed(4)),
+    },
+  };
+}
+
+export function modelCostDisabled(): boolean {
+  const flag = (process.env.OPENCODE_CLAUDE_MODEL_COST ?? "").toLowerCase();
+  return flag === "0" || flag === "false" || flag === "off";
+}
 
 const LIMIT_1M = { context: 1_000_000, output: 128_000 } as const;
 const LIMIT_200K = { context: 200_000, output: 64_000 } as const;
@@ -44,6 +95,7 @@ function model(
   limit: { context: number; output: number },
   resolvedId?: string,
 ): ClaudeModel {
+  const cost = costFor(name);
   return {
     id,
     name,
@@ -51,6 +103,7 @@ function model(
     contextWindow: limit.context,
     maxTokens: limit.output,
     ...(resolvedId ? { resolvedId } : {}),
+    ...(cost ? { cost } : {}),
   };
 }
 

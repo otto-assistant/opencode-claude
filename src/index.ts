@@ -57,6 +57,7 @@ import {
   getClaudeModels,
   getClaudeModelsForAccount,
   LOGIN_PLACEHOLDER_MODELS,
+  modelCostDisabled,
   type ClaudeModel,
 } from "./models.js";
 import {
@@ -82,6 +83,38 @@ function isClaudeOAuthAuth(auth: unknown): auth is ClaudeOAuthAuth {
     typeof (auth as { refresh?: unknown }).refresh === "string" &&
     typeof (auth as { expires?: unknown }).expires === "number"
   );
+}
+
+/**
+ * What the turn WOULD cost on an API key, $/1M tokens.
+ *
+ * A subscription turn is paid in quota, not dollars, so this is a reference
+ * price and not a bill. It is published anyway because the host computes the
+ * per-response cost from this field: leaving it at zero does not render "no
+ * cost", it renders "$0.00" — an answer, and the wrong one.
+ *
+ * Falls back to zeros for a model with no listed price, and when
+ * OPENCODE_CLAUDE_MODEL_COST is turned off.
+ */
+function apiReferenceCost(model: ClaudeModel) {
+  if (modelCostDisabled()) return zeroCost();
+  return model.cost ?? zeroCost();
+}
+
+/**
+ * Same prices in the shape the CONFIG merge reads, which is not the shape the
+ * runtime provider hook uses. OpenCode reads nested `cost.cache.{read,write}`
+ * from a provider's runtime models, but flat `cost.cache_read` /
+ * `cost.cache_write` from config — anything nested there silently lands as 0.
+ */
+function apiReferenceConfigCost(model: ClaudeModel) {
+  const cost = modelCostDisabled() ? undefined : model.cost;
+  return {
+    input: cost?.input ?? 0,
+    output: cost?.output ?? 0,
+    cache_read: cost?.cache.read ?? 0,
+    cache_write: cost?.cache.write ?? 0,
+  };
 }
 
 function zeroCost() {
@@ -140,7 +173,7 @@ function buildProviderModel(
       input: ["text", "image", "pdf"],
       output: ["text"],
     },
-    cost: zeroCost(),
+    cost: apiReferenceCost(model),
     limit: {
       context: model.contextWindow,
       output: model.maxTokens,
@@ -196,6 +229,7 @@ function buildConfigModelEntry(model: ClaudeModel): Record<string, unknown> {
       input: ["text", "image", "pdf"],
       output: ["text"],
     },
+    cost: apiReferenceConfigCost(model),
     limit: {
       context: model.contextWindow,
       output: model.maxTokens,

@@ -1695,6 +1695,34 @@ async function main() {
           "count_tokens-style responses carry none and must not be stored",
         );
 
+        // ---- API reference pricing on the model catalog ----
+        // The host renders per-response cost from `model.cost`; leaving it at
+        // zero renders "$0.00", which reads as a price rather than a blank.
+        {
+          const { getClaudeModels: models, costFor } = await import(
+            "../src/models.ts"
+          );
+          // By id, not by name: in multi-account mode the display name
+          // carries an icon and the quota suffix.
+          const catalog = models();
+          const opus = catalog.find((m) => m.id === "opus")!;
+          assert.equal(opus.cost?.input, 5, "Opus 5 list price, $/1M in");
+          assert.equal(opus.cost?.output, 25);
+          // Cache rates are multipliers on the INPUT rate, not flat numbers.
+          assert.equal(opus.cost?.cache.read, 0.5, "reads bill at 0.1x input");
+          assert.equal(opus.cost?.cache.write, 6.25, "5m writes at 1.25x input");
+          const haiku = catalog.find((m) => m.id === "haiku")!;
+          assert.equal(haiku.cost?.input, 1);
+          assert.equal(haiku.cost?.cache.read, 0.1);
+          // Every catalog model must be priced: an unpriced one silently
+          // reports $0.00 and looks free.
+          for (const m of catalog) {
+            assert.ok(m.cost, `${m.id} has no listed price`);
+          }
+          // A model nobody published a price for stays unpriced, not wrong.
+          assert.equal(costFor("Not A Model"), undefined);
+        }
+
         // ---- Plan usage over the SDK control channel (`get_usage`) ----
         // Payload captured from claude 2.1.235. Its units are NOT the header
         // units, and both differences are silent if unhandled: utilization is
