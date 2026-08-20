@@ -158,8 +158,17 @@ export function bindConversationAccount(
   const store = readStore();
   const existing = store[conversationKey];
   if (existing?.accountId === accountId) return;
+  // Moving a conversation to another account kills its resume target, and the
+  // next turn would rebuild the whole history to compensate. That is the exact
+  // cost that emptied two subscriptions on 2026-08-20, and it is now charged
+  // per conversation on every account change — including the ones nobody asked
+  // for, such as a default-account header arriving where none used to.
+  const movedAccount = Boolean(
+    existing && existing.accountId && existing.accountId !== accountId,
+  );
   store[conversationKey] = {
     ...(existing ?? { conversationKey, foreignSessionId: "" }),
+    ...(movedAccount ? { rebound: true } : {}),
     conversationKey,
     // Switching account invalidates the resume target: the transcript lives in
     // the other account's Claude home and resuming it there would either fail

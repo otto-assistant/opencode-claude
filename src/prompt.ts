@@ -453,7 +453,20 @@ export type ConversationHistoryMessage = {
 };
 
 /** Default history budget — generous on purpose ("keep it big"). */
-const DEFAULT_HISTORY_MAX_CHARS = 400_000;
+/**
+ * ~12k tokens. Era 400.000 (~100k tokens), y ese numero es la diferencia entre
+ * "esta conversacion arranca sin contexto" y "esta conversacion se come una
+ * ventana de cuota entera". El 20-08, 32 conversaciones quedaron encoladas a
+ * ese precio contra la unica cuenta que tenia cuota.
+ *
+ * Un traspaso es una perdida de contexto se mire como se mire: el transcript
+ * se recorta por el final, asi que lo que se conserva es lo reciente, que es
+ * lo que importa para seguir. Pagar ocho veces mas por arrastrar el principio
+ * de una conversacion de 500 mensajes no compra ocho veces mas continuidad.
+ *
+ * OPENCODE_CLAUDE_HISTORY_MAX_CHARS lo sube para un caso concreto.
+ */
+const DEFAULT_HISTORY_MAX_CHARS = 50_000;
 const TOOL_RESULT_MAX_CHARS = 1_000;
 const ATTACHMENT_NOTE = "[attachment(s) omitted from transferred history]";
 
