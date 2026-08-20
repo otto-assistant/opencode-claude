@@ -25,12 +25,26 @@ import {
   syncClaudeCliCredentialsToOpenCode,
 } from "./auth-login.js";
 import {
+  ACCOUNT_HEADER,
+  accountIdFromProviderId,
+  isClaudeProviderId,
+  providerIdForAccount,
   DEFAULT_MODEL_ID,
-  DIRECTORY_HEADER,
   EFFORT_HEADER,
   OPENAI_COMPATIBLE_NPM,
   PROVIDER_ID,
 } from "./constants.js";
+import { applyClaudeRequestContextHeaders } from "./request-context.js";
+import {
+  accountIcon,
+  configureAccounts,
+  getAccounts,
+  getDefaultAccount,
+  isMultiAccount,
+  type ClaudeAccount,
+} from "./accounts.js";
+import { readClaudeCliOAuthCredentials } from "./credentials.js";
+import { getAccountIdentity } from "./identity.js";
 import { detectClaudeCode } from "./detect.js";
 import { log } from "./log.js";
 import {
@@ -41,7 +55,9 @@ import {
   buildConfigVariants,
   buildEffortVariants,
   getClaudeModels,
+  getClaudeModelsForAccount,
   LOGIN_PLACEHOLDER_MODELS,
+  modelCostDisabled,
   type ClaudeModel,
 } from "./models.js";
 import {
@@ -49,6 +65,8 @@ import {
   getProxyPort,
   startProxy,
 } from "./proxy.js";
+import { buildAccountTools } from "./tools.js";
+import { setHostCatalogRefresher } from "./host-refresh.js";
 
 type ClaudeOAuthAuth = {
   type: "oauth";
@@ -67,21 +85,44 @@ function isClaudeOAuthAuth(auth: unknown): auth is ClaudeOAuthAuth {
   );
 }
 
+/**
+ * What the turn WOULD cost on an API key, $/1M tokens.
+ *
+ * A subscription turn is paid in quota, not dollars, so this is a reference
+ * price and not a bill. It is published anyway because the host computes the
+ * per-response cost from this field: leaving it at zero does not render "no
+ * cost", it renders "$0.00" — an answer, and the wrong one.
+ *
+ * Falls back to zeros for a model with no listed price, and when
+ * OPENCODE_CLAUDE_MODEL_COST is turned off.
+ */
+function apiReferenceCost(model: ClaudeModel) {
+  if (modelCostDisabled()) return zeroCost();
+  return model.cost ?? zeroCost();
+}
+
+/**
+ * Same prices in the shape the CONFIG merge reads, which is not the shape the
+ * runtime provider hook uses. OpenCode reads nested `cost.cache.{read,write}`
+ * from a provider's runtime models, but flat `cost.cache_read` /
+ * `cost.cache_write` from config — anything nested there silently lands as 0.
+ */
+function apiReferenceConfigCost(model: ClaudeModel) {
+  const cost = modelCostDisabled() ? undefined : model.cost;
+  return {
+    input: cost?.input ?? 0,
+    output: cost?.output ?? 0,
+    cache_read: cost?.cache.read ?? 0,
+    cache_write: cost?.cache.write ?? 0,
+  };
+}
+
 function zeroCost() {
   return {
     input: 0,
     output: 0,
     cache: { read: 0, write: 0 },
   };
-}
-
-export function applyClaudeRequestContextHeaders(
-  headers: Record<string, string>,
-  directory: string,
-  sessionID?: string,
-): void {
-  headers[DIRECTORY_HEADER] = directory;
-  if (sessionID) headers["x-opencode-claude-session"] = sessionID;
 }
 
 function buildProviderModel(
@@ -132,7 +173,7 @@ function buildProviderModel(
       input: ["text", "image", "pdf"],
       output: ["text"],
     },
-    cost: zeroCost(),
+    cost: apiReferenceCost(model),
     limit: {
       context: model.contextWindow,
       output: model.maxTokens,
@@ -145,6 +186,27 @@ function buildProviderModel(
     release_date: "",
     variants,
   };
+}
+
+/**
+ * Provider name for an account: label plus the Claude login behind it.
+ *
+ * The host shows this under the model name when hovering, and as the group
+ * header in the picker — the one place where "which subscription am I about to
+ * spend" can be answered before spending it. The label alone does not answer
+ * it: labels are operator-chosen and go stale the moment a Claude home is
+ * re-logged to a different account, which is exactly when the question matters.
+ */
+function providerNameForAccount(account: ClaudeAccount): string {
+  const email = getAccountIdentity(account.id)?.email;
+  const label = account.label.trim();
+  // Do not repeat the address when the operator already named the account after
+  // it, which is a natural thing to do.
+  const showEmail = email && !label.toLowerCase().includes(email.toLowerCase());
+  // The icon leads, matching the model rows underneath: the group header is the
+  // legend that says which account a glyph stands for.
+  const icon = isMultiAccount() ? `${accountIcon(account)} ` : "";
+  return `${icon}Claude Code · ${label}${showEmail ? ` · ${email}` : ""}`;
 }
 
 function buildConfigModelEntry(model: ClaudeModel): Record<string, unknown> {
@@ -167,6 +229,7 @@ function buildConfigModelEntry(model: ClaudeModel): Record<string, unknown> {
       input: ["text", "image", "pdf"],
       output: ["text"],
     },
+    cost: apiReferenceConfigCost(model),
     limit: {
       context: model.contextWindow,
       output: model.maxTokens,
@@ -195,6 +258,64 @@ function buildClaudeProviderModels(
     );
   }
   return providerModels;
+}
+
+/**
+ * Declare one provider per account.
+ *
+ * The host groups the model picker by provider, so a single provider carrying
+ * every account's models produces one flat list — 24 rows for four accounts,
+ * each row repeating the account label. One provider per account turns that
+ * into four labelled groups of six, which is how an operator actually reads it.
+ *
+ * The default account keeps the bare `claude-code` id, so nothing renames for
+ * single-account installs or for sessions already pinned to it.
+ */
+function ensureAccountProviderConfigs(config: Record<string, any>): void {
+  if (!config.provider || typeof config.provider !== "object") {
+    config.provider = {};
+  }
+  for (const account of getAccounts()) {
+    if (account.isDefault) continue; // handled by ensureClaudeProviderConfig
+    const id = providerIdForAccount(account.id, false);
+    const existing = config.provider[id] ?? {};
+    const port = getProxyPort();
+    const baseURL = port ? `http://127.0.0.1:${port}/v1` : undefined;
+    config.provider[id] = {
+      ...existing,
+      name: providerNameForAccount(account),
+      npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
+      options: {
+        apiKey: "claude-code-proxy",
+        includeUsage: true,
+        ...(existing.options && typeof existing.options === "object"
+          ? existing.options
+          : {}),
+        ...(baseURL ? { baseURL } : {}),
+      },
+      models: {
+        ...Object.fromEntries(
+          getClaudeModelsForAccount(account).map((model) => [
+            model.id,
+            buildConfigModelEntry(model),
+          ]),
+        ),
+        ...(existing.models && typeof existing.models === "object"
+          ? existing.models
+          : {}),
+      },
+    };
+    // `enabled_providers` is an allowlist: a provider missing from it is
+    // filtered out of the picker entirely, however well it is configured.
+    if (Array.isArray(config.enabled_providers)) {
+      if (
+        config.enabled_providers.includes(PROVIDER_ID) &&
+        !config.enabled_providers.includes(id)
+      ) {
+        config.enabled_providers.push(id);
+      }
+    }
+  }
 }
 
 function ensureClaudeProviderConfig(
@@ -228,12 +349,24 @@ function ensureClaudeProviderConfig(
     };
   }
 
+  // In multi-account mode every provider names its account, this one included:
+  // a group headed by a bare "Claude Code" beside three labelled ones reads as
+  // the odd one out rather than as the default account. A name the operator
+  // genuinely customised is still respected.
+  const defaultAccountLabel = getDefaultAccount().label;
+  const customName =
+    typeof existing.name === "string" &&
+    existing.name.trim() &&
+    existing.name.trim() !== "Claude Code"
+      ? existing.name.trim()
+      : "";
   config.provider[PROVIDER_ID] = {
     ...existing,
     name:
-      typeof existing.name === "string" && existing.name.trim()
-        ? existing.name
-        : "Claude Code",
+      customName ||
+      (isMultiAccount()
+        ? providerNameForAccount(getDefaultAccount())
+        : "Claude Code"),
     npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
     options: {
       apiKey: "claude-code-proxy",
@@ -267,10 +400,36 @@ const REFRESH_MARGIN_MS = 120_000;
  */
 const refreshInFlight = new Map<string, Promise<string | null>>();
 
+/**
+ * Access token for an account that owns its own Claude home.
+ *
+ * Deliberately read-only: the CLI living in that config dir is the sole owner
+ * of its refresh chain, and rotating it from here is exactly the two-owner
+ * replay that gets the whole grant revoked (see auth-login.ts). An expired
+ * token yields null, which makes the proxy spawn the CLI WITHOUT
+ * CLAUDE_CODE_OAUTH_TOKEN so the CLI refreshes its own credentials file.
+ */
+function resolveScopedAccountToken(account: ClaudeAccount): string | null {
+  const creds = readClaudeCliOAuthCredentials({ configDir: account.configDir });
+  if (!creds?.accessToken) return null;
+  if (creds.expiresAt && creds.expiresAt <= Date.now() + 30_000) {
+    log.info("[opencode-claude] account token expired; letting the CLI refresh", {
+      account: account.id,
+    });
+    return null;
+  }
+  return creds.accessToken;
+}
+
 async function resolveAccessToken(
   input: PluginInput,
   getAuth: () => Promise<unknown>,
+  account?: ClaudeAccount,
 ): Promise<string | null> {
+  // Accounts pinned to their own Claude home never touch auth.json: that file
+  // has exactly one `claude-code` slot, and sharing it across subscriptions
+  // would hand one account's token to another.
+  if (account?.configDir) return resolveScopedAccountToken(account);
   let auth = await getAuth();
   // The host's in-memory auth store can lag auth.json (tokens written by a
   // sibling process, a headless login, or a race at server start). When the
@@ -393,12 +552,24 @@ async function loadClaudeRuntime(
   const detection = await detectClaudeCode();
   const accessToken = await resolveAccessToken(input, getAuth);
 
-  const models =
-    accessToken || detection.loggedIn || readStoredClaudeOAuth()
-      ? getClaudeModels()
-      : LOGIN_PLACEHOLDER_MODELS;
+  // In multi-account mode a non-default account can be signed in while the
+  // ambient one is not, so the catalog must not collapse to the login
+  // placeholder just because the default account has no token yet.
+  const anyAccountReady =
+    accessToken ||
+    detection.loggedIn ||
+    Boolean(readStoredClaudeOAuth()) ||
+    getAccounts().some(
+      (a) => a.configDir && resolveScopedAccountToken(a) !== null,
+    );
 
-  if (!accessToken && !detection.loggedIn) {
+  const models = !anyAccountReady
+    ? LOGIN_PLACEHOLDER_MODELS
+    : isMultiAccount()
+      ? getClaudeModelsForAccount(getDefaultAccount())
+      : getClaudeModels();
+
+  if (!anyAccountReady) {
     // Still seed placeholder models + a proxy so the provider stays visible.
     const port = await startProxy(async () => null);
     const providerModels = buildClaudeProviderModels(models);
@@ -406,8 +577,8 @@ async function loadClaudeRuntime(
     return { port, providerModels };
   }
 
-  const port = await startProxy(async () => {
-    return resolveAccessToken(input, getAuth);
+  const port = await startProxy(async (account) => {
+    return resolveAccessToken(input, getAuth, account);
   });
 
   const providerModels = buildClaudeProviderModels(models);
@@ -418,9 +589,37 @@ async function loadClaudeRuntime(
 /**
  * OpenCode plugin that provides Claude Code authentication and model access.
  */
+export type ClaudeCodePluginOptions = {
+  /**
+   * Claude subscriptions to expose, each with its own CLAUDE_CONFIG_DIR:
+   *   { "accounts": [
+   *       { "id": "work", "label": "Work", "configDir": "~/.claude-work", "default": true },
+   *       { "id": "personal", "label": "Personal", "configDir": "~/.claude-personal" }
+   *   ] }
+   * Omit it entirely for the classic single-subscription behaviour.
+   */
+  accounts?: unknown;
+};
+
 export const ClaudeCodePlugin: Plugin = async (
   input: PluginInput,
+  options?: ClaudeCodePluginOptions,
 ): Promise<Hooks> => {
+  // Resolve the account registry before anything reads it: the model catalog,
+  // the proxy and the credential probes all key off it.
+  configureAccounts(options?.accounts);
+
+  // The model picker caches the catalog, and the account label lives inside the
+  // model name. An empty config patch makes the host re-run the config hook, so
+  // a rename or a new account shows up without restarting OpenCode.
+  setHostCatalogRefresher(async () => {
+    const config = input.client.config as {
+      update?: (args: { body: Record<string, unknown> }) => Promise<unknown>;
+    };
+    if (typeof config?.update !== "function") return;
+    await config.update({ body: {} });
+  });
+
   // Best-effort CLI sync on load so OpenChamber / headless hosts work without
   // an explicit auth.methods click when `claude` is already logged in.
   try {
@@ -433,6 +632,11 @@ export const ClaudeCodePlugin: Plugin = async (
   }
 
   return {
+    // Account management from inside a session, so adding or dropping a
+    // subscription does not require reaching a loopback page from whatever
+    // machine the operator happens to be on.
+    tool: buildAccountTools(),
+
     async config(config) {
       const detection = await detectClaudeCode();
       // Model visibility must not depend on the CLI's login state alone: a
@@ -440,15 +644,30 @@ export const ClaudeCodePlugin: Plugin = async (
       // (After a CLI logout the catalog collapsed to login+sonnet and the
       // provider looked broken despite a fresh plugin OAuth token.)
       const hasStoredAuth = Boolean(readStoredClaudeOAuth());
-      const models =
-        detection.loggedIn || detection.status === "ready" || hasStoredAuth
-          ? getClaudeModels()
-          : LOGIN_PLACEHOLDER_MODELS;
+      const hasScopedAccount = getAccounts().some(
+        (a) => a.configDir && resolveScopedAccountToken(a) !== null,
+      );
+      const ready =
+        detection.loggedIn ||
+        detection.status === "ready" ||
+        hasStoredAuth ||
+        hasScopedAccount;
+      // With one provider per account, `claude-code` carries only the default
+      // account's models — the others live in their own providers.
+      const models = !ready
+        ? LOGIN_PLACEHOLDER_MODELS
+        : isMultiAccount()
+          ? getClaudeModelsForAccount(getDefaultAccount())
+          : getClaudeModels();
 
       // Bind first (ephemeral port by default), then seed provider baseURL so
       // OpenCode's static config matches the live listener for this process.
       try {
-        await startProxy(async () => {
+        await startProxy(async (account) => {
+          if (account.configDir) {
+            // Scoped accounts never consult the host auth store.
+            return resolveAccessToken(input, async () => null, account);
+          }
           try {
             const authClient = input.client.auth as {
               get?: (args: { path: { id: string } }) => Promise<unknown>;
@@ -459,7 +678,7 @@ export const ClaudeCodePlugin: Plugin = async (
                 auth && typeof auth === "object" && "data" in auth
                   ? (auth as { data: unknown }).data
                   : auth;
-              return resolveAccessToken(input, async () => payload);
+              return resolveAccessToken(input, async () => payload, account);
             }
           } catch {
             // ignore
@@ -470,7 +689,7 @@ export const ClaudeCodePlugin: Plugin = async (
           // so use the normal resolver with an empty host response. It
           // falls back to the on-disk `claude-code` entry before considering
           // the optional Claude CLI credentials.
-          return resolveAccessToken(input, async () => null);
+          return resolveAccessToken(input, async () => null, account);
         });
       } catch (err) {
         log.error(
@@ -480,10 +699,13 @@ export const ClaudeCodePlugin: Plugin = async (
       }
 
       ensureClaudeProviderConfig(config as Record<string, any>, models);
+      if (isMultiAccount()) {
+        ensureAccountProviderConfigs(config as Record<string, any>);
+      }
     },
 
     "chat.headers": async (hookInput, output) => {
-      if (hookInput.model.providerID !== PROVIDER_ID) return;
+      if (!isClaudeProviderId(hookInput.model.providerID)) return;
       const messageModel = hookInput.message.model as {
         variant?: unknown;
       };
@@ -491,7 +713,31 @@ export const ClaudeCodePlugin: Plugin = async (
         typeof messageModel.variant === "string"
           ? messageModel.variant
           : undefined;
+      // The chosen model id carries the account (`opus@work`); the selection
+      // splits it so the proxy gets both without a second switch to keep in
+      // sync with the picker.
       const selected = resolveClaudeModelSelection(hookInput.model.id, variant);
+      // With one provider per account the provider IS the account; the
+      // `model@account` form still works for anything pinned to it earlier.
+      // The DEFAULT account keeps the bare `claude-code` provider id, so
+      // accountIdFromProviderId returns null for it — indistinguishable from
+      // "no account requested". The proxy then falls back to the session's
+      // sticky binding, and picking the default account in the model picker
+      // silently did nothing: the turn kept running on whatever account the
+      // conversation was already pinned to, while the model name showed the
+      // DEFAULT account's quota. Two accounts were spent to zero this way
+      // while the picker read 68% free.
+      //
+      // Choosing the bare provider IS choosing the default account. Say so.
+      const providerAccount = isClaudeProviderId(hookInput.model.providerID)
+        ? (accountIdFromProviderId(hookInput.model.providerID) ??
+            (isMultiAccount() ? getDefaultAccount().id : null))
+        : null;
+      const account = providerAccount ?? selected.account;
+      if (account) {
+        selected.account = account;
+        output.headers[ACCOUNT_HEADER] = account;
+      }
       output.headers[EFFORT_HEADER] = encodeClaudeModelSelection(selected);
       // The proxy runs in the long-lived OpenCode server process, whose cwd is
       // commonly the service account home (for example /home/ubuntu), not the
@@ -506,7 +752,7 @@ export const ClaudeCodePlugin: Plugin = async (
     },
 
     "chat.params": async (hookInput, output) => {
-      if (hookInput.model.providerID !== PROVIDER_ID) return;
+      if (!isClaudeProviderId(hookInput.model.providerID)) return;
       delete output.options.reasoningEffort;
     },
 
@@ -641,6 +887,6 @@ export const ClaudeCodePlugin: Plugin = async (
 export default ClaudeCodePlugin;
 
 export type { ClaudeOAuthTokens };
-export { detectClaudeCode } from "./detect.js";
-export { getClaudeModels, CLAUDE_CODE_MODELS } from "./models.js";
-export { startProxy, stopProxy, getClaudeProxyBaseUrl } from "./proxy.js";
+// Nada mas se exporta aqui: OpenCode invoca CADA export del entrypoint como
+// si fuera otro plugin. Los helpers viven en sus modulos (./detect.js,
+// ./models.js, ./proxy.js, ./request-context.js) y se importan desde alli.

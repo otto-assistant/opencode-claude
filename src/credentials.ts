@@ -71,8 +71,16 @@ export function extractClaudeOAuthCredentials(
 export function listClaudeCredentialsCandidates(
   homeDir = homedir(),
   env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+  options?: { scopedConfigDir?: string },
 ): string[] {
   const candidates: string[] = [];
+  const scoped = options?.scopedConfigDir?.trim();
+  if (scoped) {
+    // A scoped account reads ONLY its own Claude home. Falling through to the
+    // ambient candidates would hand it the default account's credentials and
+    // silently bill the wrong subscription.
+    return [join(scoped, ".credentials.json"), join(scoped, "credentials.json")];
+  }
   const configDir =
     typeof env.CLAUDE_CONFIG_DIR === "string" ? env.CLAUDE_CONFIG_DIR.trim() : "";
   if (configDir) {
@@ -107,8 +115,11 @@ function readFromKeychain(): ClaudeCliOAuthCredentials | null {
 function readFromFiles(
   homeDir = homedir(),
   env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+  scopedConfigDir?: string,
 ): ClaudeCliOAuthCredentials | null {
-  for (const path of listClaudeCredentialsCandidates(homeDir, env)) {
+  for (const path of listClaudeCredentialsCandidates(homeDir, env, {
+    ...(scopedConfigDir ? { scopedConfigDir } : {}),
+  })) {
     if (!existsSync(path)) continue;
     try {
       const raw = readFileSync(path, "utf8");
@@ -131,12 +142,23 @@ export function readClaudeCodeOAuthTokenFromEnv(
   return trimmed.length > 0 ? trimmed : null;
 }
 
+/**
+ * `configDir` pins the read to one account's Claude home. When set, the
+ * ambient sources (CLAUDE_CODE_OAUTH_TOKEN, the macOS keychain, `~/.claude`)
+ * are all skipped: they belong to whichever account the operator happens to be
+ * logged into, and using them here would run the turn on the wrong
+ * subscription while reporting the right one.
+ */
 export function readClaudeCliOAuthCredentials(options?: {
   homeDir?: string;
   env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+  configDir?: string;
 }): ClaudeCliOAuthCredentials | null {
   const env = options?.env ?? process.env;
   const homeDir = options?.homeDir ?? homedir();
+  const configDir = options?.configDir?.trim();
+
+  if (configDir) return readFromFiles(homeDir, env, configDir);
 
   const fromEnv = readClaudeCodeOAuthTokenFromEnv(env);
   if (fromEnv) {
@@ -155,6 +177,7 @@ export function readClaudeCliOAuthCredentials(options?: {
 export function hasClaudeCliOAuthCredentials(options?: {
   homeDir?: string;
   env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+  configDir?: string;
 }): boolean {
   return Boolean(readClaudeCliOAuthCredentials(options)?.accessToken);
 }

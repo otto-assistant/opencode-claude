@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process"
 import { findBinaryOnPath } from "./executable-path.js"
+import { recordQuotaFromHeaders } from "./quota.js"
 import { buildMetaPrompt, type MetaRequestKind } from "./request-kind.js"
 
 type MetaMessagesBody = {
@@ -65,6 +66,8 @@ export async function completeMetaRequest(params: {
   accessToken: string
   model?: string
   signal?: AbortSignal
+  /** Account to attribute the harvested quota headers to. */
+  accountId?: string
 }): Promise<MetaCompletionResult> {
   const { system, prompt } = buildMetaPrompt(
     Array.isArray(params.body.messages) ? params.body.messages : [],
@@ -97,6 +100,14 @@ export async function completeMetaRequest(params: {
     }),
     signal: params.signal,
   })
+
+  // Free quota telemetry: this response already crossed the wire. A failed
+  // response carries the headers too — and a 429 is exactly when they matter.
+  try {
+    recordQuotaFromHeaders(params.accountId, response.headers)
+  } catch {
+    // never let accounting break a title
+  }
 
   if (!response.ok) {
     const errText = await response.text().catch(() => "")

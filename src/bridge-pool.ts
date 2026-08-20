@@ -12,9 +12,11 @@ export type ParkedToolCall = {
   reject: (error: Error) => void;
 };
 
+/** `accountId` travels with the bridge so async failure paths (stream errors, dead sessions) record limits against the right subscription. */
 export type ParkedBridge = {
   id: string;
   conversationKey: string;
+  accountId?: string;
   handle: ClaudeQueryHandle;
   pendingTools: Map<string, ParkedToolCall>;
   createdAt: number;
