@@ -53,6 +53,7 @@ import {
   bindConversationAccount,
   getBoundAccountId,
   listSessionBindings,
+  reconcileAccountBindings,
 } from "./session-store.js";
 
 /** True when this account uses the ambient ~/.claude the CLI itself reads. */
@@ -69,7 +70,16 @@ function connected(accountId: string): boolean {
   );
 }
 
+function reconcileStoredAccountBindings(): void {
+  const accounts = getAccounts();
+  reconcileAccountBindings(
+    new Map(accounts.map((account) => [account.id, account.label])),
+    getDefaultAccount().id,
+  );
+}
+
 function describe(accountId: string, currentForSession?: string): string {
+  reconcileStoredAccountBindings();
   const account = findAccount(accountId);
   if (!account) return `${accountId}: unknown`;
   const identity = getAccountIdentity(accountId);
@@ -169,6 +179,7 @@ export function buildAccountTools(): Record<string, ToolDefinition> {
         "List the Claude subscriptions this plugin can use: which are connected, which login each one is, how much quota is left, and how many sessions are bound to each.",
       args: {},
       async execute(_args, context) {
+        reconcileStoredAccountBindings();
         const accounts = getAccounts();
         const current =
           getBoundAccountId(context.sessionID) ?? getDefaultAccount().id;
@@ -232,6 +243,7 @@ export function buildAccountTools(): Record<string, ToolDefinition> {
           ),
       },
       async execute(args, context) {
+        reconcileStoredAccountBindings();
         const id = (args.id ?? "").trim().toLowerCase();
         if (!id && args.action !== "add") {
           throw new Error(`"${args.action}" needs an account id`);

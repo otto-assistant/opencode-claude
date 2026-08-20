@@ -60,6 +60,40 @@ export function getSessionBinding(
   return readStore()[conversationKey] ?? null;
 }
 
+/**
+ * Bring persisted account bindings back in line with the live registry.
+ *
+ * Account removal is intentionally independent from this store (the Claude
+ * home is left on disk), so old bindings can outlive their account.  Keeping
+ * those ids around makes every later turn resolve the same stale id again and
+ * again.  Repointing the binding also preserves the session's sticky-account
+ * invariant for the next turn and makes the repair durable.
+ */
+export function reconcileAccountBindings(
+  accounts: ReadonlyMap<string, string> | ReadonlySet<string>,
+  defaultAccountId: string,
+): number {
+  const valid = accounts instanceof Map ? new Set(accounts.keys()) : accounts;
+  const fallbackLabel = accounts instanceof Map
+    ? accounts.get(defaultAccountId) ?? defaultAccountId
+    : defaultAccountId;
+  const store = readStore();
+  let repaired = 0;
+  for (const [key, binding] of Object.entries(store)) {
+    if (!binding.accountId || valid.has(binding.accountId)) continue;
+    store[key] = {
+      ...binding,
+      accountId: defaultAccountId,
+      accountLabel: fallbackLabel,
+      foreignSessionId: "",
+      updatedAt: Date.now(),
+    };
+    repaired++;
+  }
+  if (repaired) writeStore(store);
+  return repaired;
+}
+
 /** Repoint every session bound to an old account id (see renameAccount). */
 export function renameBoundAccount(oldId: string, newId: string, newLabel: string): void {
   const store = readStore();

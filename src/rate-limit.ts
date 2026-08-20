@@ -197,6 +197,7 @@ export function isClaudeRateLimitText(text: string): boolean {
   return (
     /hit your (session|usage) limit/i.test(text) ||
     /usage limit reached/i.test(text) ||
+    /(?:group's|group) usage limit is set to \$0/i.test(text) ||
     /rate[ -]?limit/i.test(text) ||
     /too many requests/i.test(text) ||
     /\b429\b/.test(text)

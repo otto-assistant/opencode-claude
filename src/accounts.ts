@@ -210,27 +210,46 @@ function fromEnv(): ClaudeAccount[] | null {
   return list.length > 0 ? list : null;
 }
 
-function fromFile(): ClaudeAccount[] | null {
+type FileRoster =
+  | { status: "absent" }
+  | { status: "valid"; accounts: ClaudeAccount[] }
+  | { status: "unreadable"; error: unknown }
+  | { status: "invalid" };
+
+function fromFile(): FileRoster {
   const path = accountsFilePath();
-  if (!existsSync(path)) return null;
+  if (!existsSync(path)) return { status: "absent" };
+  let text: string;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8"));
-    const raw = Array.isArray(parsed)
-      ? parsed
-      : Array.isArray((parsed as { accounts?: unknown })?.accounts)
-        ? (parsed as { accounts: unknown[] }).accounts
-        : null;
-    if (!raw) return null;
-    const list = raw
-      .map(parseAccountEntry)
-      .filter((a): a is ClaudeAccount => a !== null);
-    return list.length > 0 ? list : null;
+    text = readFileSync(path, "utf8");
   } catch (err) {
     log.warn("[opencode-claude] accounts.json unreadable; ignoring", {
       path,
       message: err instanceof Error ? err.message : String(err),
     });
-    return null;
+    return { status: "unreadable", error: err };
+  }
+  try {
+    const parsed = JSON.parse(text);
+    const raw = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray((parsed as { accounts?: unknown })?.accounts)
+        ? (parsed as { accounts: unknown[] }).accounts
+        : null;
+    if (!raw) {
+      log.warn("[opencode-claude] accounts.json has an invalid roster shape", { path });
+      return { status: "invalid" };
+    }
+    const list = raw
+      .map(parseAccountEntry)
+      .filter((a): a is ClaudeAccount => a !== null);
+    return { status: "valid", accounts: list };
+  } catch (err) {
+    log.warn("[opencode-claude] accounts.json is not valid JSON", {
+      path,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return { status: "invalid" };
   }
 }
 
@@ -245,8 +264,18 @@ function fromFile(): ClaudeAccount[] | null {
  * two layers fighting.
  */
 function resolveRegistry(): ClaudeAccount[] {
-  const fromDisk = fromEnv() ?? fromFile() ?? [];
-  const merged = [...seededAccounts];
+  const fromEnvironment = fromEnv();
+  const fileRoster = fromFile();
+  const fromDisk = fromEnvironment ?? (fileRoster.status === "valid" ? fileRoster.accounts : []);
+  // The panel-managed file is a complete current roster, not a patch.  If it
+  // exists, an account absent from it was deliberately removed and must not be
+  // resurrected from the original plugin options.  Environment configuration
+  // remains an overlay for deployments that explicitly use it.
+  // A present file is authoritative even when malformed: fail closed to the
+  // implicit ambient account instead of resurrecting accounts removed from it.
+  const completeRoster = !fromEnvironment &&
+    (fileRoster.status === "valid" || fileRoster.status === "invalid");
+  const merged = completeRoster ? [] : [...seededAccounts];
   for (const entry of fromDisk) {
     const at = merged.findIndex((a) => a.id === entry.id);
     if (at >= 0) merged[at] = entry;
@@ -705,7 +734,7 @@ export function isMultiAccount(): boolean {
   return getAccounts().length > 1;
 }
 
-/** Look up by id; unknown ids fall back to the default account. */
+/** Look up by id for legacy read-only views; unknown ids use the default. */
 export function resolveAccount(id: string | null | undefined): ClaudeAccount {
   if (!id) return getDefaultAccount();
   const wanted = id.trim().toLowerCase();
@@ -714,6 +743,14 @@ export function resolveAccount(id: string | null | undefined): ClaudeAccount {
   if (match) return match;
   log.warn("[opencode-claude] unknown account id; using default", { id: wanted });
   return getDefaultAccount();
+}
+
+/** Resolve a caller-supplied account without silently changing subscriptions. */
+export function requireAccount(id: string): ClaudeAccount {
+  const wanted = id.trim().toLowerCase();
+  const match = getAccounts().find((a) => a.id === wanted);
+  if (match) return match;
+  throw new AccountError(`unknown account "${wanted}"`, 404);
 }
 
 export function findAccount(id: string | null | undefined): ClaudeAccount | null {

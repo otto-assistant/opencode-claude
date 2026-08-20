@@ -1315,12 +1315,18 @@ async function main() {
       getDefaultAccount,
       isMultiAccount,
       resolveAccount,
+      requireAccount,
       accountConfigDir,
       accountIcon,
       accountIcons,
       sanitizeIcon,
       applyAccountEnv,
     } = await import("../src/accounts.ts");
+    const {
+      bindConversationAccount,
+      getSessionBinding,
+      reconcileAccountBindings,
+    } = await import("../src/session-store.ts");
     const {
       getClaudeModels: accountModels,
       getClaudeModelsForAccount,
@@ -1343,7 +1349,46 @@ async function main() {
     // whatever accounts the operator running the suite happens to have.
     const accountsDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-reg-"));
     const prevXdgAccounts = process.env.XDG_DATA_HOME;
+    const { mkdirSync, writeFileSync } = await import("node:fs");
     process.env.XDG_DATA_HOME = accountsDir;
+    mkdirSync(joinPath(accountsDir, "opencode-claude"), { recursive: true });
+
+    // The panel file is a complete roster: a valid subset is resolved as-is,
+    // including an explicitly empty roster. Neither case may resurrect the
+    // declarative accounts supplied to configureAccounts.
+    configureAccounts([
+      { id: "seeded", label: "Seeded", configDir: "/tmp/oc-claude-seeded", default: true },
+      { id: "other", label: "Other", configDir: "/tmp/oc-claude-other" },
+    ]);
+    writeFileSync(
+      joinPath(accountsDir, "opencode-claude", "accounts.json"),
+      JSON.stringify({ accounts: [{ id: "live", label: "Live", configDir: "/tmp/oc-claude-live", default: true }] }),
+    );
+    resetAccounts();
+    assert.deepEqual(getAccounts().map((a) => a.id), ["live"]);
+    assert.equal(resolveAccount("seeded").id, "live");
+    writeFileSync(joinPath(accountsDir, "opencode-claude", "accounts.json"), JSON.stringify({ accounts: [] }));
+    resetAccounts();
+    assert.deepEqual(getAccounts().map((a) => a.id), ["default"]);
+     assert.equal(resolveAccount("seeded").id, "default");
+     for (const invalidRoster of [
+       "{ malformed",
+       JSON.stringify({}),
+       JSON.stringify({ accounts: "not-an-array" }),
+     ]) {
+       writeFileSync(
+         joinPath(accountsDir, "opencode-claude", "accounts.json"),
+         invalidRoster,
+       );
+       resetAccounts();
+       assert.deepEqual(
+         getAccounts().map((a) => a.id),
+         ["default"],
+         "invalid roster fails closed",
+       );
+       assert.equal(resolveAccount("seeded").id, "default");
+     }
+     rmSync(joinPath(accountsDir, "opencode-claude", "accounts.json"), { force: true });
 
     // No accounts configured → single implicit account, catalog unchanged.
     resetAccounts();
@@ -1366,13 +1411,30 @@ async function main() {
     assert.equal(isMultiAccount(), true);
     assert.equal(getDefaultAccount().id, "work");
     assert.equal(resolveAccount("personal").label, "Personal");
-    assert.equal(resolveAccount("nope").id, "work", "unknown id falls back to default");
+    assert.throws(() => requireAccount("nope"), /unknown account/i);
+    assert.equal(resolveAccount("nope").id, "work", "legacy resolver remains compatible");
     assert.equal(accountConfigDir(resolveAccount("personal")), "/tmp/oc-claude-personal");
     assert.equal(
       applyAccountEnv(resolveAccount("personal"), { PATH: "/usr/bin" })
         .CLAUDE_CONFIG_DIR,
       "/tmp/oc-claude-personal",
     );
+
+    // Removed accounts must not remain sticky in the persisted session store.
+    bindConversationAccount("stale-account-session", "work", "Work");
+    assert.equal(getSessionBinding("stale-account-session")?.accountId, "work");
+    const repaired = reconcileAccountBindings(
+      new Map([
+        ["personal", "Personal"],
+        ["tercera", "Tercera"],
+      ]),
+      "personal",
+    );
+    assert.equal(repaired, 1);
+    const repairedBinding = getSessionBinding("stale-account-session");
+    assert.equal(repairedBinding?.accountId, "personal");
+    assert.equal(repairedBinding?.accountLabel, "Personal");
+    assert.equal(repairedBinding?.foreignSessionId, "");
 
     // Default account keeps bare ids; others are suffixed. Both carry the label.
     assert.equal(composeAccountModelId("opus", resolveAccount("work")), "opus");
@@ -1433,12 +1495,45 @@ async function main() {
     assert.equal(sanitizeIcon(" \u{1F465} "), "\u{1F465}");
 
     // Back to the two plain accounts the rest of this block expects.
-    configureAccounts([
-      { id: "work", label: "Work", configDir: "/tmp/oc-claude-work", default: true },
-      { id: "personal", label: "Personal", configDir: "/tmp/oc-claude-personal" },
-    ]);
+     configureAccounts([
+       { id: "work", label: "Work", configDir: "/tmp/oc-claude-work", default: true },
+       { id: "personal", label: "Personal", configDir: "/tmp/oc-claude-personal" },
+     ]);
 
-    // One provider per account: the host groups the picker by provider, so the
+     // The account tools are real registry consumers too: each entry point
+     // must repair a stale persisted binding before it reads or mutates state.
+     writeFileSync(
+       joinPath(accountsDir, "opencode-claude", "accounts.json"),
+       JSON.stringify({
+         accounts: [
+           { id: "personal", label: "Personal", configDir: "/tmp/oc-claude-personal", default: true },
+         ],
+       }),
+     );
+     resetAccounts();
+     configureAccounts([
+       { id: "work", label: "Work", configDir: "/tmp/oc-claude-work", default: true },
+       { id: "personal", label: "Personal", configDir: "/tmp/oc-claude-personal" },
+     ]);
+     bindConversationAccount("tools-stale", "work", "Work");
+     const { buildAccountTools } = await import("../src/tools.ts");
+     const accountTools = buildAccountTools();
+     const toolContext = { sessionID: "tools-stale" };
+     await (accountTools.claude_accounts as any).execute({}, toolContext);
+     assert.equal(getSessionBinding("tools-stale")?.accountId, "personal");
+     await (accountTools.claude_account_manage as any).execute(
+       { action: "set-icon", id: "personal", icon: "⭐" },
+       toolContext,
+     );
+     assert.equal(getSessionBinding("tools-stale")?.accountId, "personal");
+     rmSync(joinPath(accountsDir, "opencode-claude", "accounts.json"), { force: true });
+     resetAccounts();
+     configureAccounts([
+       { id: "work", label: "Work", configDir: "/tmp/oc-claude-work", default: true },
+       { id: "personal", label: "Personal", configDir: "/tmp/oc-claude-personal" },
+     ]);
+
+     // One provider per account: the host groups the picker by provider, so the
     // account is the group rather than a suffix repeated on every row.
     const {
       providerIdForAccount,
@@ -2357,6 +2452,21 @@ async function main() {
             2,
             "the panel payload carries usage",
           );
+
+          // Route-level regression: consumers must reconcile a stale binding
+          // before reading session/account projections, not just call the
+          // store helper in isolation.
+          bindConversationAccount("stale-route-session", "removed", "Removed");
+          const sessionsRes = await fetch(`${panelBase}/v1/sessions`);
+          assert.equal(sessionsRes.status, 200);
+          const sessionsBody = (await sessionsRes.json()) as {
+            data: Array<{ conversationKey: string; account: string; claudeSessionId: string | null }>;
+          };
+          const staleRoute = sessionsBody.data.find(
+            (entry) => entry.conversationKey === "stale-route-session",
+          );
+          assert.equal(staleRoute?.account, "default");
+          assert.equal(staleRoute?.claudeSessionId, null);
 
           // A page on another origin must not be able to drive the panel.
           const csrf = await fetch(`${panelBase}/v1/accounts`, {

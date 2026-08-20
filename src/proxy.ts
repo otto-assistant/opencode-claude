@@ -34,6 +34,7 @@ import {
   getAccountsFilePath,
   getDefaultAccount,
   isMultiAccount,
+  requireAccount,
   removeAccount,
   renameAccount,
   resolveAccount,
@@ -106,6 +107,7 @@ import {
   getBoundAccountId,
   getForeignSessionId,
   listSessionBindings,
+  reconcileAccountBindings,
   renameBoundAccount,
   setForeignSessionId,
 } from "./session-store.js";
@@ -238,27 +240,46 @@ let getAccessToken: TokenProvider | null = null;
  */
 const PLAN_USAGE_MIN_INTERVAL_MS = 60_000;
 const PLAN_USAGE_TIMEOUT_MS = 30_000;
+const planUsageInFlight = new Map<string, Promise<void>>();
+const planUsageRetryAfter = new Map<string, number>();
 
 async function refreshPlanQuota(
   handle: ClaudeQueryHandle | null | undefined,
   accountId: string | undefined,
 ): Promise<void> {
   if (typeof handle?.readPlanUsage !== "function") return;
+  const key = accountId ?? "default";
   const current = getAccountQuota(accountId);
   if (current && Date.now() - current.fetchedAt < PLAN_USAGE_MIN_INTERVAL_MS) {
     return;
   }
-  try {
-    const usage = await Promise.race([
-      handle.readPlanUsage(),
-      new Promise<null>((resolve) =>
-        setTimeout(() => resolve(null), PLAN_USAGE_TIMEOUT_MS),
-      ),
-    ]);
-    if (usage) recordQuotaFromPlanUsage(accountId, usage);
-  } catch {
-    // stale numbers beat a broken turn
-  }
+  const retryAt = planUsageRetryAfter.get(key) ?? 0;
+  if (Date.now() < retryAt) return;
+  const existing = planUsageInFlight.get(key);
+  if (existing) return existing;
+  const request = (async () => {
+    try {
+      const usage = await Promise.race([
+        handle.readPlanUsage(),
+        new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), PLAN_USAGE_TIMEOUT_MS),
+        ),
+      ]);
+      if (usage) {
+        recordQuotaFromPlanUsage(accountId, usage);
+        planUsageRetryAfter.delete(key);
+      } else {
+        planUsageRetryAfter.set(key, Date.now() + PLAN_USAGE_MIN_INTERVAL_MS);
+      }
+    } catch {
+      // Back off failures so a broken control channel cannot be hit every turn.
+      planUsageRetryAfter.set(key, Date.now() + PLAN_USAGE_MIN_INTERVAL_MS);
+    } finally {
+      planUsageInFlight.delete(key);
+    }
+  })();
+  planUsageInFlight.set(key, request);
+  return request;
 }
 
 /** Injectable for smoke tests — production path always uses startClaudeQuery. */
@@ -562,6 +583,7 @@ function describeAccount(
 }
 
 function sessionCountsByAccount(): Map<string, number> {
+  reconcileStoredAccountBindings();
   const defaultId = getDefaultAccount().id;
   const counts = new Map<string, number>();
   for (const binding of listSessionBindings()) {
@@ -569,6 +591,17 @@ function sessionCountsByAccount(): Map<string, number> {
     counts.set(id, (counts.get(id) ?? 0) + 1);
   }
   return counts;
+}
+
+function reconcileStoredAccountBindings(): void {
+  const labels = new Map(getAccounts().map((account) => [account.id, account.label]));
+  const repaired = reconcileAccountBindings(labels, getDefaultAccount().id);
+  if (repaired) {
+    log.warn("[opencode-claude] repaired stale session account bindings", {
+      repaired,
+      defaultAccount: getDefaultAccount().id,
+    });
+  }
 }
 
 /**
@@ -580,6 +613,7 @@ async function handlePanelRoutes(
   url: URL,
 ): Promise<Response | null> {
   const path = url.pathname.replace(/^\/v1(?=\/|$)/, "") || "/";
+  reconcileStoredAccountBindings();
 
   if (req.method === "GET" && (path === "/" || path === "/panel" || path === "/ui")) {
     // Traefik's StripPrefix tells us where the page really lives, so relative
@@ -899,7 +933,8 @@ async function handleRequest(req: Request): Promise<Response> {
   if (panelResponse) return panelResponse;
 
   if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) {
-    const account = resolveAccount(url.searchParams.get("account"));
+    const requested = url.searchParams.get("account");
+    const account = requested ? requireAccount(requested) : getDefaultAccount();
     const rateLimit = getRateLimitSnapshot(Date.now(), account.id);
     return Response.json({
       ok: true,
@@ -929,7 +964,7 @@ async function handleRequest(req: Request): Promise<Response> {
     (url.pathname === "/rate-limit" || url.pathname === "/v1/rate-limit")
   ) {
     const requested = url.searchParams.get("account");
-    const account = resolveAccount(requested);
+    const account = requested ? requireAccount(requested) : getDefaultAccount();
     const snapshot = getRateLimitSnapshot(Date.now(), account.id);
     if (requested || !isMultiAccount()) {
       return Response.json({ account: account.id, ...snapshot });
@@ -958,6 +993,9 @@ async function handleRequest(req: Request): Promise<Response> {
       const body = (await req.json()) as ChatCompletionRequest;
       return await handleChatCompletions(req, body);
     } catch (err) {
+      if (err instanceof AccountError) {
+        return jsonError(err.message, err.status);
+      }
       const message = err instanceof Error ? err.message : String(err);
       log.error("[opencode-claude] chat completions error", message);
       return Response.json(
@@ -1019,12 +1057,17 @@ function resolveTurnAccount(
   conversationKey: string,
   requested?: string,
 ): { account: ClaudeAccount; switched: boolean } {
+  reconcileStoredAccountBindings();
   const bound = getBoundAccountId(conversationKey);
   if (requested) {
-    const account = resolveAccount(requested);
+    const account = requireAccount(requested);
     return { account, switched: Boolean(bound) && bound !== account.id };
   }
-  if (bound) return { account: resolveAccount(bound), switched: false };
+  if (bound) {
+    const account = findAccount(bound);
+    if (account) return { account, switched: false };
+    throw new AccountError(`session is bound to removed account "${bound}"`, 409);
+  }
   return { account: getDefaultAccount(), switched: false };
 }
 
@@ -1212,6 +1255,22 @@ async function handleChatCompletions(
     let content: string;
     let usage: { prompt_tokens: number; completion_tokens: number } | undefined;
     let responseModel = body.model || "claude-haiku-4-5";
+
+    // Titles and summaries are auxiliary requests. Never spend another API
+    // request while this subscription is already known to be limited.
+    const metaGate = rateLimitGate(Date.now(), account.id);
+    if (metaGate.blocked) {
+      content =
+        metaKind === "title"
+          ? heuristicTitle(meta.prompt)
+          : sanitizeMetaOutput("", metaKind, meta.prompt);
+      return metaChatCompletionResponse({
+        stream,
+        id: completionId,
+        model: responseModel,
+        content,
+      });
+    }
 
     if (!accessToken) {
       content =
@@ -1416,23 +1475,23 @@ async function handleChatCompletions(
   }
 
   let resume = getForeignSessionId(conversationKey);
+  let lostResumeTarget = false;
   if (resume && !findClaudeSessionFile(resume, accountConfig)) {
-    // The claude CLI resumes by looking the session up on disk. A missing
-    // transcript (cleanup, different machine, pruned projects dir) would
-    // silently start a context-free session — drop the stale binding and
-    // transfer the conversation history into the prompt instead.
-    log.warn("[opencode-claude] stored Claude session file missing; transferring history", {
+    // Do not repeatedly resend a large transferred history when a stale
+    // foreign session disappears. Start a fresh Claude session for this turn.
+    log.warn("[opencode-claude] stored Claude session file missing; starting fresh", {
       conversationKey,
       foreignSessionId: resume,
     });
     clearForeignSessionId(conversationKey);
     resume = undefined;
+    lostResumeTarget = true;
   }
 
   // No resumable Claude session (first claude-code turn of this chat, model
   // switch mid-conversation, lost store): serialize the prior OpenCode
   // messages into the prompt so Claude sees the whole conversation.
-  const transcript = resume
+  const transcript = resume || lostResumeTarget
     ? ""
     : buildConversationTranscript(priorMessagesOf(messages));
   if (transcript) {
