@@ -14,6 +14,7 @@ import {
   type ClaudeAccount,
 } from "./accounts.js";
 import { formatShortDuration, getAccountQuota } from "./quota.js";
+import { getRateLimitSnapshot } from "./rate-limit.js";
 
 export type ClaudeModel = {
   id: string;
@@ -198,6 +199,8 @@ export function composeAccountModelId(
 const SHORT_WINDOW_MARK = "\u{1F7E2}"; // green circle
 /** Long window (seven-day) marker. */
 const LONG_WINDOW_MARK = "\u{1F535}"; // blue circle
+/** Hard block: the gate will refuse the next turn on this account. */
+const BLOCKED_MARK = "\u{1F534}"; // red circle
 
 /**
  * One window as `<mark> <pct>% <time until it refills>`.
@@ -219,9 +222,15 @@ function windowLabel(
   now: number,
 ): string | null {
   if (!window) return null;
-  const refilled = window.resetsAt !== undefined && window.resetsAt <= now;
-  if (refilled) return `${mark} 100%`;
-  const pct = `${Math.round(window.remaining * 100)}%`;
+  // A `resetsAt` in the past means this reading describes a window that has
+  // since rolled over — it does NOT mean the window came back full. Claiming
+  // 100% here was an inference, and it read "100% free" on accounts that were
+  // at zero and refusing turns. An unknown is worth saying; a wrong number is
+  // not.
+  if (window.resetsAt !== undefined && window.resetsAt <= now) {
+    return `${mark} ?`;
+  }
+  const pct = `${Math.round(Math.min(1, Math.max(0, window.remaining)) * 100)}%`;
   if (window.resetsAt === undefined) return `${mark} ${pct}`;
   return `${mark} ${pct} ${formatShortDuration(window.resetsAt - now)}`;
 }
@@ -240,6 +249,16 @@ export function quotaNameSuffix(accountId: string): string {
   const quota = getAccountQuota(accountId);
   if (!quota) return "";
   const now = Date.now();
+  // A hard block outranks any percentage: the next turn on this account will
+  // be refused, and that is the only thing worth reading at the moment of
+  // choosing. Two accounts sat at "100%" in the picker while every turn they
+  // took came back 429.
+  const gate = getRateLimitSnapshot(now, accountId);
+  if (gate.limited) {
+    const until = gate.limitedUntil ?? gate.resetsAt;
+    const wait = until && until > now ? ` ${formatShortDuration(until - now)}` : "";
+    return ` · ${BLOCKED_MARK} bloqueada${wait}`;
+  }
   const parts = [
     windowLabel(quota.windows.fiveHour, SHORT_WINDOW_MARK, now),
     windowLabel(quota.windows.sevenDay, LONG_WINDOW_MARK, now),
