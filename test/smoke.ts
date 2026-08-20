@@ -1127,8 +1127,8 @@ async function main() {
       );
       rmSync(fakeProjectsDir, { recursive: true, force: true });
 
-      // 3. Stored binding with a MISSING transcript file → binding dropped and
-      //    a fresh turn starts without replaying stale history.
+      // 3. Stored binding with a MISSING transcript file → binding dropped,
+      //    history transferred, and a fresh turn starts.
       setForeignSessionId("smoke-history-dead", "mock-sess-gone");
       const seen3 = { params: null as Record<string, unknown> | null };
       mockTurn(seen3, null); // no init event → store not rewritten
@@ -1136,7 +1136,8 @@ async function main() {
       assert.equal(res3.status, 200);
       await res3.text();
       assert.equal(seen3.params!.resume, undefined);
-      assert.doesNotMatch(String(seen3.params!.prompt ?? ""), /<conversation_history>/);
+      assert.match(String(seen3.params!.prompt ?? ""), /<conversation_history>/);
+      assert.match(String(seen3.params!.prompt ?? ""), /AXIOM-9042/);
       assert.match(String(seen3.params!.prompt ?? ""), /what is the codename\?/);
       assert.equal(getForeignSessionId("smoke-history-dead"), undefined);
 

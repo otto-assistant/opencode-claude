@@ -1488,10 +1488,10 @@ async function handleChatCompletions(
     lostResumeTarget = true;
   }
 
-  // No resumable Claude session (first claude-code turn of this chat, model
-  // switch mid-conversation, lost store): serialize the prior OpenCode
-  // messages into the prompt so Claude sees the whole conversation.
-  const transcript = resume || lostResumeTarget
+  // A resumable Claude session already owns the conversation context. When
+  // that transcript is lost, start Claude fresh but transfer the history that
+  // OpenCode still has instead of silently reducing the turn to one message.
+  const transcript = resume
     ? ""
     : buildConversationTranscript(priorMessagesOf(messages));
   if (transcript) {
