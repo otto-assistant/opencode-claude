@@ -3,8 +3,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
-import { hasClaudeCliOAuthCredentials } from "./credentials.js";
-import { findBinaryOnPath } from "./executable-path.js";
+import { resolveClaudeCli } from "./executable-path.js";
 import { probeClaudeAgentSdk } from "./query.js";
 
 export type ClaudeDetectStatus =
@@ -110,12 +109,13 @@ export async function detectClaudeCode(options?: {
   const binaryPath =
     options?.binaryPath !== undefined
       ? options.binaryPath
-      : findBinaryOnPath("claude", env);
+      : resolveClaudeCli(env);
 
   if (!binaryPath) {
     return {
       status: "missing-cli",
-      statusDetail: "Claude Code CLI (`claude`) not found on PATH",
+      statusDetail:
+        "Claude Code CLI (`claude`) not found — install it via the provider's install action or with `npm install -g @anthropic-ai/claude-code`.",
       binaryPath: null,
       version: null,
       sdkAvailable: false,
@@ -151,15 +151,13 @@ export async function detectClaudeCode(options?: {
   }
 
   const authStatus = probeClaudeAuthStatusCli({ binaryPath, env });
-  const loggedIn =
-    Boolean(authStatus?.loggedIn) ||
-    hasClaudeCliOAuthCredentials({ homeDir: options?.homeDir, env });
+  const loggedIn = Boolean(authStatus?.loggedIn);
 
   if (!loggedIn) {
     return {
       status: "needs-login",
       statusDetail:
-        "Claude Code is installed but not logged in with a subscription. Run `claude auth login` or use plugin OAuth.",
+        "Claude Code is installed but not logged in with a subscription. Run `claude auth login`.",
       binaryPath,
       version,
       sdkAvailable: true,

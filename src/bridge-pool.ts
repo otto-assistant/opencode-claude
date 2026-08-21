@@ -17,6 +17,8 @@ export type ParkedBridge = {
   conversationKey: string;
   handle: ClaudeQueryHandle;
   pendingTools: Map<string, ParkedToolCall>;
+  /** SDK assistant messages whose usage was already reported to OpenCode. */
+  seenAssistantUsageIds: Set<string>;
   createdAt: number;
   /** Continues consuming the SDK stream after tools resolve. */
   continueStream?: () => AsyncGenerator<unknown, void, unknown>;

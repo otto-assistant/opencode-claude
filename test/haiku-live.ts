@@ -2,7 +2,8 @@
  * Live Haiku matrix for opencode-claude.
  *
  * Exclusive model: haiku (claude-haiku-4-5) with effort=high.
- * Requires CLAUDE_CODE_OAUTH_TOKEN (or Claude CLI login) + network.
+ * Requires a logged-in Claude Code CLI (or CLAUDE_CODE_OAUTH_TOKEN in the
+ * environment for CI/headless hosts) + network.
  *
  * Run: bun test/haiku-live.ts
  */
@@ -20,6 +21,7 @@ import {
   getClaudeProxyBaseUrl,
 } from "../src/proxy.ts";
 import { EFFORT_HEADER, SESSION_HEADER } from "../src/constants.ts";
+import { detectClaudeCode } from "../src/detect.ts";
 
 type CaseResult = {
   id: string;
@@ -189,9 +191,11 @@ async function main() {
       },
     });
     assert.ok(usage);
-    assert.equal(usage!.prompt_tokens, 100);
+    // prompt_tokens follows the OpenAI contract: inclusive of cache reads and
+    // writes (Anthropic reports them separately, so 100 + 10 + 5 = 115).
+    assert.equal(usage!.prompt_tokens, 115);
     assert.equal(usage!.completion_tokens, 20);
-    assert.equal(usage!.total_tokens, 120);
+    assert.equal(usage!.total_tokens, 135);
     assert.equal(usage!.prompt_tokens_details?.cached_tokens, 10);
     assert.equal(usage!.cost_usd, 0.0012);
     return { detail: `tokens=${usage!.total_tokens} cost=${usage!.cost_usd}` };
@@ -210,15 +214,20 @@ async function main() {
     return { detail: note.trim() };
   });
 
-  const token = process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim();
-  if (!token) {
-    console.error("SKIP live cases — CLAUDE_CODE_OAUTH_TOKEN not set");
+  // The CLI owns credentials; CLAUDE_CODE_OAUTH_TOKEN is an operator-set
+  // passthrough for hosts with no on-disk CLI login (CI / headless).
+  const envToken = process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim();
+  const detection = await detectClaudeCode();
+  if (!envToken && !detection.loggedIn) {
+    console.error(
+      "SKIP live cases — Claude Code CLI is not logged in and CLAUDE_CODE_OAUTH_TOKEN is not set",
+    );
     printSummary();
     process.exit(RESULTS.some((r) => !r.ok) ? 1 : 0);
   }
 
   await stopProxy();
-  await startProxy(async () => token);
+  await startProxy();
 
   // Health
   await runCase("proxy.health_models", async () => {
@@ -711,6 +720,10 @@ async function main() {
         env: {
           ...process.env,
           PATH: `${process.env.HOME}/.local/bin:${process.env.HOME}/.bun/bin:${process.env.HOME}/.opencode/bin:${process.env.PATH}`,
+          // OpenCode trusts $PWD over the real cwd for project detection;
+          // the inherited value points at this repo, whose config does not
+          // register the plugin — pin it to the actual test project.
+          PWD: "/tmp/oc-test",
           OPENCODE_CLAUDE_DEBUG: "1",
         },
         timeout: 120_000,
@@ -721,7 +734,7 @@ async function main() {
     assert.match(out, /OC_CLI_IMAGE_OK/);
     assert.match(out, /red/i);
     // Restart proxy for any later cases (none currently)
-    await startProxy(async () => token);
+    await startProxy();
     return { detail: "opencode --file PNG OK" };
   });
 

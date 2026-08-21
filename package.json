@@ -1,7 +1,7 @@
 {
   "name": "@otto-assistant/opencode-claude",
-  "version": "0.10.0",
-  "description": "Claude Code in OpenCode — subscription OAuth, Agent SDK harness, effort variants, tools/MCP, images & compact.",
+  "version": "0.11.0",
+  "description": "Claude Code in OpenCode — CLI-owned auth, Agent SDK harness, effort variants, tools/MCP, images & compact.",
   "license": "MIT",
   "type": "module",
   "main": "./opencode-claude.js",
@@ -19,6 +19,7 @@
     "opencode-claude.js"
   ],
   "scripts": {
+    "prebuild": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "tsc -p tsconfig.json",
     "test": "bun test/smoke.ts",
     "test:haiku": "bun test/haiku-live.ts",

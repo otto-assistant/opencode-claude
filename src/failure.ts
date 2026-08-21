@@ -48,7 +48,7 @@ export function failureTypeFor(kind: ClaudeFailureKind): string {
 export function failureHintFor(kind: ClaudeFailureKind): string {
   switch (kind) {
     case "auth":
-      return "Claude OAuth credentials are invalid or expired. Re-authenticate (opencode auth login → claude-code, or `claude auth login`) — retrying is pointless until then.";
+      return "Claude Code credentials are invalid or expired. Run `claude auth login`, then restart OpenCode — retrying is pointless until then.";
     case "rate_limit":
       return "Claude subscription limit is active; wait for the reset instead of retrying.";
     default:

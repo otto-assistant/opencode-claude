@@ -12,7 +12,12 @@ export const API_PRIORITY_ENV_KEYS = Object.freeze([
 /**
  * Build a child-process env for Claude Code subscription mode.
  * Starts from process.env (or provided base), preserves PATH, then deletes
- * API-priority credentials so subscription OAuth wins.
+ * API-priority credentials so subscription auth wins.
+ *
+ * CLAUDE_CODE_OAUTH_TOKEN is deliberately passed through: the plugin never
+ * sets or rotates it, but an operator-provided token (CI / headless hosts
+ * with no on-disk CLI credentials) must reach the CLI unchanged. The CLI
+ * itself decides whether to honor it.
  */
 export function buildClaudeCodeChildEnv(
   baseEnv: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
@@ -21,15 +26,5 @@ export function buildClaudeCodeChildEnv(
   for (const key of API_PRIORITY_ENV_KEYS) {
     delete env[key];
   }
-  return env;
-}
-
-/** Inject a subscription OAuth access token for the Claude CLI / Agent SDK. */
-export function withClaudeOAuthToken(
-  accessToken: string,
-  baseEnv: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
-): Record<string, string | undefined> {
-  const env = buildClaudeCodeChildEnv(baseEnv);
-  env.CLAUDE_CODE_OAUTH_TOKEN = accessToken;
   return env;
 }
