@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.11.0
+
+- **Claude CLI-owned authentication**: removed the plugin's browser OAuth
+  (PKCE), credential-file parsing, token copying into OpenCode's `auth.json`,
+  token refresh, and OAuth environment injection. The official Claude Code CLI
+  exclusively owns and refreshes its credentials; the plugin stores no tokens
+  and calls no Anthropic OAuth or inference endpoints directly.
+  `CLAUDE_CODE_OAUTH_TOKEN` set by the operator (CI / headless) still passes
+  through to the CLI unchanged — the plugin just never sets or rotates it.
+- **Sign in without leaving the host**: the provider sign-in action relays the
+  official CLI flow. `claude auth login --claudeai` runs with piped stdio, its
+  authorize URL is handed to OpenCode to open, and the code from the Claude
+  page is pasted in the host and written to the CLI's stdin. Success is the
+  CLI's own exit status plus `claude auth status`; a rejected code keeps the
+  live CLI process (and its in-memory verifier) so retries reuse the same
+  challenge.
+- **One-click CLI install**: a new provider action, **Install Claude Code CLI
+  and sign in**, runs the official installer (`npm install -g
+  @anthropic-ai/claude-code`, Anthropic's install script as fallback) when the
+  CLI is missing and then continues straight into the sign-in relay. The
+  method list mirrors CLI presence — only the relay when `claude` exists, only
+  the install action when it does not — and `authorize` re-detects at run
+  time.
+- **Agent SDK-only inference**: title and summary generation now runs through
+  the same Agent SDK path as normal chats, as constrained single-turn,
+  tool-free queries (`maxTurns: 1`, thinking disabled, no settings/skills), so
+  no direct Anthropic Messages API calls remain and agent-style output cannot
+  leak into session titles.
+- **Stable model catalog**: Claude models are always published — no logged-out
+  placeholder catalog, and no OpenCode restart needed after signing in.
+- **Turn stall watchdog**: a Claude turn that goes totally silent (dead CLI,
+  wedged SDK, stuck compact) is killed after `OPENCODE_CLAUDE_TURN_STALL_MS`
+  (default 10m) and answered with a truthful error instead of holding the SSE
+  response open forever and wedging the session as "busy".
+- **Client disconnect tears the turn down**: the SSE stream now has a
+  `cancel()` handler — when OpenCode aborts the fetch mid-turn, the CLI handle
+  is closed and the parked bridge dropped instead of leaking a live process.
+- **SSE keep-alive**: `idleTimeout: 0` plus comment heartbeats every 5s so
+  Bun's default 10s idle RST can no longer kill a response during thinking
+  pauses ("Connection reset by server" retries).
+- **Accurate usage for parallel tools**: each SDK assistant message ID is
+  counted once per parked turn, so token usage no longer alternates between
+  the real value and an inflated multiple when the SDK replays messages while
+  parallel MCP tool results arrive. `prompt_tokens` now follows the OpenAI
+  contract (inclusive of cache reads/writes), and per-response accumulated
+  usage wins over the cumulative result snapshot of a resumed Claude query.
+- **Mid-run limit handling**: a subscription limit that lands after streaming
+  already began is surfaced as an OpenAI-compatible stream error that OpenCode
+  treats as retryable; the retry then hits the 429 gate with the real
+  `Retry-After` and reset countdown. Buffered responses preserve the true 429
+  even when partial content was produced.
+- **CLI resolution beyond PATH, memoized**: `claude` is looked up on PATH,
+  then in `~/.local/bin` and the npm global bin (locations a managed server
+  PATH misses). Resolution is cached per PATH+HOME so synchronous probes no
+  longer block the host's event loop on every query; negative results stay
+  uncached so a mid-process install is found on the next detect.
+
 ## 0.9.1
 
 - **Fail-fast on dead turns**: a Claude turn that dies before producing any
