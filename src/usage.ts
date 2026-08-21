@@ -37,10 +37,15 @@ function asNumber(value: unknown): number {
 }
 
 function fromAnthropicUsage(usage: Record<string, unknown>): OpenAIUsage {
-  const prompt = asNumber(usage.input_tokens);
+  const input = asNumber(usage.input_tokens);
   const completion = asNumber(usage.output_tokens);
   const cached = asNumber(usage.cache_read_input_tokens);
   const cacheWrite = asNumber(usage.cache_creation_input_tokens);
+  // OpenAI contract: prompt_tokens is the INCLUSIVE prompt total and
+  // prompt_tokens_details.cached_tokens is a subset of it. Anthropic reports
+  // input_tokens excluding cached tokens, so sum them back in — consumers
+  // (OpenCode) derive the non-cached count by subtracting the details.
+  const prompt = input + cached + cacheWrite;
   const details: NonNullable<OpenAIUsage["prompt_tokens_details"]> = {};
   if (cached > 0) details.cached_tokens = cached;
   if (cacheWrite > 0) details.cache_write_tokens = cacheWrite;
@@ -72,7 +77,7 @@ function fromModelUsage(
     const cacheRead = asNumber(entry.cacheReadInputTokens);
     const cacheCreate = asNumber(entry.cacheCreationInputTokens);
     const costUSD = asNumber(entry.costUSD);
-    prompt += input;
+    prompt += input + cacheRead + cacheCreate;
     completion += output;
     cached += cacheRead;
     cacheWrite += cacheCreate;
@@ -139,6 +144,97 @@ export function usageFromSdkResult(event: unknown): OpenAIUsage | null {
   }
 
   return null;
+}
+
+/**
+ * Extract per-API-call usage from an Agent SDK `assistant` event
+ * (`message.usage`). Each assistant event carries the usage of exactly one
+ * Anthropic API call — including parked (tool-call) turns, where no `result`
+ * event exists yet because the query is still alive.
+ */
+export function usageFromAssistantEvent(event: unknown): OpenAIUsage | null {
+  if (!event || typeof event !== "object") return null;
+  const e = event as Record<string, unknown>;
+  if (e.type !== "assistant") return null;
+  const message = e.message;
+  if (!message || typeof message !== "object") return null;
+  const usage = (message as Record<string, unknown>).usage;
+  if (!usage || typeof usage !== "object") return null;
+  return fromAnthropicUsage(usage as Record<string, unknown>);
+}
+
+/**
+ * Accumulate per-call usage deltas into a per-response total.
+ */
+export function addOpenAIUsage(
+  acc: OpenAIUsage | null,
+  delta: OpenAIUsage,
+): OpenAIUsage {
+  if (!acc) return { ...delta };
+  const cached =
+    (acc.prompt_tokens_details?.cached_tokens ?? 0) +
+    (delta.prompt_tokens_details?.cached_tokens ?? 0);
+  const cacheWrite =
+    (acc.prompt_tokens_details?.cache_write_tokens ?? 0) +
+    (delta.prompt_tokens_details?.cache_write_tokens ?? 0);
+  const reasoning =
+    (acc.completion_tokens_details?.reasoning_tokens ?? 0) +
+    (delta.completion_tokens_details?.reasoning_tokens ?? 0);
+  const promptDetails: NonNullable<OpenAIUsage["prompt_tokens_details"]> = {};
+  if (cached > 0) promptDetails.cached_tokens = cached;
+  if (cacheWrite > 0) promptDetails.cache_write_tokens = cacheWrite;
+  return {
+    prompt_tokens: acc.prompt_tokens + delta.prompt_tokens,
+    completion_tokens: acc.completion_tokens + delta.completion_tokens,
+    total_tokens: acc.total_tokens + delta.total_tokens,
+    ...(Object.keys(promptDetails).length
+      ? { prompt_tokens_details: promptDetails }
+      : {}),
+    ...(reasoning > 0
+      ? { completion_tokens_details: { reasoning_tokens: reasoning } }
+      : {}),
+  };
+}
+
+/** Count a replayed SDK assistant message only once across tool continuations. */
+export function addUniqueAssistantUsage(
+  acc: OpenAIUsage | null,
+  delta: OpenAIUsage,
+  messageId: string | null,
+  seen: Set<string>,
+): OpenAIUsage | null {
+  if (messageId) {
+    if (seen.has(messageId)) return acc;
+    seen.add(messageId);
+  }
+  return addOpenAIUsage(acc, delta);
+}
+
+/**
+ * Combine the per-response accumulated usage (one entry per Anthropic API
+ * call seen during this HTTP response) with the SDK `result` snapshot.
+ *
+ * The accumulated value is the correct per-response accounting; the result
+ * snapshot is cumulative for the whole Claude query (all prior turns of a
+ * resumed/continued session included) and would double-count. It is only a
+ * fallback for turns where no assistant events were observed, plus a donor
+ * for cost/model breakdown metadata.
+ */
+export function resolveTurnUsage(
+  accumulated: OpenAIUsage | null,
+  result: OpenAIUsage | null,
+): OpenAIUsage | null {
+  if (!accumulated) return result;
+  if (!result) return accumulated;
+  return {
+    ...accumulated,
+    ...(accumulated.cost_usd === undefined && result.cost_usd !== undefined
+      ? { cost_usd: result.cost_usd }
+      : {}),
+    ...(accumulated.model_usage === undefined && result.model_usage !== undefined
+      ? { model_usage: result.model_usage }
+      : {}),
+  };
 }
 
 export function formatCompactNote(meta: unknown): string {

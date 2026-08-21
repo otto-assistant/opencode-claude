@@ -11,7 +11,7 @@ type MessageLike = {
   content?: unknown;
 };
 
-function systemText(messages: MessageLike[]): string {
+export function metaSystemPrompt(messages: MessageLike[]): string {
   return messages
     .filter((m) => m.role === "system")
     .map((m) => extractTextContent(m.content))
@@ -26,7 +26,7 @@ function userText(messages: MessageLike[]): string {
 }
 
 export function isTitleGenerationRequest(messages: MessageLike[]): boolean {
-  const system = systemText(messages).toLowerCase();
+  const system = metaSystemPrompt(messages).toLowerCase();
   return (
     system.includes("title generator") ||
     system.includes("generate a short title") ||
@@ -36,7 +36,7 @@ export function isTitleGenerationRequest(messages: MessageLike[]): boolean {
 }
 
 export function isSummaryGenerationRequest(messages: MessageLike[]): boolean {
-  const system = systemText(messages).toLowerCase();
+  const system = metaSystemPrompt(messages).toLowerCase();
   if (
     system.includes("anchored context summarization") ||
     system.includes("summarizing, compacting, or merging context") ||
@@ -74,33 +74,4 @@ export function requestKeyNamespace(kind: MetaRequestKind): string {
   if (kind === "title") return "title:";
   if (kind === "summary") return "summary:";
   return "";
-}
-
-/**
- * Build a plain-text prompt + system instruction from OpenCode's messages.
- * Used for title/summary so we do not replace OpenCode's system prompt with
- * the Claude Code agent preset.
- */
-export function buildMetaPrompt(messages: MessageLike[]): {
-  system: string;
-  prompt: string;
-} {
-  const system = systemText(messages).trim();
-  const parts: string[] = [];
-  for (const msg of messages) {
-    if (msg.role === "system") continue;
-    const text = extractTextContent(msg.content).trim();
-    if (!text) continue;
-    const role = msg.role || "user";
-    parts.push(`${role}:\n${text}`);
-  }
-  const prompt = parts.join("\n\n").trim() || extractTextContent(
-    [...messages].reverse().find((m) => m.role === "user")?.content,
-  ).trim();
-  return {
-    system:
-      system ||
-      "Output only the requested text. No preamble, no tools, no markdown fences.",
-    prompt: prompt || " ",
-  };
 }

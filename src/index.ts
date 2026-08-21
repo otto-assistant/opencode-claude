@@ -2,28 +2,14 @@
  * OpenCode Claude Auth Plugin
  *
  * Enables Claude Code (subscription) inside OpenCode via:
- * 1. Claude CLI credential sync or browser OAuth (Pro/Max)
- * 2. Local OpenAI-compatible proxy backed by the Claude Agent SDK
+ * 1. Local OpenAI-compatible proxy backed by the Claude Agent SDK
+ * 2. Authentication owned entirely by the local Claude Code CLI
  * 3. Native effort variants, session resume, tools, skills, and MCP
  *
  * Register in opencode.json:
  *   { "plugin": ["@otto-assistant/opencode-claude"] }
  */
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
-import {
-  refreshClaudeToken,
-  RefreshTokenInvalidError,
-  type ClaudeOAuthTokens,
-} from "./auth.js";
-import {
-  completeClaudeBrowserLogin,
-  getPendingClaudeLogin,
-  isCliOwnedRefreshToken,
-  readStoredClaudeOAuth,
-  resetPendingClaudeLogin,
-  startClaudeBrowserLogin,
-  syncClaudeCliCredentialsToOpenCode,
-} from "./auth-login.js";
 import {
   DEFAULT_MODEL_ID,
   DIRECTORY_HEADER,
@@ -32,6 +18,11 @@ import {
   PROVIDER_ID,
 } from "./constants.js";
 import { detectClaudeCode } from "./detect.js";
+import { installClaudeCli } from "./cli-install.js";
+import {
+  startClaudeCliLogin,
+  submitClaudeCliLoginCode,
+} from "./cli-login.js";
 import { log } from "./log.js";
 import {
   encodeClaudeModelSelection,
@@ -41,7 +32,6 @@ import {
   buildConfigVariants,
   buildEffortVariants,
   getClaudeModels,
-  LOGIN_PLACEHOLDER_MODELS,
   type ClaudeModel,
 } from "./models.js";
 import {
@@ -49,23 +39,6 @@ import {
   getProxyPort,
   startProxy,
 } from "./proxy.js";
-
-type ClaudeOAuthAuth = {
-  type: "oauth";
-  access?: string;
-  refresh: string;
-  expires: number;
-};
-
-function isClaudeOAuthAuth(auth: unknown): auth is ClaudeOAuthAuth {
-  return (
-    !!auth &&
-    typeof auth === "object" &&
-    (auth as { type?: unknown }).type === "oauth" &&
-    typeof (auth as { refresh?: unknown }).refresh === "string" &&
-    typeof (auth as { expires?: unknown }).expires === "number"
-  );
-}
 
 function zeroCost() {
   return {
@@ -250,228 +223,34 @@ function ensureClaudeProviderConfig(
   };
 }
 
-/**
- * Refresh the access token a little BEFORE it dies so turns never start with
- * a token that expires mid-flight. The 8h access-token TTL itself is fixed
- * Anthropic-side; what keeps the session alive indefinitely is a refresh
- * chain that never breaks.
- */
-const REFRESH_MARGIN_MS = 120_000;
-
-/**
- * In-flight refresh dedupe, keyed by refresh token. OpenCode fires the main
- * turn and the title meta request in parallel — without single-flight both
- * refresh with the SAME token, Anthropic rotates on the first, and the
- * second dies with invalid_grant, killing the whole chain (this exact race
- * burned quota on 2026-08-11).
- */
-const refreshInFlight = new Map<string, Promise<string | null>>();
-
-async function resolveAccessToken(
-  input: PluginInput,
-  getAuth: () => Promise<unknown>,
-): Promise<string | null> {
-  let auth = await getAuth();
-  // The host's in-memory auth store can lag auth.json (tokens written by a
-  // sibling process, a headless login, or a race at server start). When the
-  // host hands us nothing usable, trust the fresher on-disk entry instead of
-  // falling into the logged-out placeholder path.
-  if (
-    !isClaudeOAuthAuth(auth) ||
-    !(auth.access && auth.expires > Date.now() + REFRESH_MARGIN_MS)
-  ) {
-    const stored = readStoredClaudeOAuth();
-    if (
-      stored &&
-      (!isClaudeOAuthAuth(auth) || stored.expires > (auth.expires ?? 0))
-    ) {
-      auth = { type: "oauth", ...stored };
-    }
-  }
-  if (isClaudeOAuthAuth(auth)) {
-    if (auth.access && auth.expires > Date.now() + REFRESH_MARGIN_MS) {
-      return auth.access;
-    }
-    // CLI-owned chains are never rotated through the token endpoint by us
-    // (rotation belongs to the CLI — see isCliOwnedRefreshToken); re-sync
-    // from the CLI file instead.
-    if (isCliOwnedRefreshToken(auth.refresh)) {
-      const synced = syncClaudeCliCredentialsToOpenCode();
-      if (synced) return synced.access;
-      // Only hand out the stored access token while it is genuinely valid —
-      // an expired token spawns a doomed turn (401) and blocks CLI self-heal.
-      return auth.access && auth.expires > Date.now() ? auth.access : null;
-    }
-
-    const key = auth.refresh;
-    let pending = refreshInFlight.get(key);
-    if (!pending) {
-      pending = (async () => {
-        try {
-          const refreshed = await refreshClaudeToken(key);
-          await input.client.auth.set({
-            path: { id: PROVIDER_ID },
-            body: {
-              type: "oauth",
-              refresh: refreshed.refresh,
-              access: refreshed.access,
-              expires: refreshed.expires,
-            },
-          });
-          return refreshed.access;
-        } catch (err) {
-          const permanent = err instanceof RefreshTokenInvalidError;
-          log.error(
-            `[opencode-claude] token refresh ${permanent ? "rejected" : "failed"}: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-          if (permanent) {
-            // invalid_grant usually means another actor (claude CLI, a
-            // parallel refresh) rotated the token first. Re-read the store:
-            // fresher credentials may already be there.
-            try {
-              const latest = await getAuth();
-              if (
-                isClaudeOAuthAuth(latest) &&
-                latest.refresh !== key &&
-                latest.access &&
-                latest.expires > Date.now() + REFRESH_MARGIN_MS
-              ) {
-                log.info(
-                  "[opencode-claude] recovered newer OAuth credentials after refresh rejection",
-                );
-                return latest.access;
-              }
-            } catch {
-              // fall through to CLI sync
-            }
-            const synced = syncClaudeCliCredentialsToOpenCode();
-            return synced?.access ?? null;
-          }
-          // Transient refresh failure: the old access token is only useful
-          // while actually valid; otherwise null lets the CLI self-heal.
-          return auth.access && auth.expires > Date.now()
-            ? auth.access
-            : null;
-        }
-      })();
-      refreshInFlight.set(key, pending);
-      const cleanup = () => {
-        refreshInFlight.delete(key);
-      };
-      pending.then(cleanup, cleanup);
-    }
-    return pending;
-  }
-
-  const synced = syncClaudeCliCredentialsToOpenCode();
-  if (synced) {
-    try {
-      await input.client.auth.set({
-        path: { id: PROVIDER_ID },
-        body: {
-          type: "oauth",
-          refresh: synced.refresh,
-          access: synced.access,
-          expires: synced.expires,
-        },
-      });
-    } catch {
-      // auth.set may be unavailable in some hosts
-    }
-    return synced.access;
-  }
-  return null;
-}
-
 async function loadClaudeRuntime(
-  input: PluginInput,
-  getAuth: () => Promise<unknown>,
   provider?: { models?: Record<string, unknown> },
 ): Promise<{ port: number; providerModels: Record<string, unknown> } | undefined> {
-  const detection = await detectClaudeCode();
-  const accessToken = await resolveAccessToken(input, getAuth);
+  const port = await startProxy();
 
-  const models =
-    accessToken || detection.loggedIn || readStoredClaudeOAuth()
-      ? getClaudeModels()
-      : LOGIN_PLACEHOLDER_MODELS;
-
-  if (!accessToken && !detection.loggedIn) {
-    // Still seed placeholder models + a proxy so the provider stays visible.
-    const port = await startProxy(async () => null);
-    const providerModels = buildClaudeProviderModels(models);
-    if (provider) provider.models = providerModels;
-    return { port, providerModels };
-  }
-
-  const port = await startProxy(async () => {
-    return resolveAccessToken(input, getAuth);
-  });
-
-  const providerModels = buildClaudeProviderModels(models);
+  const providerModels = buildClaudeProviderModels(getClaudeModels());
   if (provider) provider.models = providerModels;
   return { port, providerModels };
 }
 
 /**
  * OpenCode plugin that provides Claude Code authentication and model access.
+ *
+ * The auth methods are chosen once at load from the CLI's presence: a host
+ * with `claude` gets the sign-in relay, a host without it gets the install
+ * action. `authorize` re-detects at run time, so the install action still
+ * relays the sign-in right after a successful install.
  */
 export const ClaudeCodePlugin: Plugin = async (
   input: PluginInput,
 ): Promise<Hooks> => {
-  // Best-effort CLI sync on load so OpenChamber / headless hosts work without
-  // an explicit auth.methods click when `claude` is already logged in.
-  try {
-    syncClaudeCliCredentialsToOpenCode();
-  } catch (err) {
-    log.warn(
-      "[opencode-claude] CLI credential sync skipped",
-      err instanceof Error ? err.message : err,
-    );
-  }
-
+  const cliPresent = await probeCliPresence();
   return {
     async config(config) {
-      const detection = await detectClaudeCode();
-      // Model visibility must not depend on the CLI's login state alone: a
-      // valid plugin-owned OAuth entry in auth.json is just as logged-in.
-      // (After a CLI logout the catalog collapsed to login+sonnet and the
-      // provider looked broken despite a fresh plugin OAuth token.)
-      const hasStoredAuth = Boolean(readStoredClaudeOAuth());
-      const models =
-        detection.loggedIn || detection.status === "ready" || hasStoredAuth
-          ? getClaudeModels()
-          : LOGIN_PLACEHOLDER_MODELS;
-
       // Bind first (ephemeral port by default), then seed provider baseURL so
       // OpenCode's static config matches the live listener for this process.
       try {
-        await startProxy(async () => {
-          try {
-            const authClient = input.client.auth as {
-              get?: (args: { path: { id: string } }) => Promise<unknown>;
-            };
-            if (typeof authClient.get === "function") {
-              const auth = await authClient.get({ path: { id: PROVIDER_ID } });
-              const payload =
-                auth && typeof auth === "object" && "data" in auth
-                  ? (auth as { data: unknown }).data
-                  : auth;
-              return resolveAccessToken(input, async () => payload);
-            }
-          } catch {
-            // ignore
-          }
-          // Browser OAuth belongs to this plugin and is persisted in
-          // auth.json. The host's auth client may not yet reflect that file
-          // (notably during OpenChamber's provider-page reauthentication),
-          // so use the normal resolver with an empty host response. It
-          // falls back to the on-disk `claude-code` entry before considering
-          // the optional Claude CLI credentials.
-          return resolveAccessToken(input, async () => null);
-        });
+        await startProxy();
       } catch (err) {
         log.error(
           "[opencode-claude] proxy failed to start during config",
@@ -479,7 +258,10 @@ export const ClaudeCodePlugin: Plugin = async (
         );
       }
 
-      ensureClaudeProviderConfig(config as Record<string, any>, models);
+      ensureClaudeProviderConfig(
+        config as Record<string, any>,
+        getClaudeModels(),
+      );
     },
 
     "chat.headers": async (hookInput, output) => {
@@ -512,135 +294,191 @@ export const ClaudeCodePlugin: Plugin = async (
 
     provider: {
       id: PROVIDER_ID,
-      async models(provider, ctx) {
-        const runtime = await loadClaudeRuntime(
-          input,
-          async () => ctx.auth,
-          provider,
-        );
+      async models(provider) {
+        const runtime = await loadClaudeRuntime(provider);
         return (runtime?.providerModels ?? {}) as Record<string, any>;
       },
     },
 
     auth: {
       provider: PROVIDER_ID,
-
-      async loader(getAuth, provider) {
-        const runtime = await loadClaudeRuntime(input, getAuth, provider);
-        if (!runtime) return {};
-
-        return {
-          baseURL: `http://127.0.0.1:${runtime.port}/v1`,
-          apiKey: "claude-code-proxy",
-          async fetch(
-            requestInput: RequestInfo | URL,
-            init?: RequestInit,
-          ) {
-            if (init?.headers) {
-              if (init.headers instanceof Headers) {
-                init.headers.delete("authorization");
-              } else if (Array.isArray(init.headers)) {
-                init.headers = init.headers.filter(
-                  ([key]) => key.toLowerCase() !== "authorization",
-                );
-              } else {
-                delete (init.headers as Record<string, string>).authorization;
-                delete (init.headers as Record<string, string>).Authorization;
-              }
-            }
-            return fetch(requestInput, init);
-          },
-        };
-      },
-
-      methods: [
-        {
-          type: "oauth",
-          label: "Use Claude Code CLI login",
-          async authorize() {
-            const synced = syncClaudeCliCredentialsToOpenCode();
-            if (synced) {
-              return {
-                url: "https://docs.anthropic.com/en/docs/claude-code",
-                instructions:
-                  "Claude Code CLI credentials were found and synced. Click Complete to finish.",
-                method: "auto" as const,
-                async callback() {
-                  return {
-                    type: "success" as const,
-                    refresh: synced.refresh,
-                    access: synced.access,
-                    expires: synced.expires,
-                  };
-                },
-              };
-            }
-
-            return {
-              url: "https://docs.anthropic.com/en/docs/claude-code",
-              instructions:
-                "Run `claude auth login` in a terminal, then click Complete. Or choose browser OAuth instead.",
-              method: "auto" as const,
-              async callback() {
-                const again = syncClaudeCliCredentialsToOpenCode();
-                if (!again) {
-                  return {
-                    type: "failed" as const,
-                  };
-                }
-                return {
-                  type: "success" as const,
-                  refresh: again.refresh,
-                  access: again.access,
-                  expires: again.expires,
-                };
-              },
-            };
-          },
-        },
-        {
-          type: "oauth",
-          label: "Login with Claude Pro/Max",
-          async authorize() {
-            let pending = getPendingClaudeLogin();
-            if (!pending || pending.completed) {
-              pending = await startClaudeBrowserLogin();
-            }
-
-            return {
-              url: pending.url,
-              instructions:
-                "Open the URL, approve access, then paste the redirect URL (or code#state) and click Complete.",
-              method: "code" as const,
-              async callback(code: string) {
-                try {
-                  const tokens = await completeClaudeBrowserLogin(code);
-                  return {
-                    type: "success" as const,
-                    refresh: tokens.refresh,
-                    access: tokens.access,
-                    expires: tokens.expires,
-                  };
-                } catch (err) {
-                  resetPendingClaudeLogin();
-                  log.error(
-                    "[opencode-claude] OAuth callback failed",
-                    err instanceof Error ? err.message : err,
-                  );
-                  return { type: "failed" as const };
-                }
-              },
-            };
-          },
-        },
-      ],
+      methods: buildAuthMethods(cliPresent, input.directory),
     },
   };
 };
 
+/**
+ * The method list mirrors what the host actually needs: only the sign-in relay
+ * when the CLI is there, only the install action when it is not. Each
+ * `authorize` re-detects, so the install action rolls straight into the relay
+ * after a successful install without a restart.
+ */
+export function buildAuthMethods(cliPresent: boolean, directory: string) {
+  if (!cliPresent) {
+    return [
+      {
+        type: "oauth" as const,
+        label: "Install Claude Code CLI and sign in",
+        /**
+         * One-click path for hosts without the CLI: install the official
+         * Claude Code CLI, then continue with the same sign-in relay. Users
+         * who prefer the terminal get the install and auth commands in the
+         * instructions instead.
+         */
+        async authorize() {
+          const detection = await detectClaudeCode();
+          if (detection.loggedIn) {
+            return alreadySignedInResponse();
+          }
+          if (detection.status === "missing-cli") {
+            const install = await installClaudeCli();
+            if (!install.ok) {
+              log.warn("[opencode-claude] Claude CLI install failed", {
+                message: install.message,
+              });
+              return manualInstallResponse(install.message);
+            }
+          } else if (detection.status === "missing-sdk") {
+            return manualInstallResponse(
+              "The Claude Agent SDK is unavailable in this plugin install. Reinstall the plugin, then sign in again.",
+            );
+          }
+          return relayOrFallback(
+            await startClaudeCliLogin({ cwd: directory }),
+          );
+        },
+      },
+    ];
+  }
+
+  return [
+    {
+      type: "oauth" as const,
+      label: "Sign in with Claude Code CLI",
+      /**
+       * The official CLI runs the whole flow; the host only relays it.
+       * `claude auth login --claudeai` prints an authorize URL and then
+       * waits on stdin for the code the Claude page shows, so the host UI
+       * can open that URL and pass the pasted code straight through —
+       * no separate terminal, and no OAuth implemented here.
+       *
+       * The only URL this method ever hands out is the CLI's own sign-in
+       * page: any other link would open a tab that cannot finish the
+       * sign-in, competing with the page the user actually has to use.
+       */
+      async authorize() {
+        const detection = await detectClaudeCode();
+        if (detection.loggedIn) {
+          return alreadySignedInResponse();
+        }
+        return relayOrFallback(await startClaudeCliLogin({ cwd: directory }));
+      },
+    },
+  ];
+}
+
+/**
+ * CLI presence check for the method list, capped so a slow probe can never
+ * block plugin load. Unknown results default to "present": the sign-in relay
+ * re-detects and falls back to terminal instructions if the CLI is actually
+ * missing.
+ */
+async function probeCliPresence(): Promise<boolean> {
+  try {
+    const detection = await Promise.race([
+      detectClaudeCode(),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+    ]);
+    return detection ? detection.status !== "missing-cli" : true;
+  } catch {
+    return true;
+  }
+}
+
+function alreadySignedInResponse() {
+  return {
+    url: "",
+    instructions:
+      "Claude Code CLI is already signed in. Click Complete — or sign in from a terminal instead with `claude auth login --claudeai`.",
+    method: "auto" as const,
+    async callback() {
+      // OpenCode's callback runtime stores credentials only when success
+      // includes key or refresh. Claude CLI needs neither.
+      return { type: "success" as const } as any;
+    },
+  };
+}
+
+/**
+ * The `code` method response: the host opens the CLI's authorize URL and the
+ * user pastes the code from the Claude page back into the host, which writes
+ * it to the CLI's stdin. Success is the CLI's own exit status.
+ */
+function relayOrFallback(
+  launch: Awaited<ReturnType<typeof startClaudeCliLogin>>,
+) {
+  if (launch.state === "awaiting-code") {
+    return {
+      url: launch.url,
+      instructions:
+        "Sign in on the Claude page that opened and paste the code it shows here — or sign in from a terminal instead with `claude auth login --claudeai` and start this sign-in again. If the page did not open, use the sign-in link above.",
+      method: "code" as const,
+      async callback(code: string) {
+        const submitted = await submitClaudeCliLoginCode(code);
+        if (submitted.ok) return { type: "success" as const } as any;
+        log.warn("[opencode-claude] Claude CLI login code rejected", {
+          message: submitted.message,
+        });
+        // The CLI can store its grant and still exit oddly; trust its own
+        // auth status over the exit code before failing.
+        const verified = await detectClaudeCode();
+        if (verified.loggedIn) {
+          return { type: "success" as const } as any;
+        }
+        return { type: "failed" as const };
+      },
+    };
+  }
+
+  log.warn("[opencode-claude] Claude CLI login launch failed", {
+    message: launch.message,
+  });
+  return manualInstallResponse(launch.message);
+}
+
+/**
+ * No page to open: the user installs and signs in from a terminal (or via the
+ * install action), and the callback watches `claude auth status` until the
+ * grant lands. The message always names both the install and the auth command.
+ */
+export function manualInstallResponse(launchMessage: string) {
+  return {
+    url: "",
+    instructions: `${launchMessage}
+Install Claude Code, sign in, then click Complete:
+
+  npm install -g @anthropic-ai/claude-code
+  claude auth login --claudeai
+
+Or use the “Install Claude Code CLI and sign in” action here instead.`,
+    method: "auto" as const,
+    async callback() {
+      const deadline = Date.now() + 10 * 60_000;
+      while (Date.now() < deadline) {
+        const detection = await detectClaudeCode();
+        if (detection.loggedIn) {
+          return { type: "success" as const } as any;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      }
+      log.warn("[opencode-claude] Claude CLI login timed out");
+      return { type: "failed" as const };
+    },
+  };
+}
+
 export default ClaudeCodePlugin;
 
-export type { ClaudeOAuthTokens };
 export { detectClaudeCode } from "./detect.js";
 export { getClaudeModels, CLAUDE_CODE_MODELS } from "./models.js";
 export { startProxy, stopProxy, getClaudeProxyBaseUrl } from "./proxy.js";

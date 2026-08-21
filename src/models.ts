@@ -70,21 +70,6 @@ function buildCatalog(): ClaudeModel[] {
 
 export const CLAUDE_CODE_MODELS: ClaudeModel[] = buildCatalog();
 
-/** Placeholder so OpenCode keeps the provider visible while logged out. */
-export const LOGIN_PLACEHOLDER_MODELS: ClaudeModel[] = [
-  {
-    id: "login",
-    name: "Sign in to Claude Code",
-    reasoning: false,
-    contextWindow: 200_000,
-    maxTokens: 8_192,
-  },
-];
-
-export function isLoginPlaceholderModel(id: string): boolean {
-  return id === "login";
-}
-
 export function getClaudeModels(): ClaudeModel[] {
   return CLAUDE_CODE_MODELS;
 }
@@ -102,7 +87,7 @@ export function resolveClaudeModelId(modelId: string): string {
 export function buildEffortVariants(
   model: ClaudeModel,
 ): Record<string, { effort: ClaudeEffort } | { disabled: true }> {
-  if (!model.reasoning || isLoginPlaceholderModel(model.id)) return {};
+  if (!model.reasoning) return {};
   const variants: Record<
     string,
     { effort: ClaudeEffort } | { disabled: true }

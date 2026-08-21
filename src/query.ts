@@ -159,6 +159,8 @@ export type StartClaudeQueryParams = {
   allowDangerouslySkipPermissions?: boolean;
   /** Auto-compact long conversations (Claude Code default). */
   autoCompactEnabled?: boolean;
+  /** Stop utility queries such as title generation after one model turn. */
+  maxTurns?: number;
   /** Thinking config; defaults to adaptive when effort is set. */
   thinking?:
     | { type: "adaptive" }
@@ -237,6 +239,10 @@ export async function startClaudeQuery(
     options.autoCompactEnabled = true;
   }
 
+  if (Number.isInteger(params.maxTurns) && Number(params.maxTurns) > 0) {
+    options.maxTurns = params.maxTurns;
+  }
+
   if (typeof params.canUseTool === "function") {
     options.canUseTool = params.canUseTool;
   }
@@ -290,7 +296,7 @@ export async function startClaudeQuery(
     options.toolAliases = params.toolAliases;
   }
 
-  if (params.skills === "all" || (Array.isArray(params.skills) && params.skills.length > 0)) {
+  if (params.skills === "all" || Array.isArray(params.skills)) {
     options.skills = params.skills;
   } else if (params.skills === undefined) {
     options.skills = "all";
