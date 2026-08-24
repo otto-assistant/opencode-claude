@@ -585,6 +585,112 @@ async function main() {
     assert.equal((mwContent[2] as { type: string }).type, "image");
   }
 
+  // ---- Host-transcript fingerprinting + divergence detection ----
+  {
+    const {
+      detectHostTranscriptDivergence,
+      divergenceRebuildEnabled,
+      fingerprintHostMessages,
+      hostOwnsTranscript,
+    } = await import("../src/host-transcript.ts");
+
+    const turn1 = [
+      { role: "system", content: "internal prompt v1" },
+      { role: "user", content: "remember AXIOM" },
+      { role: "assistant", content: "noted" },
+      { role: "user", content: "next question" },
+    ];
+    const fp1 = fingerprintHostMessages(turn1);
+    assert.equal(fp1.count, 3, "system messages are excluded");
+    assert.equal(fp1.chain.length, 3);
+
+    // System prompt churn between turns must never register as divergence
+    // (the proxy drops system messages deliberately).
+    const systemChanged = fingerprintHostMessages([
+      { role: "system", content: "internal prompt v2 CHANGED" },
+      ...turn1.slice(1),
+    ]);
+    assert.equal(systemChanged.hash, fp1.hash);
+
+    // Same text as a string vs a part array is not a rewrite.
+    const partArray = fingerprintHostMessages([
+      turn1[0]!,
+      { role: "user", content: [{ type: "text", text: "remember AXIOM" }] },
+      ...turn1.slice(2),
+    ]);
+    assert.equal(partArray.hash, fp1.hash);
+
+    const stored = { count: fp1.count, hash: fp1.hash };
+
+    // Normal growth (assistant reply + new user turn) extends the prefix.
+    assert.deepEqual(
+      detectHostTranscriptDivergence(
+        stored,
+        fingerprintHostMessages([
+          ...turn1,
+          { role: "assistant", content: "an answer" },
+          { role: "user", content: "another question" },
+        ]),
+      ),
+      { diverged: false },
+    );
+
+    // A retry with the identical array is not a divergence.
+    assert.deepEqual(detectHostTranscriptDivergence(stored, fp1), {
+      diverged: false,
+    });
+
+    // Messages dropped → shrunk.
+    const shrunk = detectHostTranscriptDivergence(
+      stored,
+      fingerprintHostMessages(turn1.slice(0, 2)),
+    );
+    assert.equal(shrunk.diverged, true);
+    assert.equal(shrunk.diverged && shrunk.reason, "shrunk");
+
+    // A prior message replaced (DCP-style pruning) → rewritten.
+    const rewritten = detectHostTranscriptDivergence(
+      stored,
+      fingerprintHostMessages([
+        turn1[0]!,
+        { role: "user", content: "[[pruned]]" },
+        ...turn1.slice(2),
+      ]),
+    );
+    assert.equal(rewritten.diverged, true);
+    assert.equal(rewritten.diverged && rewritten.reason, "rewritten");
+
+    // No stored digest (first turn / migrated store) → never diverged.
+    assert.deepEqual(detectHostTranscriptDivergence(undefined, fp1), {
+      diverged: false,
+    });
+
+    // Env flags: host mode is opt-in, divergence rebuild is default-on.
+    const prevHost = process.env.OPENCODE_CLAUDE_HOST_TRANSCRIPT;
+    const prevDivergence = process.env.OPENCODE_CLAUDE_DIVERGENCE_REBUILD;
+    try {
+      delete process.env.OPENCODE_CLAUDE_HOST_TRANSCRIPT;
+      delete process.env.OPENCODE_CLAUDE_DIVERGENCE_REBUILD;
+      assert.equal(hostOwnsTranscript(), false);
+      assert.equal(divergenceRebuildEnabled(), true);
+      process.env.OPENCODE_CLAUDE_HOST_TRANSCRIPT = "1";
+      process.env.OPENCODE_CLAUDE_DIVERGENCE_REBUILD = "0";
+      assert.equal(hostOwnsTranscript(), true);
+      assert.equal(divergenceRebuildEnabled(), false);
+    } finally {
+      if (prevHost === undefined) {
+        delete process.env.OPENCODE_CLAUDE_HOST_TRANSCRIPT;
+      } else {
+        process.env.OPENCODE_CLAUDE_HOST_TRANSCRIPT = prevHost;
+      }
+      if (prevDivergence === undefined) {
+        delete process.env.OPENCODE_CLAUDE_DIVERGENCE_REBUILD;
+      } else {
+        process.env.OPENCODE_CLAUDE_DIVERGENCE_REBUILD = prevDivergence;
+      }
+    }
+  }
+
   // Usage + compact helpers
   const { usageFromSdkResult, formatCompactNote } = await import(
     "../src/usage.ts"
@@ -1602,6 +1708,149 @@ async function main() {
       assert.equal(seen3.params!.resume, undefined);
       assert.match(String(seen3.params!.prompt ?? ""), /<conversation_history>/);
       assert.equal(getForeignSessionId("smoke-history-dead"), undefined);
+
+      // 4. Host-side history transform between turns (DCP-style pruning via
+      //    experimental.chat.messages.transform) → divergence detected,
+      //    resume abandoned, the TRANSFORMED history is injected.
+      const prevHostEnv = process.env.OPENCODE_CLAUDE_HOST_TRANSCRIPT;
+      const prevDivergenceEnv = process.env.OPENCODE_CLAUDE_DIVERGENCE_REBUILD;
+      delete process.env.OPENCODE_CLAUDE_HOST_TRANSCRIPT;
+      delete process.env.OPENCODE_CLAUDE_DIVERGENCE_REBUILD;
+      clearForeignSessionId("smoke-history-diverge");
+      const divProjectsDir = joinPath(
+        homedir(),
+        ".claude",
+        "projects",
+        "opencode-claude-smoke-div",
+      );
+      mkdirSync(divProjectsDir, { recursive: true });
+      writeFileSync(joinPath(divProjectsDir, "mock-sess-div.jsonl"), "{}\n");
+      try {
+        // Turn A: binding exists, no digest yet → resumes, records digest.
+        setForeignSessionId("smoke-history-diverge", "mock-sess-div");
+        const seenA = { params: null as Record<string, unknown> | null };
+        mockTurn(seenA, "mock-sess-div");
+        const resA = await postChat("smoke-history-diverge", historyMessages);
+        assert.equal(resA.status, 200);
+        await resA.text();
+        assert.equal(seenA.params!.resume, "mock-sess-div");
+
+        // Turn B: a transform plugin replaced a prior user message while the
+        // conversation grew — the stored digest is no longer a prefix.
+        const transformed = [
+          { role: "system", content: "internal system prompt" },
+          { role: "user", content: "[[pruned by DCP]]" },
+          { role: "assistant", content: "Codename AXIOM-9042 noted." },
+          { role: "user", content: "what is the codename?" },
+          { role: "assistant", content: "It is AXIOM-9042." },
+          { role: "user", content: "and what did I originally say?" },
+        ];
+        const seenB = { params: null as Record<string, unknown> | null };
+        mockTurn(seenB, "mock-sess-div");
+        const resB = await postChat("smoke-history-diverge", transformed);
+        assert.equal(resB.status, 200);
+        await resB.text();
+        assert.equal(
+          seenB.params!.resume,
+          undefined,
+          "diverged history must rebuild instead of resuming",
+        );
+        const promptB = String(seenB.params!.prompt ?? "");
+        assert.match(promptB, /<conversation_history>/);
+        assert.match(
+          promptB,
+          /\[\[pruned by DCP\]\]/,
+          "the transformed history is what reaches Claude",
+        );
+
+        // Turn C: extends turn B's transformed array → no divergence, resume
+        // returns (turn B's init event re-established the binding).
+        const seenC = { params: null as Record<string, unknown> | null };
+        mockTurn(seenC, "mock-sess-div");
+        const resC = await postChat("smoke-history-diverge", [
+          ...transformed,
+          { role: "assistant", content: "You asked me to remember it." },
+          { role: "user", content: "great, thanks" },
+        ]);
+        assert.equal(resC.status, 200);
+        await resC.text();
+        assert.equal(seenC.params!.resume, "mock-sess-div");
+        assert.doesNotMatch(
+          String(seenC.params!.prompt ?? ""),
+          /<conversation_history>/,
+        );
+
+        // 5. Shrunk host array (messages dropped outright) → also a rebuild.
+        const seenShrunk = { params: null as Record<string, unknown> | null };
+        mockTurn(seenShrunk, "mock-sess-div");
+        const resShrunk = await postChat(
+          "smoke-history-diverge",
+          transformed.slice(0, 4),
+        );
+        assert.equal(resShrunk.status, 200);
+        await resShrunk.text();
+        assert.equal(
+          seenShrunk.params!.resume,
+          undefined,
+          "shrunk host array must rebuild instead of resuming",
+        );
+
+        // 6. Warn-only mode: divergence is logged but resume is kept.
+        process.env.OPENCODE_CLAUDE_DIVERGENCE_REBUILD = "0";
+        const warnMessages = [
+          { role: "system", content: "internal system prompt" },
+          { role: "user", content: "[[a different transform]]" },
+          { role: "assistant", content: "noted" },
+          { role: "user", content: "next" },
+        ];
+        const seenWarn = { params: null as Record<string, unknown> | null };
+        mockTurn(seenWarn, "mock-sess-div");
+        const resWarn = await postChat("smoke-history-diverge", warnMessages);
+        assert.equal(resWarn.status, 200);
+        await resWarn.text();
+        assert.equal(
+          seenWarn.params!.resume,
+          "mock-sess-div",
+          "warn-only mode must keep resuming despite divergence",
+        );
+        delete process.env.OPENCODE_CLAUDE_DIVERGENCE_REBUILD;
+
+        // 7. Host-transcript mode: never resume, rebuild every turn — even
+        //    when the incoming array extends the previous one cleanly.
+        process.env.OPENCODE_CLAUDE_HOST_TRANSCRIPT = "1";
+        const seenHost = { params: null as Record<string, unknown> | null };
+        mockTurn(seenHost, "mock-sess-div");
+        const resHost = await postChat("smoke-history-diverge", [
+          ...warnMessages,
+          { role: "assistant", content: "ok" },
+          { role: "user", content: "continue" },
+        ]);
+        assert.equal(resHost.status, 200);
+        await resHost.text();
+        assert.equal(
+          seenHost.params!.resume,
+          undefined,
+          "host-transcript mode must never resume",
+        );
+        assert.match(
+          String(seenHost.params!.prompt ?? ""),
+          /<conversation_history>/,
+        );
+        delete process.env.OPENCODE_CLAUDE_HOST_TRANSCRIPT;
+      } finally {
+        if (prevHostEnv === undefined) {
+          delete process.env.OPENCODE_CLAUDE_HOST_TRANSCRIPT;
+        } else {
+          process.env.OPENCODE_CLAUDE_HOST_TRANSCRIPT = prevHostEnv;
+        }
+        if (prevDivergenceEnv === undefined) {
+          delete process.env.OPENCODE_CLAUDE_DIVERGENCE_REBUILD;
+        } else {
+          process.env.OPENCODE_CLAUDE_DIVERGENCE_REBUILD = prevDivergenceEnv;
+        }
+        rmSync(divProjectsDir, { recursive: true, force: true });
+        clearForeignSessionId("smoke-history-diverge");
+      }
 
       clearForeignSessionId("smoke-history-fresh");
       clearForeignSessionId("smoke-history-resume");

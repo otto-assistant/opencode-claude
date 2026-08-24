@@ -40,8 +40,16 @@ import {
   conversationKeyFromMessages,
   findClaudeSessionFile,
   getForeignSessionId,
+  getHostTranscriptDigest,
   setForeignSessionId,
+  setHostTranscriptDigest,
 } from "./session-store.js";
+import {
+  detectHostTranscriptDivergence,
+  divergenceRebuildEnabled,
+  fingerprintHostMessages,
+  hostOwnsTranscript,
+} from "./host-transcript.js";
 import { log } from "./log.js";
 import {
   getRateLimitSnapshot,
@@ -525,6 +533,58 @@ async function handleChatCompletions(
     });
     clearForeignSessionId(conversationKey);
     resume = undefined;
+  }
+
+  // Resume replays history from the Claude-side transcript, which ignores
+  // any host-side edits to prior messages (experimental.chat.messages.transform
+  // plugins such as DCP). Fingerprint what the host sends each turn; when the
+  // incoming array stops being an extension of the last one — or the operator
+  // opted into host-owned transcripts — rebuild from the host array instead.
+  if (!isMetaRequest) {
+    const fingerprint = fingerprintHostMessages(messages);
+    if (hostOwnsTranscript()) {
+      if (resume) {
+        log.info(
+          "[opencode-claude] host-transcript mode: skipping Claude session resume",
+          { conversationKey },
+        );
+        resume = undefined;
+      }
+    } else if (resume) {
+      const divergence = detectHostTranscriptDivergence(
+        getHostTranscriptDigest(conversationKey),
+        fingerprint,
+      );
+      if (divergence.diverged) {
+        if (divergenceRebuildEnabled()) {
+          log.warn(
+            "[opencode-claude] host messages diverged from last turn (history transform detected); rebuilding from host array instead of resuming",
+            {
+              conversationKey,
+              reason: divergence.reason,
+              sentCount: divergence.sentCount,
+              incomingCount: divergence.incomingCount,
+            },
+          );
+          clearForeignSessionId(conversationKey);
+          resume = undefined;
+        } else {
+          log.warn(
+            "[opencode-claude] host messages diverged from last turn but divergence rebuild is disabled — resuming the Claude transcript; transformed history will NOT reach Claude",
+            {
+              conversationKey,
+              reason: divergence.reason,
+              sentCount: divergence.sentCount,
+              incomingCount: divergence.incomingCount,
+            },
+          );
+        }
+      }
+    }
+    setHostTranscriptDigest(conversationKey, {
+      count: fingerprint.count,
+      hash: fingerprint.hash,
+    });
   }
 
   // No resumable Claude session (first claude-code turn of this chat, model

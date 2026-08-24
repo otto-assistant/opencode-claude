@@ -5,12 +5,16 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import type { HostTranscriptDigest } from "./host-transcript.js";
 
 export type ClaudeSessionBinding = {
   conversationKey: string;
-  foreignSessionId: string;
+  /** Absent while only a host-transcript digest has been recorded. */
+  foreignSessionId?: string;
   modelId?: string;
   cwd?: string;
+  /** Fingerprint of the host messages array sent last turn. */
+  hostDigest?: HostTranscriptDigest;
   updatedAt: number;
 };
 
@@ -53,7 +57,10 @@ export function setForeignSessionId(
   meta?: { modelId?: string; cwd?: string },
 ): void {
   const store = readStore();
+  // Merge so the host-transcript digest recorded at turn start survives the
+  // session_id events that arrive later in the same turn.
   store[conversationKey] = {
+    ...store[conversationKey],
     conversationKey,
     foreignSessionId,
     modelId: meta?.modelId,
@@ -67,6 +74,32 @@ export function clearForeignSessionId(conversationKey: string): void {
   const store = readStore();
   if (!(conversationKey in store)) return;
   delete store[conversationKey];
+  writeStore(store);
+}
+
+export function getHostTranscriptDigest(
+  conversationKey: string,
+): HostTranscriptDigest | undefined {
+  const digest = readStore()[conversationKey]?.hostDigest;
+  return digest &&
+    Number.isInteger(digest.count) &&
+    digest.count >= 0 &&
+    typeof digest.hash === "string"
+    ? digest
+    : undefined;
+}
+
+export function setHostTranscriptDigest(
+  conversationKey: string,
+  digest: HostTranscriptDigest,
+): void {
+  const store = readStore();
+  store[conversationKey] = {
+    ...store[conversationKey],
+    conversationKey,
+    hostDigest: digest,
+    updatedAt: Date.now(),
+  };
   writeStore(store);
 }
 
