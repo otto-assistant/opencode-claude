@@ -604,7 +604,10 @@ async function handleChatCompletions(
     cwd,
     model,
     resume: isMetaRequest ? undefined : resume,
-    effort: selection.effort,
+    // Meta requests force-disable thinking; the API rejects effort levels
+    // like "max" when thinking is disabled (400 output_config.effort), so
+    // effort must not be forwarded alongside them.
+    effort: isMetaRequest ? undefined : selection.effort,
     env,
     mcpServers: isMetaRequest ? undefined : mcpServers,
     autoCompactEnabled: !isMetaRequest,

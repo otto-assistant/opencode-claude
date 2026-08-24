@@ -226,7 +226,11 @@ export async function startClaudeQuery(
   }
 
   const effort = trimmedString(params.effort);
-  if (isClaudeEffort(effort)) options.effort = effort;
+  // The API rejects effort (e.g. "max") when thinking is disabled:
+  // "400 output_config.effort 'max' is not supported when thinking is
+  // disabled". Drop effort defensively rather than fail the whole turn.
+  const thinkingDisabled = params.thinking?.type === "disabled";
+  if (isClaudeEffort(effort) && !thinkingDisabled) options.effort = effort;
 
   if (params.thinking) {
     options.thinking = params.thinking;

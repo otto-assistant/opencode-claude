@@ -861,7 +861,16 @@ async function main() {
         `http://127.0.0.1:${port}/v1/chat/completions`,
         {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": "application/json",
+            // Selected effort must NOT reach the meta turn: thinking is
+            // force-disabled there, and the API rejects effort+disabled
+            // (400 output_config.effort 'max' is not supported...).
+            "x-opencode-claude-effort": encodeClaudeModelSelection({
+              modelId: "haiku",
+              effort: "max",
+            }),
+          },
           body: JSON.stringify({
             model: "claude-haiku-4-5",
             stream: true,
@@ -901,6 +910,11 @@ async function main() {
       assert.equal(titleOptions!.maxTurns, 1);
       assert.equal(titleOptions!.autoCompactEnabled, false);
       assert.deepEqual(titleOptions!.thinking, { type: "disabled" });
+      assert.equal(
+        titleOptions!.effort,
+        undefined,
+        "meta requests must not forward effort while thinking is disabled",
+      );
       assert.equal(titleOptions!.resume, undefined);
       assert.equal(
         titleOptions!.systemPrompt,
@@ -920,6 +934,48 @@ async function main() {
         process.env.ANTHROPIC_API_KEY = prevEnvApiKey;
       }
     }
+  }
+
+  // startClaudeQuery defensively drops effort when thinking is disabled —
+  // the API rejects that combination (400 output_config.effort ... is not
+  // supported when thinking is disabled).
+  {
+    const { startClaudeQuery } = await import("../src/query.ts");
+    const captureOptions = async (
+      extra: Record<string, unknown>,
+    ): Promise<Record<string, unknown>> => {
+      let captured: Record<string, unknown> | null = null;
+      const handle = await startClaudeQuery({
+        prompt: "hi",
+        cwd: "/tmp",
+        pathToClaudeCodeExecutable: "/bin/true",
+        ...extra,
+        queryImpl:
+          () =>
+          (input: { options: Record<string, unknown> }) => {
+            captured = input.options;
+            return (async function* () {})();
+          },
+      } as never);
+      handle.close();
+      assert.ok(captured, "queryImpl was invoked");
+      return captured!;
+    };
+
+    const disabledThinking = await captureOptions({
+      effort: "max",
+      thinking: { type: "disabled" },
+    });
+    assert.equal(
+      disabledThinking.effort,
+      undefined,
+      "effort must be dropped when thinking is disabled",
+    );
+    assert.deepEqual(disabledThinking.thinking, { type: "disabled" });
+
+    const adaptive = await captureOptions({ effort: "max" });
+    assert.equal(adaptive.effort, "max");
+    assert.deepEqual(adaptive.thinking, { type: "adaptive" });
   }
 
   // ---- Rate-limit tracker + tool/plan behavior (mocked Agent SDK) ----
