@@ -6,6 +6,15 @@ export const EFFORT_HEADER = "x-opencode-claude-effort";
 export const SESSION_HEADER = "x-opencode-claude-session";
 /** Active OpenCode project directory forwarded to the local Agent SDK proxy. */
 export const DIRECTORY_HEADER = "x-opencode-claude-directory";
+/**
+ * Claude account a response ran on. Echoed on turn responses and errors in
+ * multi-account mode so the bound account is visible from the wire without
+ * reading any store.
+ */
+export const ACCOUNT_HEADER = "x-opencode-claude-account";
+
+/** Separates a model id from its account: `opus@work`. */
+export const ACCOUNT_MODEL_SEPARATOR = "@";
 
 export const EFFORT_LEVELS = [
   "low",
