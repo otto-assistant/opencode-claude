@@ -115,6 +115,7 @@ opencode run "Summarise this repository in five bullets." --model claude-code/so
 | **Auto-compact** | Long sessions compact like Claude Code; boundary events are surfaced in the stream. |
 | **Session resume** | Sticky foreign Claude session IDs so follow-ups continue the same Agent SDK turn. |
 | **History transfer** | When no Claude session can be resumed (first claude-code turn of a chat, model switch mid-conversation, pruned transcript), the full prior conversation is serialized into the prompt — Claude never starts blind. |
+| **Host history transforms** | Plugins that rewrite conversation history via `experimental.chat.messages.transform` (e.g. DCP) work on resumed turns too: when the incoming message array stops being an extension of the last one, the proxy rebuilds the Claude session from the transformed host array instead of resuming. |
 | **Rate-limit counter** | Subscription limit state is tracked with its reset time; `GET /v1/rate-limit` answers "when are limits back", and doomed turns fail fast with 429 + `Retry-After`. |
 | **Stall & cancel safety** | A silent turn is killed after a watchdog timeout instead of wedging the session forever, and a client disconnect tears the turn down instead of leaking a live CLI process. |
 
@@ -148,6 +149,32 @@ errors (including the parsed reset time) to
 - `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0` disables the 429 gate (turns are
   attempted and error normally).
 
+### Host history & transform plugins
+
+On follow-up turns the proxy resumes the sticky Claude-side session, so
+conversation history normally comes from Claude's own transcript — not from
+the message array OpenCode sends. Host plugins that rewrite history through
+`experimental.chat.messages.transform` (context pruning à la
+`@tarquinen/opencode-dcp`, message editing, etc.) would silently have no
+effect on resumed turns.
+
+The proxy therefore fingerprints the non-system messages of every turn
+(system messages are deliberately dropped — the Claude Code preset supplies
+the agent system prompt). When the incoming array is no longer an extension
+of what the host sent last turn — messages were dropped, replaced, or edited —
+the proxy logs a warning, abandons the Claude session, and rebuilds it from
+the transformed host array via history transfer, so the transform actually
+reaches Claude.
+
+- Default: divergence → rebuild from the host array (new Claude session,
+  transferred history).
+- `OPENCODE_CLAUDE_DIVERGENCE_REBUILD=0` — warn-only: the divergence is
+  logged but the Claude transcript still wins (pre-0.12 behavior).
+- `OPENCODE_CLAUDE_HOST_TRANSCRIPT=1` — the host owns the transcript: never
+  resume, rebuild from the (possibly transformed) host array every turn.
+  Guarantees transform plugins always apply, at the cost of Claude-side
+  cross-turn prompt caching and auto-compact continuity.
+
 ## Requirements
 
 - [OpenCode](https://opencode.ai)
@@ -174,6 +201,8 @@ Optional knobs:
 - `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL` — `0` disables the 429 rate-limit gate
 - `OPENCODE_CLAUDE_RATE_LIMIT_STORE` — override the rate-limit store path (tests)
 - `OPENCODE_CLAUDE_HISTORY_MAX_CHARS` — budget for transferred conversation history when a Claude session cannot be resumed (default `400000`; newest messages are kept, `0` disables transfer)
+- `OPENCODE_CLAUDE_HOST_TRANSCRIPT` — `1` makes the host own the transcript: Claude sessions are never resumed and the conversation is rebuilt from the (possibly transformed) host messages every turn
+- `OPENCODE_CLAUDE_DIVERGENCE_REBUILD` — `0` downgrades host-history divergence handling to warn-only (the Claude transcript keeps winning; transformed history does not reach Claude)
 
 ## Release
 

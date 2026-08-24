@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- **Host history transforms respected on resume**: on resumed turns the proxy
+  previously ignored the host's prior messages entirely — history came from
+  the Claude-side session transcript, so plugins rewriting conversation
+  history via `experimental.chat.messages.transform` (e.g.
+  `@tarquinen/opencode-dcp`) had no effect after turn 2. The proxy now
+  fingerprints the non-system messages of every turn and, when the incoming
+  array is no longer an extension of what the host sent last turn (messages
+  dropped, replaced, or edited), logs a warning and rebuilds the Claude
+  session from the transformed host array instead of resuming.
+  `OPENCODE_CLAUDE_DIVERGENCE_REBUILD=0` downgrades this to warn-only, and
+  `OPENCODE_CLAUDE_HOST_TRANSCRIPT=1` opts into full host-owned transcripts
+  (never resume; rebuild from the host array every turn).
+- **Meta requests no longer 400 on effort**: session title and summary
+  generation force-disable thinking but still forwarded the selected effort
+  (e.g. `max`), which the API rejects with
+  `400 output_config.effort 'max' is not supported when thinking is disabled`.
+  Effort is no longer sent for meta requests, and `startClaudeQuery` also
+  drops effort defensively whenever thinking is disabled.
+
 ## 0.11.0
 
 - **Claude CLI-owned authentication**: removed the plugin's browser OAuth
