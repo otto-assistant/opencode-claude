@@ -39,6 +39,7 @@ import {
   getProxyPort,
   startProxy,
 } from "./proxy.js";
+import { buildClaudeTools } from "./tools.js";
 
 function zeroCost() {
   return {
@@ -245,7 +246,11 @@ export const ClaudeCodePlugin: Plugin = async (
   input: PluginInput,
 ): Promise<Hooks> => {
   const cliPresent = await probeCliPresence();
+  const claudeTools = buildClaudeTools();
   return {
+    // In-session account management (claude_accounts, claude_account_manage).
+    // Empty when disabled via OPENCODE_CLAUDE_TOOLS=0.
+    ...(Object.keys(claudeTools).length > 0 ? { tool: claudeTools } : {}),
     async config(config) {
       // Bind first (ephemeral port by default), then seed provider baseURL so
       // OpenCode's static config matches the live listener for this process.

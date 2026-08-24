@@ -577,6 +577,21 @@ function reconcileStoredAccountBindings(): number {
   return repaired;
 }
 
+/** Full account descriptions for the management tools — same data as /accounts. */
+export function describeAllAccounts(): Array<Record<string, unknown>> {
+  reconcileStoredAccountBindings();
+  const counts = sessionCountsByAccount();
+  return getAccounts().map((account) => describeAccount(account, counts));
+}
+
+/** Explicit quota refresh for one account (boots one idle CLI probe). */
+export async function refreshAccountQuota(accountId: string): Promise<{
+  quota: ReturnType<typeof getAccountQuota>;
+  identity: ReturnType<typeof getAccountIdentity>;
+}> {
+  return probeQuotaViaCli(requireAccount(accountId));
+}
+
 /**
  * Account/quota/session routes. Returns null when the path is not one of
  * them, so the main handler falls through to the OpenAI-compatible surface.
