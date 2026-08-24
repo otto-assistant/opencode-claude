@@ -2,6 +2,89 @@
 
 ## Unreleased
 
+- **Multiple Claude accounts, CLI-owned end to end**: one OpenCode server can
+  now drive several Claude subscriptions. Each account is a
+  `CLAUDE_CONFIG_DIR` — a self-contained Claude CLI home holding its own
+  credentials, transcripts and settings. The plugin never reads or writes a
+  token: connecting an account means running
+  `CLAUDE_CONFIG_DIR=<dir> claude auth login` (the exact command is printed by
+  the panel and tools), so the CLI stays the sole owner of every credential
+  chain. Accounts come from `OPENCODE_CLAUDE_ACCOUNTS` (JSON array or
+  `id:label:configDir` entries) or the panel/tool-managed
+  `~/.local/share/opencode-claude/accounts.json`; with neither, behaviour is
+  the single-account setup, byte for byte. In multi-account mode every model
+  appears once per account (`sonnet@work`, named "Claude Sonnet 4.5 (Work)"),
+  requests may pin an account via the `x-opencode-claude-account` header, and
+  each conversation binds to its account so follow-up turns stay put. Unknown
+  account ids are rejected with 404 — never silently routed to the default
+  account (and its quota).
+- **Account switches never leak transcripts across logins**: a Claude-side
+  resume id belongs to one account's config dir. When a conversation moves to
+  a different account (model pick, header, panel/tool rebind), the stored
+  resume target is cleared and the turn starts a fresh Claude session with the
+  OpenCode history transferred — resuming another login's session id is never
+  attempted. Removing an account reconciles all of its session bindings back
+  to the default account the same way.
+- **Remaining quota, without spending any**: the proxy tracks every quota
+  window per account — the SDK's `rate_limit_event` reports one window at a
+  time, so it is merged with the control channel's plan-usage snapshot (the
+  structured data behind the CLI's `/usage` command), which reports the
+  five-hour, seven-day and Opus windows at once. Refreshing quota
+  (`POST /accounts/:id/quota/refresh`, panel button, or the
+  `refresh-quota` tool action) boots one idle CLI probe and reads the control
+  channel — no Messages API call, zero tokens spent. Probes are single-flight
+  per account with a cooldown and failure backoff. Remaining percent per
+  window is surfaced in the model name (` · 5h 96% 2h 20m · 7d 4% 5d`,
+  disable with `OPENCODE_CLAUDE_MODEL_QUOTA=0`), `/health`, `/quota`, 429
+  bodies and the control panel; a window whose reset time has passed shows
+  `?` instead of a stale number.
+- **Account identity from the CLI**: each account's login (email,
+  organization, plan) is read over the SDK control channel and cached with a
+  staleness window. The panel and `/accounts` flag two accounts that resolve
+  to the same email — the duplicate-login detection from the OAuth era,
+  rebuilt without the plugin ever seeing a credential.
+- **Per-account usage counters**: turns and token totals (input/output/cache)
+  are recorded per account per day at
+  `~/.local/share/opencode-claude/usage.json` and exposed via `/usage`, the
+  panel and the tools.
+- **Control panel**: a self-contained HTML page (no external assets, CSP
+  `default-src 'none'`) at the proxy root (`/` or `/panel`) shows accounts,
+  logins, quota windows, rate-limit state, usage counters and the
+  session→account map, and can add/rename/remove accounts, set the default,
+  move a session and refresh quota. Mutating routes require a same-origin
+  request; the panel stays loopback-only unless
+  `OPENCODE_CLAUDE_PANEL_HOST` widens the bind, honours `X-Forwarded-Prefix`
+  behind a reverse proxy, and `OPENCODE_CLAUDE_PANEL=0` disables the page
+  (JSON API stays).
+- **In-session management tools**: `claude_accounts` (list accounts with
+  login, quota, usage and binding counts) and `claude_account_manage`
+  (add/remove/rename/set-default/bind-session/refresh-quota) manage the
+  roster from inside a session without touching the panel port. Disable with
+  `OPENCODE_CLAUDE_TOOLS=0`. When accounts are configured via
+  `OPENCODE_CLAUDE_ACCOUNTS`, mutations are refused with a pointer to the env
+  var instead of silently writing a shadowed accounts.json.
+- **Per-account rate limits**: the rate-limit store, 429 gate, `Retry-After`
+  and countdown notes are all keyed by account — one exhausted subscription
+  no longer blocks turns on a healthy one, and `/health?account=<id>` reports
+  the account you ask about.
+- **`$0 group usage limit` fails fast as a rate limit**: org spend-cap
+  errors ("usage limit reached for your group", `$0 balance`) are classified
+  as rate limits — 429 + gate — instead of generic 500s that hosts retry in
+  a loop against a wall.
+- **529 `overloaded` answered honestly**: Anthropic overload errors return
+  HTTP 529 with a short `Retry-After` instead of a generic 500, and do NOT
+  trip the local rate-limit gate — overload is Anthropic-side and transient,
+  not a subscription window.
+- **Local title/summary fallback when limited**: when the account is
+  rate-limited (or the meta turn itself dies on a limit), title and summary
+  requests answer 200 with a locally derived title/summary heuristic instead
+  of 429 — hosts stop burning retries on meta requests that cannot succeed,
+  and sessions still get a usable name. Meta requests also never bind a
+  conversation to an account.
+- **Smoke tests isolated from live state**: the test run redirects
+  `XDG_DATA_HOME` to a temp dir and clears `OPENCODE_CLAUDE_*` overrides, so
+  `bun test/smoke.ts` can never read or clobber a live rate-limit store,
+  account roster or session bindings, and never binds a production port.
 - **Host history transforms respected on resume**: on resumed turns the proxy
   previously ignored the host's prior messages entirely — history came from
   the Claude-side session transcript, so plugins rewriting conversation
