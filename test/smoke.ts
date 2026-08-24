@@ -4,6 +4,35 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync as rmTree } from "node:fs";
+import { tmpdir as osTmpdir } from "node:os";
+import { join as joinPaths } from "node:path";
+
+/**
+ * Isolate the whole run from the live host BEFORE any module reads its
+ * stores: every durable file (accounts, sessions, rate-limit, quota,
+ * identity, usage, debug log) lands in a throwaway XDG_DATA_HOME, and the
+ * proxy never binds/reuses an operator-pinned production port. A smoke run
+ * must not read the operator's real state — and must never gate or pollute
+ * a production proxy that is serving live sessions on this machine.
+ */
+const SMOKE_XDG = mkdtempSync(joinPaths(osTmpdir(), "oc-claude-smoke-xdg-"));
+process.env.XDG_DATA_HOME = SMOKE_XDG;
+for (const key of [
+  "OPENCODE_CLAUDE_PROXY_PORT",
+  "OPENCODE_CLAUDE_ACCOUNTS",
+  "OPENCODE_CLAUDE_RATE_LIMIT_STORE",
+  "OPENCODE_CLAUDE_QUOTA_STORE",
+  "OPENCODE_CLAUDE_IDENTITY_STORE",
+  "OPENCODE_CLAUDE_USAGE_STORE",
+  "OPENCODE_CLAUDE_MODEL_QUOTA",
+  "OPENCODE_CLAUDE_PANEL",
+  "OPENCODE_CLAUDE_PANEL_HOST",
+  "OPENCODE_CLAUDE_TOOLS",
+  "OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL",
+]) {
+  delete process.env[key];
+}
 
 async function main() {
   const { buildClaudeCodeChildEnv } = await import("../src/auth-env.ts");
@@ -834,8 +863,8 @@ async function main() {
     const { spawnSync } = await import("node:child_process");
     const { readFileSync, unlinkSync, existsSync } = await import("node:fs");
     const { join } = await import("node:path");
-    const { homedir } = await import("node:os");
-    const logPath = join(homedir(), ".local", "share", "opencode-claude", "debug.log");
+    // The spawned children inherit this run's isolated XDG_DATA_HOME.
+    const logPath = join(SMOKE_XDG, "opencode-claude", "debug.log");
     if (existsSync(logPath)) unlinkSync(logPath);
 
     const off = spawnSync(
@@ -1430,7 +1459,9 @@ async function main() {
       assert.match(blockedJson.error?.message ?? "", /limit resets in/);
       assert.ok((blockedJson.error?.retry_after ?? 0) > 0);
 
-      // Meta requests use Agent SDK too, so a confirmed hard limit gates them.
+      // Meta requests during a confirmed hard limit are answered LOCALLY
+      // (zero API calls) instead of burning the host's retry budget on a
+      // doomed 429: titles fall back to a heuristic of the request text.
       const metaRes = await fetch(
         `http://127.0.0.1:${port}/v1/chat/completions`,
         {
@@ -1450,7 +1481,40 @@ async function main() {
           }),
         },
       );
-      assert.equal(metaRes.status, 429);
+      assert.equal(metaRes.status, 200, "meta title falls back locally");
+      const metaJson = (await metaRes.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      assert.equal(metaJson.choices?.[0]?.message?.content, "Explain quicksort");
+
+      // Summary meta requests fall back to a locally assembled transcript so
+      // the conversation can continue with SOME context instead of none.
+      const summaryRes = await fetch(
+        `http://127.0.0.1:${port}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "sonnet",
+            stream: false,
+            messages: [
+              {
+                role: "system",
+                content:
+                  "You are tasked with summarizing conversations for compaction.",
+              },
+              { role: "user", content: "we discussed the AXIOM-9042 codename" },
+            ],
+          }),
+        },
+      );
+      assert.equal(summaryRes.status, 200, "meta summary falls back locally");
+      const summaryJson = (await summaryRes.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      const summaryText = String(summaryJson.choices?.[0]?.message?.content ?? "");
+      assert.match(summaryText, /Summary unavailable/);
+      assert.match(summaryText, /AXIOM-9042/, "fallback preserves context");
 
       // Counter endpoint reports the active limit with countdown
       const limitedRes = await fetch(`http://127.0.0.1:${port}/v1/rate-limit`);
@@ -2194,7 +2258,824 @@ async function main() {
     }
   }
 
+  // ---- Failure taxonomy: 529 overload + $0 group budget ----
+  {
+    const { setClaudeQueryStarter } = await import("../src/proxy.ts");
+    const {
+      classifyClaudeFailure,
+      failureStatusFor,
+      failureTypeFor,
+    } = await import("../src/failure.ts");
+    const {
+      isClaudeOverloadedText,
+      isClaudeRateLimitText,
+      recordRateLimitErrorText,
+      rateLimitGate,
+    } = await import("../src/rate-limit.ts");
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join: joinPath } = await import("node:path");
+
+    const tmpDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-529-"));
+    const prevStoreEnv = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+    process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = joinPath(
+      tmpDir,
+      "rate-limit.json",
+    );
+
+    const postTurn = (sessionHeader: string) =>
+      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-opencode-claude-session": sessionHeader,
+        },
+        body: JSON.stringify({
+          model: "sonnet",
+          stream: true,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+
+    const mockDeath = (text: string) => {
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield { type: "system", subtype: "init", session_id: "tax-sess" };
+          yield { type: "result", is_error: true, result: text };
+          throw new Error(`Claude Code returned an error result: ${text}`);
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      }));
+    };
+
+    try {
+      // Unit: classification. Overload outranks the generic limit patterns
+      // and must never be recorded as a hard subscription limit.
+      assert.equal(
+        classifyClaudeFailure("API is temporarily overloaded (overloaded_error)"),
+        "overloaded",
+      );
+      assert.equal(classifyClaudeFailure("upstream returned 529"), "overloaded");
+      assert.equal(failureStatusFor("overloaded"), 529);
+      assert.equal(failureTypeFor("overloaded"), "overloaded_error");
+      assert.equal(isClaudeOverloadedText("overloaded_error"), true);
+      assert.equal(
+        recordRateLimitErrorText("529 overloaded_error: try later"),
+        null,
+        "a transient overload must never activate the hard-limit gate",
+      );
+
+      // Unit: an org admin setting the group budget to $0 is a hard limit.
+      assert.equal(
+        isClaudeRateLimitText("Your group's usage limit is set to $0"),
+        true,
+      );
+      assert.equal(
+        classifyClaudeFailure(
+          "This request would exceed your group's usage limit is set to $0",
+        ),
+        "rate_limit",
+      );
+
+      // Proxy: overload death → 529 + short Retry-After, gate untouched.
+      mockDeath("API is temporarily overloaded (529 overloaded_error)");
+      const overloadedRes = await postTurn("tax-overload");
+      assert.equal(overloadedRes.status, 529);
+      assert.ok(overloadedRes.headers.get("retry-after"));
+      const overloadedJson = (await overloadedRes.json()) as {
+        error?: { type?: string; code?: string };
+      };
+      assert.equal(overloadedJson.error?.type, "overloaded_error");
+      assert.equal(overloadedJson.error?.code, "claude_overloaded");
+      assert.equal(
+        rateLimitGate().blocked,
+        false,
+        "529 must not gate follow-up turns",
+      );
+
+      // Follow-up turn goes straight through (no doomed fast-fail).
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "RECOVERED" },
+            },
+          };
+          yield { type: "result", is_error: false, usage: {} };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      }));
+      const recoveredRes = await postTurn("tax-recovered");
+      assert.equal(recoveredRes.status, 200);
+      assert.match(await recoveredRes.text(), /RECOVERED/);
+
+      // Proxy: $0 group budget death → 429 + gate active.
+      mockDeath("Your group's usage limit is set to $0 — request refused");
+      const groupRes = await postTurn("tax-group-zero");
+      assert.equal(groupRes.status, 429);
+      assert.equal(rateLimitGate().blocked, true, "$0 group budget gates");
+    } finally {
+      setClaudeQueryStarter(null);
+      if (prevStoreEnv === undefined) {
+        delete process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+      } else {
+        process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = prevStoreEnv;
+      }
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  // ---- Quota + identity stores (SDK control channel parsing) ----
+  {
+    const {
+      __resetQuotaStore,
+      formatQuotaSummary,
+      getAccountQuota,
+      mergeSdkRateLimitEvent,
+      parsePlanUsage,
+      recordQuotaFromPlanUsage,
+    } = await import("../src/quota.ts");
+    const {
+      __resetIdentityStore,
+      accountsSharingLogin,
+      labelLoginMismatch,
+      parseAccountInfo,
+      recordAccountIdentity,
+    } = await import("../src/identity.ts");
+    const { quotaNameSuffix } = await import("../src/models.ts");
+
+    __resetQuotaStore();
+    // Control-channel payload: utilization is 0-100, resets_at is ISO.
+    const resetsIso = new Date(Date.now() + 2 * 3600_000).toISOString();
+    const weeklyIso = new Date(Date.now() + 5 * 24 * 3600_000).toISOString();
+    const parsed = parsePlanUsage({
+      rate_limits_available: true,
+      rate_limits: {
+        five_hour: { utilization: 57, resets_at: resetsIso },
+        seven_day: { utilization: 93, resets_at: weeklyIso },
+      },
+    });
+    assert.ok(parsed, "plan usage parsed");
+    assert.ok(
+      Math.abs(parsed!.windows.fiveHour!.remaining - 0.43) < 1e-9,
+      "0-100 utilization converts to 0..1 remaining",
+    );
+    assert.equal(parsed!.windows.fiveHour!.resetsAt, Date.parse(resetsIso));
+    assert.ok(Math.abs(parsed!.windows.sevenDay!.remaining - 0.07) < 1e-9);
+    assert.equal(parsePlanUsage({ rate_limits_available: false }), null);
+    assert.equal(parsePlanUsage({}), null);
+    assert.equal(parsePlanUsage(null), null);
+
+    recordQuotaFromPlanUsage("work", {
+      rate_limits_available: true,
+      rate_limits: {
+        five_hour: { utilization: 57, resets_at: resetsIso },
+        seven_day: { utilization: 93, resets_at: weeklyIso },
+      },
+    });
+
+    // A rate_limit_event reports ONE window — merging must not erase the
+    // sibling window (five-hour healthy while weekly nearly spent is exactly
+    // the case that matters).
+    mergeSdkRateLimitEvent("work", {
+      rateLimitType: "five_hour",
+      status: "allowed",
+      utilization: 0.61,
+      resetsAt: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const merged = getAccountQuota("work");
+    assert.ok(merged);
+    assert.ok(
+      Math.abs(merged!.windows.fiveHour!.utilization - 0.61) < 1e-9,
+      "event window merged",
+    );
+    assert.ok(
+      merged!.windows.sevenDay &&
+        Math.abs(merged!.windows.sevenDay.remaining - 0.07) < 1e-9,
+      "sibling window survives the merge",
+    );
+    const summary = formatQuotaSummary(merged);
+    assert.match(summary ?? "", /5h 39% left/);
+    assert.match(summary ?? "", /7d 7% left/);
+
+    // Model-name quota suffix (percent LEFT — what the operator reads while
+    // picking a model). Stale windows (reset already behind us) show "?".
+    const suffix = quotaNameSuffix("work");
+    assert.match(suffix, /5h 39%/);
+    assert.match(suffix, /7d 7%/);
+    process.env.OPENCODE_CLAUDE_MODEL_QUOTA = "0";
+    assert.equal(quotaNameSuffix("work"), "");
+    delete process.env.OPENCODE_CLAUDE_MODEL_QUOTA;
+
+    // Identity: resolved by the CLI, recorded as reported, duplicate logins
+    // across accounts are flagged (one quota pool wearing two labels).
+    __resetIdentityStore();
+    assert.equal(parseAccountInfo({}), null);
+    assert.equal(parseAccountInfo(null), null);
+    recordAccountIdentity("work", {
+      email: "alice@corp.com",
+      organization: "Corp",
+      subscriptionType: "max",
+    });
+    recordAccountIdentity("personal", { email: "ALICE@corp.com" });
+    assert.deepEqual(accountsSharingLogin("work"), ["personal"]);
+    const mismatch = labelLoginMismatch("work", "Work · bob@corp.com");
+    assert.equal(mismatch?.claimed, "bob@corp.com");
+    assert.equal(mismatch?.actual, "alice@corp.com");
+    assert.equal(labelLoginMismatch("work", "Just Work"), null);
+    __resetIdentityStore();
+    __resetQuotaStore();
+  }
+
+  // ---- Usage counters (per-account turn/token accounting) ----
+  {
+    const {
+      __resetUsageStore,
+      getAccountUsage,
+      recordTurnUsage,
+    } = await import("../src/usage-store.ts");
+    __resetUsageStore();
+    recordTurnUsage("work", {
+      prompt_tokens: 100,
+      completion_tokens: 20,
+      prompt_tokens_details: { cached_tokens: 60, cache_write_tokens: 5 },
+    });
+    // A parked (tool-call) response is a fragment of a turn: tokens count,
+    // the turn does not.
+    recordTurnUsage("work", { prompt_tokens: 50, completion_tokens: 10 }, {
+      countTurn: false,
+    });
+    const usage = getAccountUsage("work");
+    assert.equal(usage.turns, 1);
+    assert.equal(usage.inputTokens, 150);
+    assert.equal(usage.outputTokens, 30);
+    assert.equal(usage.cacheReadTokens, 60);
+    assert.equal(usage.today.turns, 1);
+    assert.equal(usage.last7Days.inputTokens, 150);
+    __resetUsageStore();
+  }
+
+  // ---- Account registry: file-managed roster (CLI-owned config dirs) ----
+  {
+    const {
+      AccountError,
+      addAccount,
+      applyAccountEnv,
+      findAccount,
+      getAccounts,
+      getAccountsFilePath,
+      getDefaultAccount,
+      isMultiAccount,
+      removeAccount,
+      renameAccount,
+      requireAccount,
+      resetAccounts,
+      setDefaultAccount,
+      slugifyAccountId,
+      assertLabelNamesNoLogin,
+    } = await import("../src/accounts.ts");
+    const { bindConversationAccount, clearForeignSessionId } = await import(
+      "../src/session-store.ts"
+    );
+    const { rmSync } = await import("node:fs");
+    const { join } = await import("node:path");
+
+    // Nothing configured → one implicit ambient account, single-account mode.
+    resetAccounts();
+    assert.equal(isMultiAccount(), false);
+    assert.equal(getAccounts().length, 1);
+    assert.equal(getDefaultAccount().id, "default");
+    // The ambient account leaves the child env untouched (operator tokens
+    // pass through; the CLI decides what to honor).
+    const ambientEnv = applyAccountEnv(getDefaultAccount(), {
+      PATH: "/usr/bin",
+      CLAUDE_CODE_OAUTH_TOKEN: "keep",
+    });
+    assert.equal(ambientEnv.CLAUDE_CODE_OAUTH_TOKEN, "keep");
+
+    // Slug + label hygiene.
+    assert.equal(slugifyAccountId("Cuenta Diseño"), "cuenta-diseno");
+    assert.equal(slugifyAccountId("Work Shared"), "work-shared");
+    assert.throws(
+      () => assertLabelNamesNoLogin("Work alice@corp.com"),
+      AccountError,
+      "labels must not hardcode a login",
+    );
+
+    try {
+      // Add: id derived from the label, config dir created, ambient account
+      // persisted alongside so it stays addressable.
+      const teamDir = join(SMOKE_XDG, "claude-team");
+      const added = addAccount({ label: "Team Rocket", configDir: teamDir });
+      assert.equal(added.id, "team-rocket");
+      assert.equal(added.configDir, teamDir);
+      resetAccounts();
+      assert.equal(isMultiAccount(), true);
+      assert.ok(findAccount("team-rocket"));
+      assert.ok(findAccount("default"), "ambient account persisted");
+
+      // A scoped account pins CLAUDE_CONFIG_DIR and drops the ambient env
+      // token (the CLI would prefer it over the account's credential file).
+      const scoped = applyAccountEnv(requireAccount("team-rocket"), {
+        PATH: "/usr/bin",
+        CLAUDE_CODE_OAUTH_TOKEN: "ambient-token",
+      });
+      assert.equal(scoped.CLAUDE_CONFIG_DIR, teamDir);
+      assert.equal(scoped.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+
+      // Duplicate config dir refused — one Claude home per account.
+      assert.throws(
+        () => addAccount({ label: "Impostor", configDir: teamDir }),
+        AccountError,
+      );
+      // Email in a label refused at add time too.
+      assert.throws(
+        () => addAccount({ label: "x alice@corp.com" }),
+        AccountError,
+      );
+
+      // Rename with id migration: every per-account store must be carried.
+      let migrated: [string, string, string] | null = null;
+      const renamed = renameAccount("team-rocket", "Team", {
+        newId: "team",
+        migrate: (oldId, newId, label) => {
+          migrated = [oldId, newId, label];
+        },
+      });
+      assert.equal(renamed.id, "team");
+      assert.equal(renamed.label, "Team");
+      assert.deepEqual(migrated, ["team-rocket", "team", "Team"]);
+
+      setDefaultAccount("team");
+      resetAccounts();
+      assert.equal(getDefaultAccount().id, "team");
+
+      // Removing an account that still owns conversations requires force.
+      bindConversationAccount("smoke-registry-bound", "team", "Team");
+      assert.throws(() => removeAccount("team"), AccountError);
+      removeAccount("default", false);
+      resetAccounts();
+      assert.equal(getAccounts().length, 1);
+      assert.throws(
+        () => removeAccount("team"),
+        AccountError,
+        "cannot remove the only account",
+      );
+      clearForeignSessionId("smoke-registry-bound");
+
+      // Env-configured rosters are read-only: mutations would write a file
+      // the env override shadows, so they are refused loudly.
+      process.env.OPENCODE_CLAUDE_ACCOUNTS = "solo:Solo";
+      resetAccounts();
+      assert.throws(() => addAccount({ label: "Nope" }), AccountError);
+      assert.throws(() => setDefaultAccount("solo"), AccountError);
+    } finally {
+      delete process.env.OPENCODE_CLAUDE_ACCOUNTS;
+      rmSync(getAccountsFilePath(), { force: true });
+      resetAccounts();
+    }
+  }
+
+  // ---- Multi-account routing through the proxy (mocked Agent SDK) ----
+  {
+    const { setClaudeQueryStarter } = await import("../src/proxy.ts");
+    const { resetAccounts } = await import("../src/accounts.ts");
+    const { recordRateLimitErrorText } = await import("../src/rate-limit.ts");
+    const {
+      bindConversationAccount,
+      getSessionBinding,
+      clearForeignSessionId,
+    } = await import("../src/session-store.ts");
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join: joinPath } = await import("node:path");
+
+    const tmpRoot = mkdtempSync(joinPath(tmpdir(), "oc-claude-acct-"));
+    const workDir = joinPath(tmpRoot, "work");
+    const personalDir = joinPath(tmpRoot, "personal");
+    const prevRateStore = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+    process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = joinPath(
+      tmpRoot,
+      "rate-limit.json",
+    );
+    process.env.OPENCODE_CLAUDE_ACCOUNTS = `work:Work:${workDir},personal:Personal:${personalDir}`;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "ambient-shell-token";
+    resetAccounts();
+
+    const seen = { params: null as Record<string, unknown> | null };
+    const mockOk = () => {
+      setClaudeQueryStarter(async (params) => {
+        seen.params = params as unknown as Record<string, unknown>;
+        return {
+          stream: (async function* () {
+            yield { type: "system", subtype: "init", session_id: "acct-sess" };
+            yield {
+              type: "stream_event",
+              event: {
+                type: "content_block_delta",
+                delta: { type: "text_delta", text: "ACCT_OK" },
+              },
+            };
+            yield {
+              type: "result",
+              is_error: false,
+              usage: { input_tokens: 5, output_tokens: 2 },
+            };
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        };
+      });
+    };
+
+    const postChat = (
+      sessionHeader: string,
+      model: string,
+      messages: unknown[] = [{ role: "user", content: "hi" }],
+    ) =>
+      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-opencode-claude-session": sessionHeader,
+        },
+        body: JSON.stringify({ model, stream: false, messages }),
+      });
+
+    try {
+      // Explicit account in the model id → that account's Claude home, and
+      // the ambient env token is dropped so the CLI cannot prefer it.
+      mockOk();
+      const workRes = await postChat("acct-conv-1", "claude-code/sonnet@work");
+      assert.equal(workRes.status, 200);
+      assert.equal(
+        workRes.headers.get("x-opencode-claude-account"),
+        "work",
+        "account echoed on the response",
+      );
+      await workRes.text();
+      const workEnv = seen.params!.env as Record<string, string | undefined>;
+      assert.equal(workEnv.CLAUDE_CONFIG_DIR, workDir);
+      assert.equal(workEnv.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+      assert.equal(seen.params!.model, "sonnet", "account suffix stripped");
+
+      // Sticky binding: the follow-up carries NO account — it must stay on
+      // the bound one, not drift to the default.
+      const binding1 = getSessionBinding("acct-conv-1");
+      assert.equal(binding1?.accountId, "work");
+      mockOk();
+      const stickyRes = await postChat("acct-conv-1", "sonnet");
+      assert.equal(stickyRes.status, 200);
+      await stickyRes.text();
+      assert.equal(
+        (seen.params!.env as Record<string, string | undefined>)
+          .CLAUDE_CONFIG_DIR,
+        workDir,
+        "session stays on its bound account",
+      );
+
+      // Unknown account ids are REJECTED, never silently rerouted.
+      const unknownRes = await postChat("acct-conv-2", "sonnet@nope");
+      assert.equal(unknownRes.status, 400);
+      const unknownJson = (await unknownRes.json()) as {
+        error?: { message?: string };
+      };
+      assert.match(unknownJson.error?.message ?? "", /unknown Claude account/);
+      assert.match(unknownJson.error?.message ?? "", /work, personal/);
+
+      // Model catalog: default account keeps bare ids; others get @suffix,
+      // and every name carries its account label.
+      const catalogRes = await fetch(`http://127.0.0.1:${port}/v1/models`);
+      const catalog = (await catalogRes.json()) as {
+        data: Array<{ id: string }>;
+      };
+      const ids = catalog.data.map((m) => m.id);
+      assert.ok(ids.includes("sonnet"), "default account keeps bare ids");
+      assert.ok(ids.includes("sonnet@personal"), "other accounts get @suffix");
+      const { getClaudeModels } = await import("../src/models.ts");
+      const named = getClaudeModels();
+      assert.ok(named.some((m) => m.name.includes("(Work)")));
+      assert.ok(named.some((m) => m.name.includes("(Personal)")));
+
+      // Selection header with an account rides through end to end.
+      mockOk();
+      const headerRes = await fetch(
+        `http://127.0.0.1:${port}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-opencode-claude-session": "acct-conv-3",
+            "x-opencode-claude-effort": encodeClaudeModelSelection({
+              modelId: "opus",
+              effort: "high",
+              account: "personal",
+            }),
+          },
+          body: JSON.stringify({
+            model: "sonnet",
+            stream: false,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        },
+      );
+      assert.equal(headerRes.status, 200);
+      assert.equal(headerRes.headers.get("x-opencode-claude-account"), "personal");
+      await headerRes.text();
+      assert.equal(
+        (seen.params!.env as Record<string, string | undefined>)
+          .CLAUDE_CONFIG_DIR,
+        personalDir,
+      );
+      assert.equal(seen.params!.model, "opus");
+      assert.equal(seen.params!.effort, "high");
+
+      // Removed account: the stored binding is repaired onto the default
+      // account, the dead resume target is cleared, and the next turn starts
+      // FRESH (no history transfer nobody asked to pay for).
+      bindConversationAccount("acct-conv-gone", "gone", "Gone");
+      mockOk();
+      const reboundRes = await postChat("acct-conv-gone", "sonnet", [
+        { role: "user", content: "remember AXIOM-9042" },
+        { role: "assistant", content: "noted" },
+        { role: "user", content: "next question" },
+      ]);
+      assert.equal(reboundRes.status, 200);
+      await reboundRes.text();
+      assert.equal(
+        (seen.params!.env as Record<string, string | undefined>)
+          .CLAUDE_CONFIG_DIR,
+        workDir,
+        "repaired binding lands on the default account",
+      );
+      assert.doesNotMatch(
+        String(seen.params!.prompt ?? ""),
+        /<conversation_history>/,
+        "machinery rebinds skip the history transfer",
+      );
+      const repaired = getSessionBinding("acct-conv-gone");
+      assert.equal(repaired?.accountId, "work");
+      assert.equal(repaired?.rebound, undefined, "rebound absorbed by the turn");
+
+      // Operator moves a session between accounts: resume target cleared,
+      // next turn transfers history into the NEW account.
+      const moveRes = await fetch(
+        `http://127.0.0.1:${port}/sessions/${encodeURIComponent("acct-conv-1")}/account`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ account: "personal" }),
+        },
+      );
+      assert.equal(moveRes.status, 200);
+      mockOk();
+      const movedTurn = await postChat("acct-conv-1", "sonnet", [
+        { role: "user", content: "remember AXIOM-9042" },
+        { role: "assistant", content: "noted" },
+        { role: "user", content: "what was it?" },
+      ]);
+      assert.equal(movedTurn.status, 200);
+      await movedTurn.text();
+      assert.equal(
+        (seen.params!.env as Record<string, string | undefined>)
+          .CLAUDE_CONFIG_DIR,
+        personalDir,
+        "moved session runs on the new account",
+      );
+      assert.equal(seen.params!.resume, undefined);
+      assert.match(
+        String(seen.params!.prompt ?? ""),
+        /<conversation_history>/,
+        "operator moves DO transfer history",
+      );
+
+      // Read-only account/quota/usage/session endpoints.
+      const accountsRes = await fetch(`http://127.0.0.1:${port}/accounts`);
+      assert.equal(accountsRes.status, 200);
+      const accountsJson = (await accountsRes.json()) as {
+        multiAccount?: boolean;
+        data?: Array<{ id: string; sessions: number; quotaSummary?: unknown }>;
+      };
+      assert.equal(accountsJson.multiAccount, true);
+      assert.deepEqual(
+        accountsJson.data?.map((a) => a.id).sort(),
+        ["personal", "work"],
+      );
+      const quotaRes = await fetch(`http://127.0.0.1:${port}/quota`);
+      assert.equal(quotaRes.status, 200);
+      const usageRes = await fetch(`http://127.0.0.1:${port}/usage`);
+      assert.equal(usageRes.status, 200);
+      const usageJson = (await usageRes.json()) as {
+        accounts?: Record<string, { turns?: number }>;
+      };
+      assert.ok(
+        (usageJson.accounts?.work?.turns ?? 0) >= 1,
+        "turn usage recorded per account",
+      );
+      const sessionsRes = await fetch(
+        `http://127.0.0.1:${port}/sessions?account=personal`,
+      );
+      const sessionsJson = (await sessionsRes.json()) as {
+        data?: Array<{ conversationKey: string; account: string }>;
+      };
+      assert.ok(
+        sessionsJson.data?.some((s) => s.conversationKey === "acct-conv-1"),
+        "moved session listed under its new account",
+      );
+
+      // Per-account limits: work hits its window; personal keeps working.
+      recordRateLimitErrorText(
+        "You've hit your usage limit · resets at 2099-01-02T03:04:05Z",
+        "work",
+      );
+      const gatedRes = await postChat("acct-conv-4", "sonnet@work");
+      assert.equal(gatedRes.status, 429, "limited account fails fast");
+      assert.equal(gatedRes.headers.get("x-opencode-claude-account"), "work");
+      mockOk();
+      const freeRes = await postChat("acct-conv-3", "sonnet@personal");
+      assert.equal(
+        freeRes.status,
+        200,
+        "an unrelated account must not be gated",
+      );
+      await freeRes.text();
+
+      // Meta title on the LIMITED account → local fallback, zero API calls.
+      const metaLocal = await fetch(
+        `http://127.0.0.1:${port}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "haiku@work",
+            stream: false,
+            messages: [
+              {
+                role: "system",
+                content:
+                  "You are a title generator. Generate a brief title. Output only the title.",
+              },
+              { role: "user", content: "Refactor the billing module" },
+            ],
+          }),
+        },
+      );
+      assert.equal(metaLocal.status, 200);
+      const metaLocalJson = (await metaLocal.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      assert.equal(
+        metaLocalJson.choices?.[0]?.message?.content,
+        "Refactor the billing module",
+      );
+
+      // Health and rate-limit are account-scoped on demand.
+      const healthWork = await fetch(
+        `http://127.0.0.1:${port}/health?account=work`,
+      );
+      const healthWorkJson = (await healthWork.json()) as {
+        account?: string;
+        rateLimit?: { limited?: boolean };
+      };
+      assert.equal(healthWorkJson.account, "work");
+      assert.equal(healthWorkJson.rateLimit?.limited, true);
+      const healthUnknown = await fetch(
+        `http://127.0.0.1:${port}/health?account=nope`,
+      );
+      assert.equal(healthUnknown.status, 404);
+
+      // Mutations under an env-configured roster are refused (409) — and
+      // cross-origin browser requests are refused regardless (403).
+      const envMutation = await fetch(`http://127.0.0.1:${port}/accounts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ label: "Nope" }),
+      });
+      assert.equal(envMutation.status, 409);
+      const crossOrigin = await fetch(`http://127.0.0.1:${port}/accounts`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: "http://evil.example",
+        },
+        body: JSON.stringify({ label: "Evil" }),
+      });
+      assert.equal(crossOrigin.status, 403);
+
+      clearForeignSessionId("acct-conv-1");
+      clearForeignSessionId("acct-conv-3");
+      clearForeignSessionId("acct-conv-gone");
+    } finally {
+      setClaudeQueryStarter(null);
+      delete process.env.OPENCODE_CLAUDE_ACCOUNTS;
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      if (prevRateStore === undefined) {
+        delete process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+      } else {
+        process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = prevRateStore;
+      }
+      resetAccounts();
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }
+
+  // ---- Control panel + management tools ----
+  {
+    const panelRes = await fetch(`http://127.0.0.1:${port}/`);
+    assert.equal(panelRes.status, 200);
+    assert.match(panelRes.headers.get("content-type") ?? "", /text\/html/);
+    const panelHtml = await panelRes.text();
+    assert.match(panelHtml, /opencode-claude/);
+    assert.doesNotMatch(
+      panelHtml,
+      /src="http|href="http/,
+      "panel must be self-contained (no external assets)",
+    );
+
+    // Reverse-proxy prefix lands in <base>; garbage prefixes are ignored.
+    const prefixed = await fetch(`http://127.0.0.1:${port}/`, {
+      headers: { "x-forwarded-prefix": "/claude" },
+    });
+    assert.match(await prefixed.text(), /<base href="\/claude\/">/);
+    const { basePathFromPrefix } = await import("../src/panel.ts");
+    assert.equal(basePathFromPrefix('/x"><script>'), "/");
+    assert.equal(basePathFromPrefix("not-a-path"), "/");
+    assert.equal(basePathFromPrefix(null), "/");
+
+    // Kill switch.
+    process.env.OPENCODE_CLAUDE_PANEL = "0";
+    const disabled = await fetch(`http://127.0.0.1:${port}/`);
+    assert.equal(disabled.status, 404);
+    delete process.env.OPENCODE_CLAUDE_PANEL;
+
+    // Tools: registered by default, removable via env, and the read tool
+    // reports the roster without any Claude turn.
+    const { buildClaudeTools, claudeToolsEnabled } = await import(
+      "../src/tools.ts"
+    );
+    assert.equal(claudeToolsEnabled(), true);
+    const tools = buildClaudeTools();
+    assert.deepEqual(Object.keys(tools).sort(), [
+      "claude_account_manage",
+      "claude_accounts",
+    ]);
+    process.env.OPENCODE_CLAUDE_TOOLS = "0";
+    assert.deepEqual(buildClaudeTools(), {});
+    delete process.env.OPENCODE_CLAUDE_TOOLS;
+
+    const listResult = (await tools.claude_accounts!.execute(
+      {} as never,
+      {} as never,
+    )) as { title?: string; output?: string };
+    assert.match(listResult.output ?? "", /"accounts"/);
+    assert.match(listResult.output ?? "", /"default"/);
+
+    const badAction = (await tools.claude_account_manage!.execute(
+      { action: "remove", account: "does-not-exist" } as never,
+      {} as never,
+    )) as { output?: string };
+    assert.match(badAction.output ?? "", /unknown account/);
+
+    // Add + remove through the tool (file-managed registry).
+    const { getAccountsFilePath, resetAccounts } = await import(
+      "../src/accounts.ts"
+    );
+    const { rmSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    try {
+      const addResult = (await tools.claude_account_manage!.execute(
+        {
+          action: "add",
+          label: "Tool Made",
+          configDir: join(SMOKE_XDG, "claude-tool-made"),
+        } as never,
+        {} as never,
+      )) as { output?: string };
+      assert.match(addResult.output ?? "", /claude auth login/);
+      assert.match(addResult.output ?? "", /tool-made/);
+      const removeResult = (await tools.claude_account_manage!.execute(
+        { action: "remove", account: "tool-made" } as never,
+        {} as never,
+      )) as { output?: string };
+      assert.match(removeResult.output ?? "", /"removed"/);
+    } finally {
+      rmSync(getAccountsFilePath(), { force: true });
+      resetAccounts();
+    }
+  }
+
   await stopProxy();
+
+  // Nothing during the run may have escaped into the operator's real stores;
+  // drop the throwaway XDG home.
+  rmTree(SMOKE_XDG, { recursive: true, force: true });
 
   // TypeScript build
   const build = spawnSync("bun", ["run", "build"], {

@@ -1339,11 +1339,15 @@ async function handleChatCompletions(
   };
   putBridge(bridge);
 
+  // Account fields only exist in multi-account mode: a single-account store
+  // stays byte-compatible with what pre-account versions wrote, and the
+  // implicit "default" id never leaks into durable state.
   const sessionMeta = {
     modelId: model,
     cwd,
-    accountId: account.id,
-    accountLabel: account.label,
+    ...(isMultiAccount()
+      ? { accountId: account.id, accountLabel: account.label }
+      : {}),
   };
 
   async function* consumeStream(): AsyncGenerator<unknown, void, unknown> {

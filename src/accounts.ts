@@ -344,6 +344,21 @@ export class AccountError extends Error {
 }
 
 /**
+ * Registry mutations edit accounts.json — but OPENCODE_CLAUDE_ACCOUNTS wins
+ * whole over the file, so a mutation made while the env override is active
+ * would write state nobody ever reads. Refuse loudly instead.
+ */
+function assertRegistryMutable(): void {
+  if (process.env.OPENCODE_CLAUDE_ACCOUNTS?.trim()) {
+    throw new AccountError(
+      "accounts are configured via OPENCODE_CLAUDE_ACCOUNTS — edit that " +
+        "environment variable instead; registry changes made here would be ignored",
+      409,
+    );
+  }
+}
+
+/**
  * Register an account. The config dir is created on demand so the operator's
  * `CLAUDE_CONFIG_DIR=<dir> claude auth login` has somewhere to write.
  */
@@ -353,6 +368,7 @@ export function addAccount(input: {
   configDir?: unknown;
   makeDefault?: boolean;
 }): ClaudeAccount {
+  assertRegistryMutable();
   const existing = getAccounts();
   const taken = new Set(existing.map((a) => a.id));
   const givenId = typeof input.id === "string" ? input.id.trim().toLowerCase() : "";
@@ -425,6 +441,7 @@ export function addAccount(input: {
 
 /** Forget an account. Its Claude home is left on disk — credentials are the operator's. */
 export function removeAccount(id: string, force = false): void {
+  assertRegistryMutable();
   const wanted = id.trim().toLowerCase();
   const existing = getAccounts();
   const target = existing.find((a) => a.id === wanted);
@@ -462,6 +479,7 @@ export function renameAccount(
   label: unknown,
   options?: { newId?: unknown; migrate?: (oldId: string, newId: string, label: string) => void },
 ): ClaudeAccount {
+  assertRegistryMutable();
   const wanted = id.trim().toLowerCase();
   const existing = getAccounts();
   const current = existing.find((a) => a.id === wanted);
@@ -517,6 +535,7 @@ export function renameAccount(
 
 /** Which account new sessions land on when nothing else says otherwise. */
 export function setDefaultAccount(id: string): ClaudeAccount {
+  assertRegistryMutable();
   const wanted = id.trim().toLowerCase();
   const existing = getAccounts();
   if (!existing.some((a) => a.id === wanted)) {
