@@ -99,6 +99,7 @@ import {
   hostOwnsTranscript,
 } from "./host-transcript.js";
 import { log } from "./log.js";
+import { panelEnabled, renderPanelHtml } from "./panel.js";
 import {
   getAllRateLimitSnapshots,
   getRateLimitSnapshot,
@@ -744,6 +745,27 @@ async function handleAccountRoutes(
 
 async function handleRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
+
+  // Control panel: one self-contained HTML page at the root. Read-only until
+  // its fetches hit the mutation routes, which enforce same-origin.
+  if (
+    req.method === "GET" &&
+    (url.pathname === "/" || url.pathname === "/panel") &&
+    panelEnabled()
+  ) {
+    return new Response(
+      renderPanelHtml(req.headers.get("x-forwarded-prefix")),
+      {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+          "Content-Security-Policy":
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'self'; form-action 'self'",
+        },
+      },
+    );
+  }
 
   const accountResponse = await handleAccountRoutes(req, url);
   if (accountResponse) return accountResponse;
