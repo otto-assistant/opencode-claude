@@ -75,3 +75,15 @@ export function requestKeyNamespace(kind: MetaRequestKind): string {
   if (kind === "summary") return "summary:";
   return "";
 }
+
+/**
+ * Local, zero-API-call session title derived from the user's request text.
+ * Used when the subscription is rate-limited: titles are auxiliary, and
+ * spending a turn (or failing one) on them during a limit is the worst trade
+ * available.
+ */
+export function heuristicTitle(userText: string): string {
+  const line = (userText || "").replace(/\s+/g, " ").trim().slice(0, 60);
+  if (!line) return "New session";
+  return line.length < (userText || "").trim().length ? `${line}...` : line;
+}

@@ -19,37 +19,96 @@ import {
 } from "./bridge-pool.js";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
 import {
+  AccountError,
+  accountConfigDir,
+  addAccount,
+  applyAccountEnv,
+  findAccount,
+  getAccounts,
+  getAccountsFilePath,
+  getDefaultAccount,
+  isMultiAccount,
+  removeAccount,
+  renameAccount,
+  requireAccount,
+  setDefaultAccount,
+  type ClaudeAccount,
+} from "./accounts.js";
+import {
   classifyClaudeFailure,
   failureHintFor,
   failureStatusFor,
   failureTypeFor,
+  OVERLOADED_RETRY_AFTER_SECONDS,
 } from "./failure.js";
+import {
+  accountsSharingLogin,
+  clearAccountIdentity,
+  getAccountIdentity,
+  labelLoginMismatch,
+  recordAccountIdentity,
+  renameAccountIdentity,
+} from "./identity.js";
 import {
   decodeClaudeModelSelection,
   EFFORT_HEADER,
 } from "./model-selection.js";
-import { resolveClaudeModelId } from "./models.js";
+import { parseAccountModelId, resolveClaudeModelId } from "./models.js";
 import {
+  ACCOUNT_HEADER,
   DIRECTORY_HEADER,
   SESSION_HEADER,
   type ClaudeEffort,
 } from "./constants.js";
 import { startClaudeQuery, type ClaudeQueryHandle } from "./query.js";
 import {
+  clearAccountQuota,
+  formatQuotaSummary,
+  getAccountQuota,
+  getAllAccountQuota,
+  mergeSdkRateLimitEvent,
+  recordQuotaFromPlanUsage,
+  renameAccountQuota,
+} from "./quota.js";
+import {
+  bindConversationAccount,
   clearForeignSessionId,
   conversationKeyFromMessages,
+  countBoundSessions,
   findClaudeSessionFile,
+  getBoundAccountId,
   getForeignSessionId,
+  getHostTranscriptDigest,
+  getSessionBinding,
+  listSessionBindings,
+  reconcileAccountBindings,
+  renameBoundAccount,
   setForeignSessionId,
+  setHostTranscriptDigest,
 } from "./session-store.js";
-import { log } from "./log.js";
 import {
+  getAccountUsage,
+  getAllAccountUsage,
+  recordTurnUsage,
+  renameAccountUsage,
+} from "./usage-store.js";
+import {
+  detectHostTranscriptDivergence,
+  divergenceRebuildEnabled,
+  fingerprintHostMessages,
+  hostOwnsTranscript,
+} from "./host-transcript.js";
+import { log } from "./log.js";
+import { panelEnabled, renderPanelHtml } from "./panel.js";
+import {
+  getAllRateLimitSnapshots,
   getRateLimitSnapshot,
   maybeRateLimitNote,
   normalizeClaudeErrorText,
   rateLimitGate,
   recordRateLimitErrorText,
   recordRateLimitInfo,
+  renameAccountRateLimit,
   formatResetCountdown,
 } from "./rate-limit.js";
 import {
@@ -63,6 +122,7 @@ import {
 } from "./prompt.js";
 import {
   detectMetaRequestKind,
+  heuristicTitle,
   metaSystemPrompt,
   requestKeyNamespace,
 } from "./request-kind.js";
@@ -112,6 +172,17 @@ const REQUESTED_PROXY_PORT: number = (() => {
     : 0;
 })();
 
+/**
+ * Interface the proxy binds to. Loopback by default — it fronts a
+ * subscription. Set OPENCODE_CLAUDE_PANEL_HOST=0.0.0.0 to put the panel
+ * behind a reverse proxy you already trust; it is then only as protected as
+ * that proxy makes it.
+ */
+const BIND_HOST = (() => {
+  const raw = process.env.OPENCODE_CLAUDE_PANEL_HOST?.trim();
+  return raw || "127.0.0.1";
+})();
+
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
@@ -149,6 +220,143 @@ type ChatCompletionRequest = {
 
 let server: ReturnType<typeof Bun.serve> | null = null;
 let proxyPort: number | null = null;
+
+// ---------------------------------------------------------------------------
+// Quota + identity telemetry over the SDK control channel.
+//
+// Post-#12 every Anthropic request runs inside the spawned `claude` CLI, so
+// the unified rate-limit response headers never reach this process. The
+// control channel's `get_usage` reports EVERY plan window at once via the
+// CLI's own credentials (claude.ai usage endpoint — no Messages call, no
+// quota spent). It only answers while a query's message loop is pumping, so
+// the refresh fires during live turns and is never awaited by them.
+//
+// Throttled, single-flight and backed off per account: a broken control
+// channel must not be re-hit on every turn.
+// ---------------------------------------------------------------------------
+const PLAN_USAGE_MIN_INTERVAL_MS = 60_000;
+const PLAN_USAGE_TIMEOUT_MS = 30_000;
+const IDENTITY_MIN_INTERVAL_MS = 6 * 3_600_000;
+const planUsageInFlight = new Map<string, Promise<void>>();
+const planUsageRetryAfter = new Map<string, number>();
+
+async function refreshAccountTelemetry(
+  handle: ClaudeQueryHandle | null | undefined,
+  accountId: string,
+  options?: { force?: boolean },
+): Promise<void> {
+  if (typeof handle?.readPlanUsage !== "function") return;
+  const now = Date.now();
+  const current = getAccountQuota(accountId);
+  if (
+    !options?.force &&
+    current &&
+    now - current.fetchedAt < PLAN_USAGE_MIN_INTERVAL_MS
+  ) {
+    return;
+  }
+  if (!options?.force && now < (planUsageRetryAfter.get(accountId) ?? 0)) return;
+  const existing = planUsageInFlight.get(accountId);
+  if (existing) return existing;
+  const request = (async () => {
+    try {
+      const timeout = new Promise<null>((resolve) => {
+        const timer = setTimeout(() => resolve(null), PLAN_USAGE_TIMEOUT_MS);
+        timer.unref?.();
+      });
+      const usage = await Promise.race([handle.readPlanUsage(), timeout]);
+      if (usage) {
+        recordQuotaFromPlanUsage(accountId, usage);
+        planUsageRetryAfter.delete(accountId);
+      } else {
+        planUsageRetryAfter.set(accountId, Date.now() + PLAN_USAGE_MIN_INTERVAL_MS);
+      }
+      // Identity rarely changes — refresh it only when stale, and reuse the
+      // same live control channel.
+      const identity = getAccountIdentity(accountId);
+      if (
+        typeof handle.readAccountInfo === "function" &&
+        (options?.force ||
+          !identity ||
+          Date.now() - identity.fetchedAt > IDENTITY_MIN_INTERVAL_MS)
+      ) {
+        const info = await Promise.race([handle.readAccountInfo(), timeout]);
+        if (info) recordAccountIdentity(accountId, info);
+      }
+    } catch {
+      // Back off failures so a broken control channel is not hit every turn.
+      planUsageRetryAfter.set(accountId, Date.now() + PLAN_USAGE_MIN_INTERVAL_MS);
+    } finally {
+      planUsageInFlight.delete(accountId);
+    }
+  })();
+  planUsageInFlight.set(accountId, request);
+  return request;
+}
+
+/**
+ * Explicit quota refresh without spending quota and without touching
+ * credentials: start an idle Agent SDK query (streaming prompt that never
+ * yields a message), read `get_usage` + `accountInfo` over its control
+ * channel, and tear the CLI down. No Messages API call is made.
+ *
+ * Single-flight per account and rate-limited: each probe boots a CLI
+ * process, so hammering the endpoint must not multiply them.
+ */
+const QUOTA_PROBE_COOLDOWN_MS = 30_000;
+const quotaProbeLastAt = new Map<string, number>();
+
+async function probeQuotaViaCli(account: ClaudeAccount): Promise<{
+  quota: ReturnType<typeof getAccountQuota>;
+  identity: ReturnType<typeof getAccountIdentity>;
+}> {
+  const inFlight = planUsageInFlight.get(account.id);
+  if (inFlight) {
+    await inFlight;
+    return {
+      quota: getAccountQuota(account.id),
+      identity: getAccountIdentity(account.id),
+    };
+  }
+  const last = quotaProbeLastAt.get(account.id) ?? 0;
+  if (Date.now() - last < QUOTA_PROBE_COOLDOWN_MS) {
+    return {
+      quota: getAccountQuota(account.id),
+      identity: getAccountIdentity(account.id),
+    };
+  }
+  quotaProbeLastAt.set(account.id, Date.now());
+
+  // A prompt stream that never yields: the CLI boots, the control channel
+  // comes up, and no user message is ever sent.
+  const idleGate: { release: (() => void) | null } = { release: null };
+  const idlePrompt = (async function* () {
+    await new Promise<void>((resolve) => {
+      idleGate.release = resolve;
+    });
+  })() as AsyncIterable<SdkUserPrompt>;
+
+  const handle = await queryStarter({
+    prompt: idlePrompt,
+    cwd: process.env.OPENCODE_CLAUDE_CWD || process.cwd(),
+    env: applyAccountEnv(account, buildClaudeCodeChildEnv()),
+    settingSources: [],
+    skills: [],
+    tools: [],
+    maxTurns: 1,
+    systemPrompt: "quota probe",
+  });
+  try {
+    await refreshAccountTelemetry(handle, account.id, { force: true });
+  } finally {
+    idleGate.release?.();
+    handle.close();
+  }
+  return {
+    quota: getAccountQuota(account.id),
+    identity: getAccountIdentity(account.id),
+  };
+}
 
 /** Injectable for smoke tests — production path always uses startClaudeQuery. */
 let queryStarter: typeof startClaudeQuery = startClaudeQuery;
@@ -223,7 +431,7 @@ export async function startProxy(): Promise<number> {
     }
   }
 
-  const hostname = "127.0.0.1";
+  const hostname = BIND_HOST;
   const bindPort = REQUESTED_PROXY_PORT; // 0 → ephemeral
 
   try {
@@ -265,14 +473,320 @@ export async function stopProxy(): Promise<void> {
   }
 }
 
+/**
+ * Same-origin guard for mutating panel/account routes. Requests without an
+ * Origin header (curl, same-machine tooling) pass; a browser Origin must
+ * match the Host the request arrived on (X-Forwarded-Host wins behind a
+ * reverse proxy) or be loopback.
+ */
+function isLocalOrigin(req: Request): boolean {
+  const origin = req.headers.get("origin");
+  if (!origin) return true; // curl, xh, the plugin's own tooling
+  const forwardedHost = req.headers.get("x-forwarded-host")?.split(",")[0]?.trim();
+  const host = (forwardedHost || req.headers.get("host") || "").trim();
+  try {
+    const url = new URL(origin);
+    if (host && url.host.toLowerCase() === host.toLowerCase()) return true;
+    const hostname = url.hostname;
+    return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Carry every per-account store to a new id. Miss one and the account keeps
+ * its name but loses its quota, usage, identity or session bindings.
+ */
+export function migrateAccountStores(
+  oldId: string,
+  newId: string,
+  newLabel: string,
+): void {
+  renameAccountQuota(oldId, newId);
+  renameAccountIdentity(oldId, newId);
+  renameAccountUsage(oldId, newId);
+  renameAccountRateLimit(oldId, newId);
+  renameBoundAccount(oldId, newId, newLabel);
+}
+
+function jsonError(message: string, status: number): Response {
+  return Response.json(
+    {
+      error: {
+        message,
+        type: status === 404 ? "not_found" : "invalid_request_error",
+      },
+    },
+    { status },
+  );
+}
+
+async function readJsonBody(req: Request): Promise<Record<string, unknown>> {
+  try {
+    const parsed = await req.json();
+    return parsed && typeof parsed === "object"
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Account payload for the panel/tools: identity, limits and usage. */
+function describeAccount(
+  account: ClaudeAccount,
+  sessionCounts: Map<string, number>,
+): Record<string, unknown> {
+  return {
+    id: account.id,
+    label: account.label,
+    default: account.isDefault,
+    configDir: accountConfigDir(account),
+    sessions: sessionCounts.get(account.id) ?? 0,
+    rateLimit: getRateLimitSnapshot(Date.now(), account.id),
+    usage: getAccountUsage(account.id),
+    quota: getAccountQuota(account.id),
+    quotaSummary: formatQuotaSummary(getAccountQuota(account.id)),
+    // Who this actually is, as the CLI reported it during a turn/probe.
+    identity: getAccountIdentity(account.id),
+    labelClaimsLogin: labelLoginMismatch(account.id, account.label),
+    // Two accounts resolving to the same login are one quota pool.
+    sharesLoginWith: accountsSharingLogin(account.id),
+  };
+}
+
+function sessionCountsByAccount(): Map<string, number> {
+  const defaultId = getDefaultAccount().id;
+  const counts = new Map<string, number>();
+  for (const binding of listSessionBindings()) {
+    const id = binding.accountId ?? defaultId;
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function reconcileStoredAccountBindings(): number {
+  const labels = new Map(getAccounts().map((account) => [account.id, account.label]));
+  const repaired = reconcileAccountBindings(labels, getDefaultAccount().id);
+  if (repaired) {
+    log.warn("[opencode-claude] repaired stale session account bindings", {
+      repaired,
+      defaultAccount: getDefaultAccount().id,
+    });
+  }
+  return repaired;
+}
+
+/** Full account descriptions for the management tools — same data as /accounts. */
+export function describeAllAccounts(): Array<Record<string, unknown>> {
+  reconcileStoredAccountBindings();
+  const counts = sessionCountsByAccount();
+  return getAccounts().map((account) => describeAccount(account, counts));
+}
+
+/** Explicit quota refresh for one account (boots one idle CLI probe). */
+export async function refreshAccountQuota(accountId: string): Promise<{
+  quota: ReturnType<typeof getAccountQuota>;
+  identity: ReturnType<typeof getAccountIdentity>;
+}> {
+  return probeQuotaViaCli(requireAccount(accountId));
+}
+
+/**
+ * Account/quota/session routes. Returns null when the path is not one of
+ * them, so the main handler falls through to the OpenAI-compatible surface.
+ */
+async function handleAccountRoutes(
+  req: Request,
+  url: URL,
+): Promise<Response | null> {
+  const path = url.pathname.replace(/^\/v1(?=\/|$)/, "") || "/";
+
+  if (req.method === "GET" && path === "/accounts") {
+    reconcileStoredAccountBindings();
+    const counts = sessionCountsByAccount();
+    return Response.json({
+      object: "list",
+      multiAccount: isMultiAccount(),
+      registryPath: getAccountsFilePath(),
+      data: getAccounts().map((account) => describeAccount(account, counts)),
+    });
+  }
+
+  if (req.method === "GET" && path === "/usage") {
+    return Response.json({ object: "usage", accounts: getAllAccountUsage() });
+  }
+
+  // Last known quota per account. Read-only and free; refreshing boots a CLI
+  // probe, so it is a separate explicit POST.
+  if (req.method === "GET" && path === "/quota") {
+    return Response.json({ object: "quota", accounts: getAllAccountQuota() });
+  }
+
+  if (req.method === "GET" && path === "/sessions") {
+    reconcileStoredAccountBindings();
+    const defaultId = getDefaultAccount().id;
+    const wanted = url.searchParams.get("account")?.trim().toLowerCase();
+    const data = listSessionBindings()
+      .map((binding) => {
+        const accountId = binding.accountId ?? defaultId;
+        return {
+          conversationKey: binding.conversationKey,
+          account: accountId,
+          // Current label, not the one captured at bind time — a rename must
+          // not leave old names scattered across the session list.
+          accountLabel: findAccount(accountId)?.label ?? accountId,
+          modelId: binding.modelId,
+          cwd: binding.cwd,
+          claudeSessionId: binding.foreignSessionId || null,
+          updatedAt: binding.updatedAt,
+        };
+      })
+      .filter((entry) => !wanted || entry.account === wanted);
+    return Response.json({ object: "list", data });
+  }
+
+  // ---- mutations ----
+  const accountMatch =
+    /^\/accounts\/([^/]+)(?:\/(default|rename|quota\/refresh))?$/.exec(path);
+  const sessionMatch = /^\/sessions\/([^/]+)\/account$/.exec(path);
+  const isMutation =
+    req.method !== "GET" &&
+    (path === "/accounts" || accountMatch !== null || sessionMatch !== null);
+  if (!isMutation) return null;
+
+  if (!isLocalOrigin(req)) {
+    return jsonError("cross-origin requests are not accepted", 403);
+  }
+
+  try {
+    if (req.method === "POST" && path === "/accounts") {
+      const body = await readJsonBody(req);
+      const account = addAccount({
+        id: body.id,
+        label: body.label,
+        configDir: body.configDir,
+        makeDefault: body.makeDefault === true,
+      });
+      return Response.json(
+        {
+          ...describeAccount(account, sessionCountsByAccount()),
+          connect: `CLAUDE_CONFIG_DIR=${accountConfigDir(account)} claude auth login`,
+        },
+        { status: 201 },
+      );
+    }
+
+    if (accountMatch) {
+      const id = decodeURIComponent(accountMatch[1]);
+      const action = accountMatch[2];
+      const account = findAccount(id);
+      if (!account) return jsonError(`unknown account "${id}"`, 404);
+
+      if (req.method === "DELETE" && !action) {
+        const force = ["1", "true", "yes"].includes(
+          (url.searchParams.get("force") ?? "").trim().toLowerCase(),
+        );
+        removeAccount(id, force);
+        clearAccountIdentity(id);
+        clearAccountQuota(id);
+        reconcileStoredAccountBindings();
+        return Response.json({ removed: id });
+      }
+      if (req.method === "POST" && action === "default") {
+        return Response.json({ default: setDefaultAccount(id).id });
+      }
+      if (req.method === "POST" && action === "rename") {
+        const body = await readJsonBody(req);
+        const renamed = renameAccount(id, body.label, {
+          newId: body.newId,
+          migrate: migrateAccountStores,
+        });
+        return Response.json({ account: renamed.id, label: renamed.label });
+      }
+      if (req.method === "POST" && action === "quota/refresh") {
+        // Boots one idle CLI process and reads the control channel — no
+        // Messages API call, no quota spent. Operator-initiated only.
+        const probed = await probeQuotaViaCli(account);
+        return Response.json({
+          account: account.id,
+          quota: probed.quota,
+          quotaSummary: formatQuotaSummary(probed.quota),
+          identity: probed.identity,
+        });
+      }
+    }
+
+    if (sessionMatch && req.method === "POST") {
+      const conversationKey = decodeURIComponent(sessionMatch[1]);
+      const body = await readJsonBody(req);
+      const target = findAccount(
+        typeof body.account === "string" ? body.account : "",
+      );
+      if (!target) return jsonError("unknown account", 404);
+      if (!getSessionBinding(conversationKey)) {
+        return jsonError(`unknown session "${conversationKey}"`, 404);
+      }
+      // Same rule as an in-band switch: the resume target belongs to the old
+      // account's Claude home and must not follow the session across.
+      bindConversationAccount(conversationKey, target.id, target.label);
+      return Response.json({ conversationKey, account: target.id });
+    }
+  } catch (err) {
+    if (err instanceof AccountError) return jsonError(err.message, err.status);
+    const message = err instanceof Error ? err.message : String(err);
+    log.warn("[opencode-claude] account route failed", { path, message });
+    return jsonError(message, 400);
+  }
+
+  return null;
+}
+
 async function handleRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
 
+  // Control panel: one self-contained HTML page at the root. Read-only until
+  // its fetches hit the mutation routes, which enforce same-origin.
+  if (
+    req.method === "GET" &&
+    (url.pathname === "/" || url.pathname === "/panel") &&
+    panelEnabled()
+  ) {
+    return new Response(
+      renderPanelHtml(req.headers.get("x-forwarded-prefix")),
+      {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+          "Content-Security-Policy":
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'self'; form-action 'self'",
+        },
+      },
+    );
+  }
+
+  const accountResponse = await handleAccountRoutes(req, url);
+  if (accountResponse) return accountResponse;
+
   if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) {
-    const rateLimit = getRateLimitSnapshot();
+    const requested = url.searchParams.get("account");
+    let account: ClaudeAccount;
+    try {
+      account = requested ? requireAccount(requested) : getDefaultAccount();
+    } catch (err) {
+      if (err instanceof AccountError) return jsonError(err.message, err.status);
+      throw err;
+    }
+    const rateLimit = getRateLimitSnapshot(Date.now(), account.id);
     return Response.json({
       ok: true,
       provider: "claude-code",
+      account: account.id,
+      accountLabel: account.label,
+      accounts: getAccounts().map((a) => a.id),
+      quota: formatQuotaSummary(getAccountQuota(account.id)),
       rateLimit: {
         limited: rateLimit.limited,
         ...(rateLimit.resetsAtISO ? { resetsAt: rateLimit.resetsAtISO } : {}),
@@ -287,11 +801,25 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   // Live "when are limits back" counter for OpenChamber / OpenCode UIs.
+  // `?account=<id>` scopes it; without it, the default account's counter
+  // plus a per-account map so a UI can show every subscription at once.
   if (
     req.method === "GET" &&
     (url.pathname === "/rate-limit" || url.pathname === "/v1/rate-limit")
   ) {
-    return Response.json(getRateLimitSnapshot());
+    const requested = url.searchParams.get("account");
+    let account: ClaudeAccount;
+    try {
+      account = requested ? requireAccount(requested) : getDefaultAccount();
+    } catch (err) {
+      if (err instanceof AccountError) return jsonError(err.message, err.status);
+      throw err;
+    }
+    return Response.json({
+      ...getRateLimitSnapshot(Date.now(), account.id),
+      account: account.id,
+      ...(isMultiAccount() ? { accounts: getAllRateLimitSnapshots() } : {}),
+    });
   }
 
   if (req.method === "GET" && url.pathname === "/v1/models") {
@@ -311,6 +839,9 @@ async function handleRequest(req: Request): Promise<Response> {
       const body = (await req.json()) as ChatCompletionRequest;
       return await handleChatCompletions(req, body);
     } catch (err) {
+      if (err instanceof AccountError) {
+        return jsonError(err.message, err.status);
+      }
       const message = err instanceof Error ? err.message : String(err);
       log.error("[opencode-claude] chat completions error", message);
       return Response.json(
@@ -337,14 +868,66 @@ function collectToolResults(
 function selectionFromRequest(
   req: Request,
   body: ChatCompletionRequest,
-): { modelId: string; effort?: ClaudeEffort } {
+): { modelId: string; effort?: ClaudeEffort; account?: string } {
   const header = req.headers.get(EFFORT_HEADER);
   const decoded = decodeClaudeModelSelection(header);
-  const modelId =
-    decoded?.modelId ||
-    (typeof body.model === "string" ? body.model.replace(/^claude-code\//, "") : "sonnet");
-  const effort = decoded?.effort;
-  return { modelId, ...(effort ? { effort } : {}) };
+  if (decoded) {
+    // The header's modelId may itself carry an account suffix when the host
+    // relays the raw picker id.
+    const { baseModelId, accountId } = parseAccountModelId(decoded.modelId);
+    return {
+      modelId: baseModelId || decoded.modelId,
+      ...(decoded.effort ? { effort: decoded.effort } : {}),
+      ...(decoded.account || accountId
+        ? { account: decoded.account || accountId! }
+        : {}),
+    };
+  }
+  const rawModel =
+    typeof body.model === "string"
+      ? body.model.replace(/^claude-code\//, "")
+      : "sonnet";
+  const { baseModelId, accountId } = parseAccountModelId(rawModel);
+  return {
+    modelId: baseModelId || "sonnet",
+    ...(accountId ? { account: accountId } : {}),
+  };
+}
+
+/**
+ * Account this request runs on.
+ *
+ * Order: explicit account from the model selection (unknown ids are REJECTED
+ * — silently routing someone's turn to a different subscription is how quota
+ * gets spent on the wrong account); then the conversation's sticky binding
+ * (repaired to the default when its account was removed); then the default.
+ */
+function resolveRequestAccount(
+  selection: { account?: string },
+  bindingKey: string,
+): ClaudeAccount {
+  if (selection.account) {
+    const explicit = findAccount(selection.account);
+    if (!explicit) {
+      throw new AccountError(
+        `unknown Claude account "${selection.account}" — configured accounts: ${getAccounts()
+          .map((a) => a.id)
+          .join(", ")}`,
+        400,
+      );
+    }
+    return explicit;
+  }
+  const boundId = getBoundAccountId(bindingKey);
+  if (boundId) {
+    const bound = findAccount(boundId);
+    if (bound) return bound;
+    // The bound account was removed underneath the session. Repair every
+    // stale binding (marking them rebound so the next turn starts fresh
+    // without a history transfer nobody asked for) and continue on default.
+    reconcileStoredAccountBindings();
+  }
+  return getDefaultAccount();
 }
 
 async function handleChatCompletions(
@@ -360,6 +943,11 @@ async function handleChatCompletions(
   const selection = selectionFromRequest(req, body);
   const model = resolveClaudeModelId(selection.modelId);
   const stream = body.stream !== false;
+
+  // Which subscription this turn runs on. Unknown explicit ids are rejected
+  // here with a 400 — resolveRequestAccount throws AccountError — instead of
+  // silently spending a different account's quota.
+  const account = resolveRequestAccount(selection, conversationKey);
 
   // Resume a parked bridge if OpenCode returned tool results.
   const toolResults = collectToolResults(messages);
@@ -429,7 +1017,9 @@ async function handleChatCompletions(
     bridgePending: existing?.pendingTools.size ?? 0,
   });
 
-  const env = buildClaudeCodeChildEnv();
+  // Child env pointing the CLI at this account's Claude home. The plugin
+  // never reads credentials — the config dir IS the account.
+  const env = applyAccountEnv(account, buildClaudeCodeChildEnv());
 
   const openCodeTools = Array.isArray(body.tools) ? body.tools : [];
   const isMetaRequest = metaKind !== null;
@@ -479,14 +1069,32 @@ async function handleChatCompletions(
     );
   }
 
-  // Confirmed hard subscription limit active? Fail fast with a proper 429 +
-  // Retry-After instead of spawning a doomed Agent SDK turn (which would
-  // surface as a fake "completed" assistant message and burn time).
-  // Placed after input validation so malformed requests still get 400.
-  const gate = rateLimitGate();
+  // Confirmed hard subscription limit active ON THIS ACCOUNT? Fail fast with
+  // a proper 429 + Retry-After instead of spawning a doomed Agent SDK turn
+  // (which would surface as a fake "completed" assistant message and burn
+  // time). Placed after input validation so malformed requests still get 400.
+  const gate = rateLimitGate(Date.now(), account.id);
   if (gate.blocked) {
+    // Meta requests (title/summary) are auxiliary: spending the retry budget
+    // (or a 429 doom loop) on them during a limit is the worst trade
+    // available. Answer locally with zero API calls instead.
+    if (metaKind) {
+      log.info("[opencode-claude] meta request answered locally (rate-limited)", {
+        conversationKey,
+        metaKind,
+        account: account.id,
+      });
+      return localMetaFallbackResponse(
+        metaKind,
+        messages,
+        body.model || model,
+        stream,
+        gate.message,
+      );
+    }
     log.warn("[opencode-claude] rate-limit gate blocked a turn", {
       conversationKey,
+      account: account.id,
       retryAfterSeconds: gate.retryAfterSeconds,
     });
     return Response.json(
@@ -508,13 +1116,24 @@ async function handleChatCompletions(
           ...(gate.resetsAt !== undefined
             ? { "x-claude-rate-limit-reset": new Date(gate.resetsAt).toISOString() }
             : {}),
+          ...accountEchoHeaders(account.id),
         },
       },
     );
   }
 
+  // Record the account binding before the turn starts, so parallel requests
+  // and the panel agree on ownership even while the first turn is running.
+  // Switching a bound conversation to another account clears its resume
+  // target (the transcript lives in the OLD account's Claude home).
+  const priorBinding = isMetaRequest ? null : getSessionBinding(conversationKey);
+  const reboundSkipTransfer = priorBinding?.rebound === true;
+  if (!isMetaRequest && isMultiAccount()) {
+    bindConversationAccount(conversationKey, account.id, account.label);
+  }
+
   let resume = getForeignSessionId(conversationKey);
-  if (resume && !findClaudeSessionFile(resume)) {
+  if (resume && !findClaudeSessionFile(resume, accountConfigDir(account))) {
     // The claude CLI resumes by looking the session up on disk. A missing
     // transcript (cleanup, different machine, pruned projects dir) would
     // silently start a context-free session — drop the stale binding and
@@ -527,12 +1146,68 @@ async function handleChatCompletions(
     resume = undefined;
   }
 
+  // Resume replays history from the Claude-side transcript, which ignores
+  // any host-side edits to prior messages (experimental.chat.messages.transform
+  // plugins such as DCP). Fingerprint what the host sends each turn; when the
+  // incoming array stops being an extension of the last one — or the operator
+  // opted into host-owned transcripts — rebuild from the host array instead.
+  if (!isMetaRequest) {
+    const fingerprint = fingerprintHostMessages(messages);
+    if (hostOwnsTranscript()) {
+      if (resume) {
+        log.info(
+          "[opencode-claude] host-transcript mode: skipping Claude session resume",
+          { conversationKey },
+        );
+        resume = undefined;
+      }
+    } else if (resume) {
+      const divergence = detectHostTranscriptDivergence(
+        getHostTranscriptDigest(conversationKey),
+        fingerprint,
+      );
+      if (divergence.diverged) {
+        if (divergenceRebuildEnabled()) {
+          log.warn(
+            "[opencode-claude] host messages diverged from last turn (history transform detected); rebuilding from host array instead of resuming",
+            {
+              conversationKey,
+              reason: divergence.reason,
+              sentCount: divergence.sentCount,
+              incomingCount: divergence.incomingCount,
+            },
+          );
+          clearForeignSessionId(conversationKey);
+          resume = undefined;
+        } else {
+          log.warn(
+            "[opencode-claude] host messages diverged from last turn but divergence rebuild is disabled — resuming the Claude transcript; transformed history will NOT reach Claude",
+            {
+              conversationKey,
+              reason: divergence.reason,
+              sentCount: divergence.sentCount,
+              incomingCount: divergence.incomingCount,
+            },
+          );
+        }
+      }
+    }
+    setHostTranscriptDigest(conversationKey, {
+      count: fingerprint.count,
+      hash: fingerprint.hash,
+    });
+  }
+
   // No resumable Claude session (first claude-code turn of this chat, model
   // switch mid-conversation, lost store): serialize the prior OpenCode
   // messages into the prompt so Claude sees the whole conversation.
-  const transcript = resume
-    ? ""
-    : buildConversationTranscript(priorMessagesOf(messages));
+  // Machinery-rebound conversations (their account was removed) skip the
+  // transfer: nobody asked to pay for re-ingesting the history on another
+  // subscription — the next turn simply starts fresh.
+  const transcript =
+    resume || reboundSkipTransfer
+      ? ""
+      : buildConversationTranscript(priorMessagesOf(messages));
   if (transcript) {
     log.info("[opencode-claude] injecting transferred conversation history", {
       conversationKey,
@@ -604,7 +1279,10 @@ async function handleChatCompletions(
     cwd,
     model,
     resume: isMetaRequest ? undefined : resume,
-    effort: selection.effort,
+    // Meta requests force-disable thinking; the API rejects effort levels
+    // like "max" when thinking is disabled (400 output_config.effort), so
+    // effort must not be forwarded alongside them.
+    effort: isMetaRequest ? undefined : selection.effort,
     env,
     mcpServers: isMetaRequest ? undefined : mcpServers,
     autoCompactEnabled: !isMetaRequest,
@@ -653,12 +1331,24 @@ async function handleChatCompletions(
   const bridge: ParkedBridge = {
     id: bridgeId,
     conversationKey,
+    accountId: account.id,
     handle,
     pendingTools,
     seenAssistantUsageIds: new Set(),
     createdAt: Date.now(),
   };
   putBridge(bridge);
+
+  // Account fields only exist in multi-account mode: a single-account store
+  // stays byte-compatible with what pre-account versions wrote, and the
+  // implicit "default" id never leaks into durable state.
+  const sessionMeta = {
+    modelId: model,
+    cwd,
+    ...(isMultiAccount()
+      ? { accountId: account.id, accountLabel: account.label }
+      : {}),
+  };
 
   async function* consumeStream(): AsyncGenerator<unknown, void, unknown> {
     const iterator = handle!.stream[Symbol.asyncIterator]();
@@ -733,10 +1423,7 @@ async function handleChatCompletions(
             const pendingEvent = raced.value.value;
             const pendingSessionId = extractSessionId(pendingEvent);
             if (pendingSessionId) {
-              setForeignSessionId(conversationKey, pendingSessionId, {
-                modelId: model,
-                cwd,
-              });
+              setForeignSessionId(conversationKey, pendingSessionId, sessionMeta);
             }
             yield pendingEvent;
           }
@@ -749,10 +1436,13 @@ async function handleChatCompletions(
         const event = raced.value.value;
         const sessionId = extractSessionId(event);
         if (sessionId) {
-          setForeignSessionId(conversationKey, sessionId, {
-            modelId: model,
-            cwd,
-          });
+          setForeignSessionId(conversationKey, sessionId, sessionMeta);
+          // The message loop is live now — refresh quota + identity over the
+          // control channel (single-flight, throttled, no Messages call).
+          // Never awaited by the turn; meta turns are too short to bother.
+          if (!isMetaRequest) {
+            void refreshAccountTelemetry(handle, account.id);
+          }
         }
         yield event;
       }
@@ -775,14 +1465,134 @@ async function handleChatCompletions(
   // fake-200 stream whose only "assistant text" is the error. Hosts retry
   // fake-200 turns in a loop and each retry re-sends the whole conversation
   // to Anthropic: that doom loop burned ~4% of a weekly quota on 2026-08-11.
+  //
+  // Meta requests probe in both modes: when the turn dies of a rate limit
+  // (or transient overload) the local fallback answers instead — a title or
+  // summary is never worth a doomed retry loop.
+  if (isMetaRequest) {
+    const probe = await probeTurnEvents(consumeStream());
+    if (probe.status === "failed") {
+      const kind = classifyClaudeFailure(probe.errorText);
+      if (kind === "rate_limit" || kind === "overloaded") {
+        recordRateLimitErrorText(probe.errorText, account.id);
+        log.info("[opencode-claude] meta turn failed; answering locally", {
+          conversationKey,
+          metaKind,
+          kind,
+        });
+        return localMetaFallbackResponse(
+          metaKind,
+          messages,
+          body.model || model,
+          stream,
+          probe.errorText,
+        );
+      }
+      return failureResponse(probe.errorText, conversationKey, account.id);
+    }
+    return stream
+      ? streamOpenAIResponse(probe.replay, body.model || model, bridge)
+      : collectTurnResponse(probe.replay, body.model || model, bridge);
+  }
   if (stream) {
     const probe = await probeTurnEvents(consumeStream());
     if (probe.status === "failed") {
-      return failureResponse(probe.errorText, conversationKey);
+      return failureResponse(probe.errorText, conversationKey, account.id);
     }
     return streamOpenAIResponse(probe.replay, body.model || model, bridge);
   }
   return collectTurnResponse(consumeStream(), body.model || model, bridge);
+}
+
+/** `x-opencode-claude-account` echo — only meaningful with several accounts. */
+function accountEchoHeaders(
+  accountId: string | undefined,
+): Record<string, string> {
+  return accountId && isMultiAccount() ? { [ACCOUNT_HEADER]: accountId } : {};
+}
+
+/**
+ * Zero-API-call answer for a title/summary request while the subscription is
+ * limited. Titles fall back to a trimmed first line of the request; summaries
+ * preserve a truncated transcript so the conversation can continue with SOME
+ * context instead of none (an apology-only summary would erase it).
+ */
+function localMetaFallbackResponse(
+  metaKind: "title" | "summary",
+  messages: OpenAIMessage[],
+  model: string,
+  stream: boolean,
+  reason: string,
+): Response {
+  let text: string;
+  if (metaKind === "title") {
+    const source = [...messages].reverse().find((m) => m.role === "user");
+    text = heuristicTitle(extractTextContent(source?.content));
+  } else {
+    const transcript = buildConversationTranscript(messages, 12_000);
+    text = [
+      "Summary unavailable: the Claude subscription limit is active, so this",
+      "summary was assembled locally without an API call.",
+      `(${reason.slice(0, 200)})`,
+      "",
+      "Raw conversation transcript (truncated) for continuity:",
+      "",
+      transcript || "(no transferable history)",
+    ].join("\n");
+  }
+
+  const completionId = `chatcmpl_${createHash("sha1")
+    .update(`${metaKind}:${text}`)
+    .digest("hex")
+    .slice(0, 24)}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  if (!stream) {
+    return Response.json({
+      id: completionId,
+      object: "chat.completion",
+      created,
+      model,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: text },
+          finish_reason: "stop",
+        },
+      ],
+    });
+  }
+
+  const encoder = new TextEncoder();
+  const chunk = (payload: unknown) =>
+    encoder.encode(`data: ${JSON.stringify(payload)}\n\n`);
+  const readable = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(
+        chunk({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [
+            { index: 0, delta: { role: "assistant", content: text }, finish_reason: null },
+          ],
+        }),
+      );
+      controller.enqueue(
+        chunk({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        }),
+      );
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+  return new Response(readable, { headers: SSE_HEADERS });
 }
 
 
@@ -939,7 +1749,7 @@ async function collectTurnResponse(
 
   try {
     for await (const event of events) {
-      const mapped = mapSdkEvent(event);
+      const mapped = mapSdkEvent(event, bridge.accountId);
       if (mapped.kind === "park") {
         toolCalls.push(...mapped.tools);
         sawContent = true;
@@ -967,12 +1777,18 @@ async function collectTurnResponse(
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    recordRateLimitErrorText(message);
+    recordRateLimitErrorText(message, bridge.accountId);
     forgetDeadSession(bridge.conversationKey, message);
     noteError(message);
   }
 
   const usage = resolveTurnUsage(turnUsage, resultUsage);
+  // A parked response is a partial turn: count its tokens, not a turn.
+  if (usage || toolCalls.length === 0) {
+    recordTurnUsage(bridge.accountId, usage, {
+      countTurn: toolCalls.length === 0,
+    });
+  }
 
   // Buffered responses have not committed HTTP headers yet. Even if an agent
   // produced partial work first, preserve the real 429 so OpenCode starts its
@@ -981,36 +1797,39 @@ async function collectTurnResponse(
     errorText &&
     (!sawContent || classifyClaudeFailure(errorText) === "rate_limit")
   ) {
-    return failureResponse(errorText, bridge.conversationKey);
+    return failureResponse(errorText, bridge.conversationKey, bridge.accountId);
   }
 
-  return Response.json({
-    id: completionId,
-    object: "chat.completion",
-    created,
-    model,
-    choices: [
-      {
-        index: 0,
-        message: {
-          role: "assistant",
-          content,
-          ...(reasoning ? { reasoning_content: reasoning } : {}),
-          ...(toolCalls.length
-            ? {
-                tool_calls: toolCalls.map((t) => ({
-                  id: t.id,
-                  type: "function",
-                  function: { name: t.name, arguments: t.arguments },
-                })),
-              }
-            : {}),
+  return Response.json(
+    {
+      id: completionId,
+      object: "chat.completion",
+      created,
+      model,
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content,
+            ...(reasoning ? { reasoning_content: reasoning } : {}),
+            ...(toolCalls.length
+              ? {
+                  tool_calls: toolCalls.map((t) => ({
+                    id: t.id,
+                    type: "function",
+                    function: { name: t.name, arguments: t.arguments },
+                  })),
+                }
+              : {}),
+          },
+          finish_reason: toolCalls.length ? "tool_calls" : "stop",
         },
-        finish_reason: toolCalls.length ? "tool_calls" : "stop",
-      },
-    ],
-    ...(usage ? { usage } : {}),
-  });
+      ],
+      ...(usage ? { usage } : {}),
+    },
+    { headers: accountEchoHeaders(bridge.accountId) },
+  );
 }
 
 /**
@@ -1132,18 +1951,20 @@ async function probeTurnEvents(
 function failureResponse(
   errorText: string,
   conversationKey: string,
+  accountId?: string,
 ): Response {
-  recordRateLimitErrorText(errorText);
+  recordRateLimitErrorText(errorText, accountId);
   forgetDeadSession(conversationKey, errorText);
   const kind = classifyClaudeFailure(errorText);
   log.warn("[opencode-claude] turn failed fast", {
     kind,
     conversationKey,
+    ...(accountId ? { account: accountId } : {}),
     message: errorText.slice(0, 300),
   });
 
   if (kind === "rate_limit") {
-    const snap = getRateLimitSnapshot();
+    const snap = getRateLimitSnapshot(Date.now(), accountId);
     const until = snap.limitedUntil ?? snap.resetsAt;
     const retryAfterSeconds =
       until !== undefined
@@ -1178,6 +1999,29 @@ function failureResponse(
                 ).toISOString(),
               }
             : {}),
+          ...accountEchoHeaders(accountId),
+        },
+      },
+    );
+  }
+
+  // Transient 529 overload: retryable status + a short Retry-After, and no
+  // hard-limit gate (recordRateLimitErrorText already ignored it).
+  if (kind === "overloaded") {
+    return Response.json(
+      {
+        error: {
+          message: `${errorText} ${failureHintFor(kind)}`,
+          type: failureTypeFor(kind),
+          code: "claude_overloaded",
+          retry_after: OVERLOADED_RETRY_AFTER_SECONDS,
+        },
+      },
+      {
+        status: failureStatusFor(kind),
+        headers: {
+          "Retry-After": String(OVERLOADED_RETRY_AFTER_SECONDS),
+          ...accountEchoHeaders(accountId),
         },
       },
     );
@@ -1192,7 +2036,10 @@ function failureResponse(
         code: kind === "auth" ? "claude_auth" : "claude_turn_failed",
       },
     },
-    { status: failureStatusFor(kind) },
+    {
+      status: failureStatusFor(kind),
+      headers: accountEchoHeaders(accountId),
+    },
   );
 }
 
@@ -1294,7 +2141,7 @@ function streamOpenAIResponse(
 
       try {
         for await (const event of events) {
-          const mapped = mapSdkEvent(event);
+          const mapped = mapSdkEvent(event, bridge.accountId);
           if (mapped.kind === "park") {
             finishReason = "tool_calls";
             for (let i = 0; i < mapped.tools.length; i++) {
@@ -1390,7 +2237,7 @@ function streamOpenAIResponse(
         const message = err instanceof Error ? err.message : String(err);
         // A limit/result failure typically arrives here right after the SDK
         // emitted the same text as a result event — dedupe via sendError.
-        recordRateLimitErrorText(message);
+        recordRateLimitErrorText(message, bridge.accountId);
         forgetDeadSession(bridge.conversationKey, message);
         log.warn("[opencode-claude] stream iterator failed", {
           conversationKey: bridge.conversationKey,
@@ -1402,6 +2249,12 @@ function streamOpenAIResponse(
       }
 
       const usage = resolveTurnUsage(turnUsage, resultUsage);
+      // A parked response is a partial turn: count its tokens, not a turn.
+      if (usage || finishReason !== "tool_calls") {
+        recordTurnUsage(bridge.accountId, usage, {
+          countTurn: finishReason !== "tool_calls",
+        });
+      }
       if (!streamClosed) {
         send({
           id: completionId,
@@ -1433,7 +2286,9 @@ function streamOpenAIResponse(
     },
   });
 
-  return new Response(readable, { headers: SSE_HEADERS });
+  return new Response(readable, {
+    headers: { ...SSE_HEADERS, ...accountEchoHeaders(bridge.accountId) },
+  });
 }
 
 type MappedEvent =
@@ -1489,7 +2344,7 @@ function forgetDeadSession(conversationKey: string, errorText: string): void {
  * `assistant` message payloads repeat the same content after partials and
  * would double-print if both were forwarded.
  */
-function mapSdkEvent(event: unknown): MappedEvent {
+function mapSdkEvent(event: unknown, accountId?: string): MappedEvent {
   if (!event || typeof event !== "object") return { kind: "ignore" };
   const e = event as Record<string, unknown>;
 
@@ -1506,8 +2361,11 @@ function mapSdkEvent(event: unknown): MappedEvent {
       e.rate_limit_info && typeof e.rate_limit_info === "object"
         ? (e.rate_limit_info as Record<string, unknown>)
         : undefined;
-    const state = recordRateLimitInfo(rawInfo);
-    const note = maybeRateLimitNote(state, rawInfo);
+    const state = recordRateLimitInfo(rawInfo, accountId);
+    // Also merge the reported window into the quota store — one window at a
+    // time, never clobbering the sibling window a control-channel read saw.
+    mergeSdkRateLimitEvent(accountId, rawInfo);
+    const note = maybeRateLimitNote(state, rawInfo, accountId);
     return note ? { kind: "reasoning", text: note } : { kind: "ignore" };
   }
 
@@ -1562,7 +2420,7 @@ function mapSdkEvent(event: unknown): MappedEvent {
     // this event can activate the shared countdown/gate in time.
     const errorText = assistantErrorText(e);
     if (errorText) {
-      const limited = recordRateLimitErrorText(errorText);
+      const limited = recordRateLimitErrorText(errorText, accountId);
       let note = errorText;
       const until = limited?.limitedUntil ?? limited?.resetsAt;
       if (until !== undefined) {
@@ -1595,7 +2453,7 @@ function mapSdkEvent(event: unknown): MappedEvent {
             ? e.error
             : "Claude turn failed";
       // Hard subscription limit? Record it so the gate + counter activate.
-      const limited = recordRateLimitErrorText(text);
+      const limited = recordRateLimitErrorText(text, accountId);
       let note = text;
       if (limited?.limited) {
         const until = limited.limitedUntil ?? limited.resetsAt;

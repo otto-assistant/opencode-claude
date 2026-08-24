@@ -124,7 +124,25 @@ export type ClaudeQueryHandle = {
   interrupt: () => Promise<void>;
   close: () => void;
   getPid: () => number | null | undefined;
+  /**
+   * Plan rate-limit windows over the SDK control channel (`get_usage`), or
+   * null when this SDK/CLI pair does not speak it. Only answers while the
+   * message loop is running, so call it during the turn, never from its
+   * `finally`. Reads the claude.ai usage endpoint via the CLI's own
+   * credentials — no Messages API call, no quota spent.
+   */
+  readPlanUsage: () => Promise<unknown | null>;
+  /**
+   * The login behind the spawned CLI's credentials (email, organization,
+   * subscription type), or null when unsupported. Same constraints as
+   * readPlanUsage.
+   */
+  readAccountInfo: () => Promise<unknown | null>;
 };
+
+/** Control method behind `/usage`. Experimental upstream, so feature-detected. */
+const PLAN_USAGE_METHOD =
+  "usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET";
 
 export type StartClaudeQueryParams = {
   prompt: string | AsyncIterable<unknown>;
@@ -226,7 +244,15 @@ export async function startClaudeQuery(
   }
 
   const effort = trimmedString(params.effort);
-  if (isClaudeEffort(effort)) options.effort = effort;
+  // The API rejects effort (e.g. "max") when thinking is disabled:
+  // "400 output_config.effort 'max' is not supported when thinking is
+  // disabled". Effort only means anything for ADAPTIVE thinking, so forward
+  // it solely when thinking is absent (we default to adaptive below) or
+  // explicitly adaptive — an explicit token budget or disabled thinking
+  // drops it defensively rather than fail the whole turn with a 400.
+  const effortCompatible =
+    params.thinking === undefined || params.thinking.type === "adaptive";
+  if (isClaudeEffort(effort) && effortCompatible) options.effort = effort;
 
   if (params.thinking) {
     options.thinking = params.thinking;
@@ -359,5 +385,19 @@ export async function startClaudeQuery(
     }
   };
 
-  return { stream: result as AsyncIterable<unknown>, interrupt, close, getPid };
+  const callControl = async (method: string): Promise<unknown | null> => {
+    if (closed) return null;
+    const fn = (result as Record<string, unknown> | null)?.[method];
+    if (typeof fn !== "function") return null;
+    return await (fn as () => Promise<unknown>).call(result);
+  };
+
+  return {
+    stream: result as AsyncIterable<unknown>,
+    interrupt,
+    close,
+    getPid,
+    readPlanUsage: () => callControl(PLAN_USAGE_METHOD),
+    readAccountInfo: () => callControl("accountInfo"),
+  };
 }

@@ -15,6 +15,8 @@ export type ParkedToolCall = {
 export type ParkedBridge = {
   id: string;
   conversationKey: string;
+  /** Claude account this turn runs on — scopes rate-limit/quota records. */
+  accountId?: string;
   handle: ClaudeQueryHandle;
   pendingTools: Map<string, ParkedToolCall>;
   /** SDK assistant messages whose usage was already reported to OpenCode. */
